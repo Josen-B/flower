@@ -10,8 +10,8 @@ pub mod platform;
 pub mod settings;
 
 pub use engine::{
-    keymap, Candidate, CompositionUpdate, EngineError, EngineSession, Key, KeyEvent, Lexicon,
-    Modifiers, PinyinSession, DEFAULT_PAGE_SIZE,
+    keymap, Candidate, CompositionUpdate, EngineError, EngineRouter, EngineSession, Key, KeyEvent,
+    Lexicon, Modifiers, PinyinSession, DEFAULT_PAGE_SIZE,
 };
 pub use platform::{is_supported_platform, TEXT_SERVICE_DESCRIPTION};
 pub use settings::{

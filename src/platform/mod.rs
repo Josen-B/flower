@@ -1,7 +1,9 @@
 //! Platform-specific host integration.
 
+mod composition;
 pub mod windows;
 
+pub use composition::{CompositionController, CompositionHost};
 pub use windows::{is_supported_platform, TEXT_SERVICE_DESCRIPTION};
 
 #[cfg(target_os = "windows")]

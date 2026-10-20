@@ -9,11 +9,13 @@ is a single Rust Cargo package named `flower`.
 - `flower::platform` contains the Windows TSF/COM boundary. Its `windows`
   dependency is enabled only for Windows targets.
 - `flower::settings` provides the serde JSON settings model and file store.
+- `EngineRouter` is the platform-neutral boundary used by the TSF layer.
 - `DllGetClassObject` exposes the Flower class factory and accepts only the
-  Flower text-service CLSID. The text service advises a pass-through key event
-  sink while it is active.
-- Composition rendering, the candidate window, registration, and the settings
-  UI remain future work.
+  Flower text-service CLSID. The active text service keeps one engine session
+  per TSF context and applies preedit/commit/cancel updates through synchronous
+  edit sessions.
+- Candidate rendering, profile registration, the settings UI, and a real
+  Windows host smoke test remain future work.
 
 ## Repository layout
 
@@ -34,13 +36,18 @@ src/
     types.rs
   platform/
     mod.rs
+    composition.rs
     windows.rs
   settings.rs
 tests/
+  engine_router.rs
   pinyin_session.rs
 data/pinyin/mvp_lexicon.tsv
 docs/plans/
 ```
+
+The staged implementation and acceptance criteria are tracked in
+[`docs/plans/2026-10-20-flower-rust-implementation-roadmap.md`](docs/plans/2026-10-20-flower-rust-implementation-roadmap.md).
 
 ## Public API
 
@@ -55,14 +62,21 @@ The primary API lives in three modules:
 Common engine and settings items are also re-exported from the crate root:
 
 ```rust
-use flower::{keymap, Key, Modifiers, PinyinSession};
+use flower::{keymap, EngineRouter, Key, KeyEvent, Modifiers};
 
 let event = keymap::map_windows_virtual_key(b'A' as u32, Modifiers::SHIFT)
     .expect("supported key");
 assert_eq!(event.key, Key::Char('a'));
 
-let session = PinyinSession::new().expect("embedded MVP lexicon");
-assert!(!session.is_composing());
+let mut router = EngineRouter::new().expect("embedded MVP lexicon");
+assert!(!router.is_composing());
+
+let letter = KeyEvent::plain(Key::Char('n'));
+assert!(router.test_key(letter).expect("key preview"));
+assert!(!router.is_composing());
+
+let update = router.process_key(letter).expect("key processing");
+assert_eq!(update.preedit, "n");
 ```
 
 On Windows, `FLOWER_TEXT_SERVICE_CLSID`, `DllGetClassObject`, and
