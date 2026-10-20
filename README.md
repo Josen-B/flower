@@ -2,8 +2,9 @@
 
 Flower is an independent Windows Text Services Framework (TSF) Chinese Pinyin
 input method. The current source provides the librime engine adapter, Windows
-key translation, and the initial offline Pinyin schema. The TSF COM service,
-candidate window, and per-user installer are still in progress.
+key translation, the initial offline Pinyin schema, and a TSF COM server
+activation/key-sink foundation. Composition handling, candidate UI,
+registration, and the per-user installer are still in progress.
 
 ## Dependencies
 

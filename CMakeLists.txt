@@ -34,6 +34,33 @@ else()
   target_compile_options(flower_engine PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(flower_tsf SHARED
+  src/tsf/com_server.cpp
+  src/tsf/text_service.cpp
+)
+target_include_directories(flower_tsf PRIVATE src)
+target_compile_features(flower_tsf PRIVATE cxx_std_17)
+target_compile_definitions(flower_tsf
+  PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+    _WIN32_WINNT=0x0A00
+)
+target_link_libraries(flower_tsf PRIVATE flower_engine ole32 msctf uuid)
+if(MSVC)
+  target_compile_options(flower_tsf PRIVATE /W4 /permissive- /EHsc)
+else()
+  target_compile_options(flower_tsf PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+  target_sources(flower_tsf PRIVATE src/tsf/flower_tsf_x86.def)
+else()
+  target_sources(flower_tsf PRIVATE src/tsf/flower_tsf_x64.def)
+endif()
+
 if(FLOWER_BUILD_TESTS)
   enable_testing()
   add_executable(flower_engine_tests
@@ -47,7 +74,7 @@ if(FLOWER_BUILD_TESTS)
   add_test(NAME flower_engine_tests COMMAND flower_engine_tests)
 endif()
 
-install(TARGETS flower_engine
+install(TARGETS flower_engine flower_tsf
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin

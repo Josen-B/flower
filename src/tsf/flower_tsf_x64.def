@@ -1,0 +1,4 @@
+LIBRARY flower_tsf
+EXPORTS
+  DllGetClassObject
+  DllCanUnloadNow
