@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "56d54c7238d8c66fab370e1618abc666ef5a70e7",
+    "indexed_at": "2026-10-20T08:38:16Z",
+    "project": "code-shurufa-flower",
+    "nodes": 268,
+    "edges": 790,
+    "original_size": 2359296,
+    "compressed_size": 262316,
+    "compression_level": 3
+}
