@@ -9,7 +9,11 @@ use std::path::{Component, Path, PathBuf};
 /// identity and must not change.
 pub const FLOWER_TEXT_SERVICE_CLSID_U128: u128 = 0x3d5b7cb1_96cb_4f44_a792_64304f6e7426;
 pub const FLOWER_TEXT_SERVICE_CLSID: &str = "{3D5B7CB1-96CB-4F44-A792-64304F6E7426}";
-pub const FLOWER_TEXT_SERVICE_DESCRIPTION: &str = "Flower Pinyin input method";
+pub const FLOWER_TEXT_SERVICE_DESCRIPTION: &str = "Flower";
+/// Group-icon resource embedded in the Windows DLL and executable files.
+pub const FLOWER_ICON_RESOURCE_ID: u16 = 101;
+/// Index of the first group icon in the registered DLL.
+pub const FLOWER_PROFILE_ICON_INDEX: u32 = 0;
 
 /// Fixed zh-CN language profile introduced with the machine registration tool.
 pub const FLOWER_LANGUAGE_PROFILE_GUID_U128: u128 = 0x6c7782f4_5f59_42cf_8c29_f9a8d46f1b72;

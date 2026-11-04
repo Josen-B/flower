@@ -38,6 +38,7 @@ mod windows_exports {
         PopupRect,
     };
     use crate::platform::composition::{CompositionController, CompositionHost};
+    use crate::platform::diagnostics::{record, record_result, Stage};
     use crate::platform::{CandidatePopupModel, CandidatePopupWindow, PopupError};
     use crate::settings::{Settings, SettingsStore};
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
@@ -392,11 +393,15 @@ mod windows_exports {
         type Error = Error;
 
         fn begin(&mut self, preedit: &str) -> Result<()> {
-            let insert: ITfInsertAtSelection = self.context.cast()?;
+            let insert: Result<ITfInsertAtSelection> = self.context.cast();
+            record_result(Stage::QueryInsert, &insert);
+            let insert = insert?;
             // SAFETY: A query-only insertion returns a live range at the
             // selection without changing document text.
             let range =
-                unsafe { insert.InsertTextAtSelection(self.edit_cookie, TF_IAS_QUERYONLY, &[]) }?;
+                unsafe { insert.InsertTextAtSelection(self.edit_cookie, TF_IAS_QUERYONLY, &[]) };
+            record_result(Stage::QueryInsertionRange, &range);
+            let range = range?;
             let composition_manager: ITfContextComposition = self.context.cast()?;
 
             // SAFETY: The queried range and context are live in the current
@@ -407,7 +412,9 @@ mod windows_exports {
                     &range,
                     None::<&ITfCompositionSink>,
                 )
-            }?;
+            };
+            record_result(Stage::StartComposition, &composition);
+            let composition = composition?;
             self.composition = Some(composition.clone());
 
             let text: Vec<u16> = preedit.encode_utf16().collect();
@@ -417,6 +424,7 @@ mod windows_exports {
                 // SAFETY: `range` is live and `text` is a valid UTF-16 buffer.
                 unsafe { range.SetText(self.edit_cookie, 0, &text) }
             });
+            record_result(Stage::SetInitialText, &set_text);
 
             if let Err(error) = set_text {
                 self.end_composition_best_effort();
@@ -564,6 +572,7 @@ mod windows_exports {
 
     impl ITfEditSession_Impl for EditSession_Impl {
         fn DoEditSession(&self, edit_cookie: u32) -> Result<()> {
+            record(Stage::DoEditSession, S_OK);
             let this = self.get_impl();
             let completion = this.take_completion();
             if this.requires_preflight && completion.is_none() {
@@ -586,6 +595,7 @@ mod windows_exports {
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
             let result = controller.apply_update(&mut host, &this.update);
+            record_result(Stage::ApplyUpdate, &result);
             let caret = if result.is_ok() && controller.is_active() {
                 host.composition.as_ref().and_then(|composition| {
                     composition_caret(&this.context, composition, edit_cookie)
@@ -681,6 +691,10 @@ mod windows_exports {
         let requested = unsafe {
             context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READWRITE)
         };
+        record_result(Stage::RequestKeyEdit, &requested);
+        if let Ok(status) = requested.as_ref() {
+            record(Stage::EditSessionResult, *status);
+        }
         match requested {
             // SAFETY: `session` was created from `EditSession` above.
             Ok(result) if result.is_ok() => unsafe {
@@ -1242,6 +1256,7 @@ mod windows_exports {
 
     impl ITfTextInputProcessor_Impl for TextService_Impl {
         fn Activate(&self, thread_manager: Option<&ITfThreadMgr>, client_id: u32) -> Result<()> {
+            record(Stage::Activate, S_OK);
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
@@ -1269,11 +1284,18 @@ mod windows_exports {
                 }
             }
 
-            let mut popup = match CandidatePopupWindow::new() {
+            let popup = CandidatePopupWindow::new();
+            if let Err(error) = &popup {
+                record(Stage::PopupCreate, popup_activation_hresult(error));
+            } else {
+                record(Stage::PopupCreate, S_OK);
+            }
+            let mut popup = match popup {
                 Ok(popup) => popup,
                 Err(error) => return Err(popup_activation_hresult(&error).into()),
             };
             if let Err(error) = popup.set_theme(settings.theme) {
+                record(Stage::PopupTheme, popup_activation_hresult(&error));
                 return Err(popup_activation_hresult(&error).into());
             }
             let token = next_activation_token();
@@ -1283,6 +1305,7 @@ mod windows_exports {
                 dispatch_popup_action(&action_activation, token, owner_thread, action);
             });
             if let Err(error) = popup.set_action_sink(Some(action_sink)) {
+                record(Stage::PopupActionSink, popup_activation_hresult(&error));
                 return Err(popup_activation_hresult(&error).into());
             }
             if !register_thread_popup(token, popup) {
@@ -1322,6 +1345,7 @@ mod windows_exports {
             // its own reference to `key_sink` after a successful advise.
             let advised =
                 unsafe { keystroke_manager.AdviseKeyEventSink(client_id, &key_sink, TRUE) };
+            record_result(Stage::AdviseKeySink, &advised);
 
             if let Err(error) = advised {
                 let stale = {
@@ -1344,6 +1368,7 @@ mod windows_exports {
                 return Err(error);
             }
 
+            record(Stage::ActivationReady, S_OK);
             Ok(())
         }
 
@@ -1458,6 +1483,7 @@ mod windows_exports {
             wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            record(Stage::TestKeyDown, S_OK);
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
@@ -1516,6 +1542,7 @@ mod windows_exports {
             wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            record(Stage::KeyDown, S_OK);
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
@@ -1724,6 +1751,6 @@ mod tests {
 
     #[test]
     fn text_service_description_is_stable() {
-        assert_eq!(TEXT_SERVICE_DESCRIPTION, "Flower Pinyin input method");
+        assert_eq!(TEXT_SERVICE_DESCRIPTION, "Flower");
     }
 }

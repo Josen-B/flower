@@ -514,10 +514,9 @@ fn install_layout_or_tip_uses_only_fixed_flags_and_target_profile() {
         FLOWER_TEXT_SERVICE_CLSID_U128,
         0x3d5b7cb1_96cb_4f44_a792_64304f6e7426
     );
-    assert_eq!(
-        FLOWER_LANGUAGE_PROFILE_DESCRIPTION,
-        "Flower Pinyin input method"
-    );
+    assert_eq!(FLOWER_LANGUAGE_PROFILE_DESCRIPTION, "Flower");
+    assert_eq!(flower::registration::FLOWER_ICON_RESOURCE_ID, 101);
+    assert_eq!(flower::registration::FLOWER_PROFILE_ICON_INDEX, 0);
 }
 
 #[test]

@@ -2,6 +2,8 @@
 
 mod candidate;
 mod composition;
+#[cfg(target_os = "windows")]
+mod diagnostics;
 mod popup;
 pub mod windows;
 

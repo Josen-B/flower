@@ -14,8 +14,8 @@ use crate::registration::{
     InstallationSnapshot, OperationError, OperationOutcome, RegistrationBackend,
     RegistrationResource, ResourceInstallation, ResourceState, UserLayoutBackend,
     UserLayoutOperation, FLOWER_LANGID_ZH_CN, FLOWER_LANGUAGE_PROFILE_DESCRIPTION,
-    FLOWER_LANGUAGE_PROFILE_GUID_U128, FLOWER_TEXT_SERVICE_CLSID, FLOWER_TEXT_SERVICE_CLSID_U128,
-    FLOWER_TEXT_SERVICE_DESCRIPTION,
+    FLOWER_LANGUAGE_PROFILE_GUID_U128, FLOWER_PROFILE_ICON_INDEX, FLOWER_TEXT_SERVICE_CLSID,
+    FLOWER_TEXT_SERVICE_CLSID_U128, FLOWER_TEXT_SERVICE_DESCRIPTION,
 };
 use windows::core::{s, w, GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -876,7 +876,7 @@ fn inspect_keyboard_category() -> Result<ResourceState, String> {
     })
 }
 
-fn install_language_profile() -> Result<ResourceInstallation, String> {
+fn install_language_profile(dll: &Path) -> Result<ResourceInstallation, String> {
     match inspect_language_profile()? {
         ResourceState::PresentOwned => return Ok(ResourceInstallation::AlreadyPresent),
         ResourceState::Conflict => {
@@ -887,8 +887,8 @@ fn install_language_profile() -> Result<ResourceInstallation, String> {
 
     let manager = profile_manager()?;
     let description = wide(FLOWER_LANGUAGE_PROFILE_DESCRIPTION);
-    let no_icon = [0u16];
-    // SAFETY: The fixed identifiers, description, and empty icon expression
+    let icon_file = wide_path(dll);
+    // SAFETY: The fixed identifiers, description, and validated DLL icon path
     // remain live for the call. HKL substitute is NULL, preferred layout is 0,
     // and the profile is not enabled for all users by default.
     unsafe {
@@ -897,8 +897,8 @@ fn install_language_profile() -> Result<ResourceInstallation, String> {
             FLOWER_LANGID_ZH_CN,
             &FLOWER_LANGUAGE_PROFILE,
             &description,
-            &no_icon[..0],
-            0,
+            &icon_file,
+            FLOWER_PROFILE_ICON_INDEX,
             HKL(ptr::null_mut()),
             0,
             FALSE,
@@ -1013,7 +1013,7 @@ impl RegistrationBackend for WindowsRegistrationBackend {
                 let validated = validate_dll(dll).map_err(|error| error.to_string())?;
                 create_com_registration(&validated)
             }
-            RegistrationResource::LanguageProfile => install_language_profile(),
+            RegistrationResource::LanguageProfile => install_language_profile(dll),
             RegistrationResource::KeyboardCategory => install_keyboard_category(),
         }
     }

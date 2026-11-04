@@ -1,0 +1,53 @@
+; Flower-owned simplified Chinese overlay. Untranslated system errors use English.
+[LangOptions]
+LanguageName=简体中文
+LanguageID=$0804
+LanguageCodePage=0
+
+[Messages]
+SetupAppTitle=安装
+SetupWindowTitle=安装 - %1
+UninstallAppTitle=卸载
+UninstallAppFullTitle=卸载 %1
+InformationTitle=提示
+ConfirmTitle=确认
+ErrorTitle=错误
+SetupLdrStartupMessage=即将安装 %1，是否继续？
+SetupAlreadyRunning=安装程序已经在运行
+WindowsVersionNotSupported=此程序不支持当前 Windows 版本
+AdminPrivilegesRequired=安装 Flower 需要管理员权限
+ExitSetupTitle=退出安装
+ExitSetupMessage=安装尚未完成。现在退出将无法完成安装。%n%n确定退出？
+ButtonBack=< 上一步(&B)
+ButtonNext=下一步(&N) >
+ButtonInstall=安装(&I)
+ButtonOK=确定
+ButtonCancel=取消
+ButtonYes=是(&Y)
+ButtonNo=否(&N)
+ButtonFinish=完成(&F)
+SelectLanguageTitle=选择安装语言
+SelectLanguageLabel=请选择安装向导使用的语言
+ClickNext=单击“下一步”继续，或单击“取消”退出
+WelcomeLabel1=欢迎使用 [name] 安装向导
+WelcomeLabel2=本向导将在计算机上安装 [name/ver]。%n%n请先保存工作并退出加载过 Flower 的应用
+WizardLicense=许可协议
+LicenseLabel=请阅读以下许可信息
+LicenseLabel3=继续前请阅读并接受许可条款。完整的 MIT 和 Apache-2.0 正文随程序安装
+LicenseAccepted=我接受协议(&A)
+LicenseNotAccepted=我不接受协议(&D)
+WizardInfoBefore=测试版重要说明
+InfoBeforeLabel=请在继续前阅读已知限制和安全安装步骤
+InfoBeforeClickLabel=确认了解这些信息后，单击“下一步”
+WizardReady=准备安装
+ReadyLabel1=即将开始安装 Flower
+ReadyLabel2a=单击“安装”继续，或单击“上一步”查看信息
+WizardPreparing=安装前检查
+PreparingDesc=正在检查 Flower 安装条件
+CannotContinue=无法继续。请单击“取消”退出并处理上述问题
+WizardInstalling=正在安装
+InstallingLabel=正在安装 Flower，请稍候
+FinishedHeadingLabel=Flower 安装流程结束
+FinishedLabel=文件已安装。请查看下方注册状态和当前用户启用步骤
+FinishedLabelNoIcons=文件已安装。请查看下方注册状态
+ClickFinish=单击“完成”退出安装向导

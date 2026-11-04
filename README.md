@@ -33,21 +33,38 @@ Flower 是一款离线运行的 Windows 10/11 x64 拼音输入法。其实现是
 - `scripts/package.py` 提供 Windows 10/11 x64 ZIP 打包流程：严格筛选 Cargo
   release artifact，校验 AMD64 PE32+ 与 DLL 导出，收集依赖和 Rust 标准库
   许可正文，并生成确定性 ZIP、包内清单和外部 SHA-256。
-- 完整上下文焦点处理、真实签名安装器以及真实 Windows 主机冒烟测试仍属于
-  后续工作。当前 Linux 工作区不能替代 Windows 制品和桌面交互验证。
+- 已在 Windows x64 上生成真实未签名 ZIP，并通过包内外哈希、两个 EXE 帮助和
+  COM 接口查询。桌面测试发现选择 Flower 后仍直通英文，尚未通过输入验收；
+  完整上下文焦点处理和签名安装器也仍待完成。
+  详见[本机验收记录](docs/windows-validation.md)。
+- 已生成基于 Inno Setup 的 EXE 测试安装器，带樱花图标、中文主要向导和
+  当前用户启用/停用快捷方式；尚未在干净机器实际安装或卸载。
 
 ## 仓库结构
 
 ```text
 Cargo.toml
 Cargo.lock
+build.rs
 rust-toolchain.toml
 README.md
 LICENSE-MIT
 LICENSE-APACHE
+assets/
+  flower.png
+  flower.ico
+  flower.rc
 scripts/
   package.py
   test_package.py
+  make_icon.ps1
+  verify_windows_icons.ps1
+  installer.py
+  test_installer.py
+installer/
+  flower.iss
+  notice.zh-CN.txt
+  zh-CN.isl
 src/
   bin/
     flower-register.rs
@@ -138,11 +155,34 @@ cargo check --workspace
 python -m unittest -v scripts/test_package.py
 ```
 
+### Windows EXE 安装器
+
+除 ZIP 外，现提供基于 Inno Setup 6 的离线测试版安装器。先准备已校验的 ZIP，
+安装 Inno Setup 6，然后运行：
+
+```text
+python scripts/installer.py --package dist/flower-0.1.0-windows-x64.zip
+python -m unittest -v scripts/test_installer.py
+```
+
+可用 `--iscc <ISCC.exe>` 指定编译器，`--output-dir` 选择未包含同名产物的目录。
+生成 `flower-0.1.0-windows-x64-setup.exe`、`.exe.sha256` 和构建清单。
+编译器只是开发依赖，目标机器不需要 Python、Rust 或 Inno Setup。
+
+安装器需要管理员权限完成机器级注册；安装后各用户从开始菜单运行“启用
+Flower（当前用户）”，再按 Win+Space 选择。它不自动启用、不改默认输入法，
+不覆盖旧安装。当前输入直通故障仍未修复，安装器也尚未完成干净机器实装验收。
+详见[分发说明](docs/distribution.md)及[安装器契约](design/windows-installer.md)。
+
 安装 MSVC 目标后，可从根目录检查 Windows TSF 边界：
 
 ```text
 cargo check --workspace --target x86_64-pc-windows-msvc
 ```
+
+Windows 构建还需要 SDK 中的 `rc.exe`，用于把樱花图标嵌入 DLL 和两个 EXE。
+常规构建直接使用仓库内的 ICO，不依赖外部图片路径。需要重建图标时参见
+[`design/windows-branding.md`](design/windows-branding.md)。
 
 在 Windows 上运行设置程序：
 
@@ -166,7 +206,8 @@ zh-CN 语言配置，以及 `ITfCategoryMgr` 中的键盘分类。用户是否�
 GUID 和描述，不会替换其他输入法，也不会把 Flower 设为全体用户默认输入法。
 当前固定身份是 CLSID `{3D5B7CB1-96CB-4F44-A792-64304F6E7426}`、language
 profile `{6C7782F4-5F59-42CF-8C29-F9A8D46F1B72}`、zh-CN LANGID `0x0804`
-和描述 `Flower Pinyin input method`。
+和显示名称 `Flower`。樱花图标以多尺寸资源嵌入 DLL 和两个 EXE，
+TSF profile 使用 DLL 中的首个图标，不依赖外部 PNG 或 ICO。
 
 先在 Windows 10/11 x64 上构建：
 
@@ -235,9 +276,9 @@ TSF 清理失败时保留 COM 以支持修复后重试。COM 预检还要求
   伪造 `GetLastError` 含义。请确认先完成机器注册、以目标用户运行 `enable`，
   并尝试重新登录后重试。
 
-真实 Windows 上的管理员注册、普通用户启用、Win+Space 选择、注销重试、
-已加载 DLL 和多用户隔离仍需桌面验收。Stage 4c 的 ZIP 流程已实现，但真实
-Windows 包生成、解压运行和安装验收尚未在本 Linux 工作区完成。
+Windows 本机已生成并验证真实 ZIP/EXE 制品，并完成原始 DLL 的机器注册、
+普通用户启用和 COM 查询。实际输入仍直通英文；注销重试、已加载 DLL、
+多用户隔离和新 EXE 的安装/卸载等整体验收尚未完成。
 
 ## ZIP 分发
 

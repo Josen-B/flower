@@ -39,9 +39,9 @@ jobs:
         shell: pwsh
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Python packaging tests
+      - name: Python packaging and installer boundary tests
         shell: pwsh
-        run: python -m unittest -v scripts/test_package.py
+        run: python -m unittest -v scripts/test_package.py scripts/test_installer.py
 
       - name: Build ZIP package
         shell: pwsh
@@ -77,6 +77,7 @@ jobs:
             throw "ZIP must contain exactly one top-level directory."
           }
           $packageRoot = $topLevels[0].FullName
+          & "./scripts/verify_windows_icons.ps1" -BinaryRoot $packageRoot
           Push-Location -LiteralPath $packageRoot
           try {
             $checksumLines = Get-Content -LiteralPath "SHA256SUMS"
