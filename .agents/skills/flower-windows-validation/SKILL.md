@@ -42,6 +42,13 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 默认关闭的调试构建可以在构建时显式设置 `FLOWER_TSF_DIAGNOSTIC_FILE` 绝对路径。release 不写日志。仅记录固定阶段、pid、HRESULT，不记录输入或文档内容。
 - 独立 TSF 探针必须区分 host client、service client 和已存在接收器。客户端标识无效或重复 advise 的错误不等于真实宿主故障，不能据此改成异步或强行吞键。
 
+## 隔离原生回归与目录安全
+
+- 可在 STA 中创建真实 ThreadMgr、DocumentMgr 和无外部 text store 的 Context，直接调用服务按键回调，再通过真实编辑会话读回新建文档。测试不得全局注入按键或触碰用户文档。绕过 Activate/Advise 的测试只证明编辑路径，不证明真实宿主激活。
+- StartComposition 必须传入生产使用的非空 composition sink；验证预编辑、提交后光标顺序、Escape 和终止后的干净恢复。模拟宿主强制终止用 ITfContextOwnerCompositionServices::TerminateComposition；发起方自己的 EndComposition 不保证回调同一个终止 sink。
+- 自定义机器安装目录不能仅开放向导路径页。用 check-install-path 只读检查本地固定盘、重解析点、owner/DACL、祖先替换权限及实际 payload 树；不要通过增加 users-readexec ACE 假装移除了继承写权限，也不要擅自改 D 盘父目录 ACL。
+- 安装前后及卸载前的 helper 必须来自核对哈希的私有临时副本；在执行安装树内 helper 前完成 ACL 检查。原生 SDDL 内存描述符可验证 allow/deny、inherit-only、null DACL 和未知 ACE，不需修改系统 ACL。SDDL 的 DC 是目录服务权限，不是文件系统 FILE_DELETE_CHILD；后者应使用 0x40。
+
 ## 交接
 
 记录源码版本/差异、实际命令、产物哈希、安装绑定、当前用户启用状态、桌面观察及未覆盖项。未签名包或失败的桌面验收不得标为可发布。旧归档保持不可变，并说明其是否包含后续源码修改。日志和探针放当前会话目录，不把会话绝对路径或用户输入沉淀到长期文档/技能。

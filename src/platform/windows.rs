@@ -19,7 +19,7 @@ pub const FLOWER_TEXT_SERVICE_CLSID: windows::core::GUID =
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]
 mod windows_exports {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -51,11 +51,12 @@ mod windows_exports {
         GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::TextServices::{
-        ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfContextView,
-        ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
-        ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor,
-        ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END, TF_ES_ASYNC, TF_ES_READWRITE,
-        TF_ES_SYNC, TF_IAS_QUERYONLY,
+        ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
+        ITfContextComposition, ITfContextView, ITfEditSession, ITfEditSession_Impl,
+        ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange,
+        ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_AE_NONE, TF_ANCHOR_END,
+        TF_ES_ASYNC, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
+        TF_SELECTIONSTYLE,
     };
     use windows_core::{ComObjectInterface, IUnknownImpl};
 
@@ -234,15 +235,56 @@ mod windows_exports {
     type ContextKey = usize;
 
     #[derive(Clone)]
+    struct ActiveComposition {
+        handle: ITfComposition,
+        terminated: Rc<Cell<bool>>,
+    }
+
+    impl std::ops::Deref for ActiveComposition {
+        type Target = ITfComposition;
+
+        fn deref(&self) -> &Self::Target {
+            &self.handle
+        }
+    }
+
+    #[implement(ITfCompositionSink)]
+    struct CompositionSink {
+        terminated: Rc<Cell<bool>>,
+        owner_thread: ThreadId,
+        _registration: ObjectRegistration,
+    }
+
+    impl ITfCompositionSink_Impl for CompositionSink_Impl {
+        fn OnCompositionTerminated(
+            &self,
+            _edit_cookie: u32,
+            _composition: Option<&ITfComposition>,
+        ) -> Result<()> {
+            if std::thread::current().id() != self.owner_thread {
+                return Err(E_UNEXPECTED.into());
+            }
+            self.terminated.set(true);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
     struct ContextEntry {
         context: ITfContext,
         router: EngineRouter,
-        composition: Option<ITfComposition>,
+        composition: Option<ActiveComposition>,
         controller: CompositionController,
         popup_model: CandidatePopupModel,
     }
 
     impl ContextEntry {
+        fn composition_terminated(&self) -> bool {
+            self.composition
+                .as_ref()
+                .is_some_and(|composition| composition.terminated.get())
+        }
+
         fn new(context: &ITfContext, settings: &Settings) -> Option<Self> {
             let router = EngineRouter::with_page_size(settings.candidate_page_size).ok()?;
             Some(Self {
@@ -331,12 +373,16 @@ mod windows_exports {
 
     struct TfCompositionHost {
         context: ITfContext,
-        composition: Option<ITfComposition>,
+        composition: Option<ActiveComposition>,
         edit_cookie: u32,
     }
 
     impl TfCompositionHost {
-        fn new(context: ITfContext, composition: Option<ITfComposition>, edit_cookie: u32) -> Self {
+        fn new(
+            context: ITfContext,
+            composition: Option<ActiveComposition>,
+            edit_cookie: u32,
+        ) -> Self {
             Self {
                 context,
                 composition,
@@ -344,7 +390,7 @@ mod windows_exports {
             }
         }
 
-        fn into_composition(self) -> Option<ITfComposition> {
+        fn into_composition(self) -> Option<ActiveComposition> {
             self.composition
         }
 
@@ -352,6 +398,9 @@ mod windows_exports {
             let Some(composition) = self.composition.clone() else {
                 return Err(E_UNEXPECTED.into());
             };
+            if composition.terminated.get() {
+                return Err(E_UNEXPECTED.into());
+            }
 
             // SAFETY: The composition is a live TSF object for this context.
             match unsafe { composition.GetRange() } {
@@ -361,6 +410,24 @@ mod windows_exports {
                     Err(error)
                 }
             }
+        }
+
+        fn move_selection_to_end(&self, range: &ITfRange) -> Result<()> {
+            let caret = unsafe { range.Clone() }?;
+            unsafe { caret.Collapse(self.edit_cookie, TF_ANCHOR_END) }?;
+            let selection = TF_SELECTION {
+                range: std::mem::ManuallyDrop::new(Some(caret)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: FALSE,
+                },
+            };
+            let result = unsafe {
+                self.context
+                    .SetSelection(self.edit_cookie, std::slice::from_ref(&selection))
+            };
+            drop(std::mem::ManuallyDrop::into_inner(selection.range));
+            result
         }
 
         fn end_composition(&mut self) -> Result<()> {
@@ -403,18 +470,23 @@ mod windows_exports {
             record_result(Stage::QueryInsertionRange, &range);
             let range = range?;
             let composition_manager: ITfContextComposition = self.context.cast()?;
+            let terminated = Rc::new(Cell::new(false));
+            let sink: ITfCompositionSink = CompositionSink {
+                terminated: Rc::clone(&terminated),
+                owner_thread: std::thread::current().id(),
+                _registration: ObjectRegistration::new(),
+            }
+            .into();
 
             // SAFETY: The queried range and context are live in the current
             // read/write edit session.
-            let composition = unsafe {
-                composition_manager.StartComposition(
-                    self.edit_cookie,
-                    &range,
-                    None::<&ITfCompositionSink>,
-                )
-            };
+            let composition =
+                unsafe { composition_manager.StartComposition(self.edit_cookie, &range, &sink) };
             record_result(Stage::StartComposition, &composition);
-            let composition = composition?;
+            let composition = ActiveComposition {
+                handle: composition?,
+                terminated,
+            };
             self.composition = Some(composition.clone());
 
             let text: Vec<u16> = preedit.encode_utf16().collect();
@@ -422,7 +494,8 @@ mod windows_exports {
             // UTF-16 buffer remains alive for the duration of the call.
             let set_text = unsafe { composition.GetRange() }.and_then(|range| {
                 // SAFETY: `range` is live and `text` is a valid UTF-16 buffer.
-                unsafe { range.SetText(self.edit_cookie, 0, &text) }
+                unsafe { range.SetText(self.edit_cookie, 0, &text) }?;
+                self.move_selection_to_end(&range)
             });
             record_result(Stage::SetInitialText, &set_text);
 
@@ -439,7 +512,8 @@ mod windows_exports {
             let text: Vec<u16> = preedit.encode_utf16().collect();
             // SAFETY: The range belongs to the active composition, and the
             // UTF-16 buffer remains alive for the duration of the call.
-            unsafe { range.SetText(self.edit_cookie, 0, &text) }
+            unsafe { range.SetText(self.edit_cookie, 0, &text) }?;
+            self.move_selection_to_end(&range)
         }
 
         fn commit(&mut self, text: &str) -> Result<()> {
@@ -448,6 +522,7 @@ mod windows_exports {
             // SAFETY: The range belongs to the active composition, and the
             // UTF-16 buffer remains alive for the duration of the call.
             unsafe { range.SetText(self.edit_cookie, 0, &text) }?;
+            self.move_selection_to_end(&range)?;
             self.end_composition()
         }
 
@@ -457,13 +532,14 @@ mod windows_exports {
             // session owns its read/write cookie. Clearing it removes only the
             // preedit inserted by Flower before ending the composition.
             unsafe { range.SetText(self.edit_cookie, 0, &[]) }?;
+            self.move_selection_to_end(&range)?;
             self.end_composition()
         }
     }
 
     #[derive(Clone)]
     struct EditSessionOutcome {
-        composition: Option<ITfComposition>,
+        composition: Option<ActiveComposition>,
         controller: CompositionController,
         caret: Option<RECT>,
     }
@@ -493,7 +569,7 @@ mod windows_exports {
     }
 
     struct EditSessionState {
-        composition: Option<ITfComposition>,
+        composition: Option<ActiveComposition>,
         controller: CompositionController,
         outcome: Option<EditSessionOutcome>,
     }
@@ -512,7 +588,7 @@ mod windows_exports {
         fn new(
             context: ITfContext,
             update: CompositionUpdate,
-            composition: Option<ITfComposition>,
+            composition: Option<ActiveComposition>,
             controller: CompositionController,
         ) -> Self {
             Self {
@@ -532,7 +608,7 @@ mod windows_exports {
         fn new_popup_action(
             context: ITfContext,
             update: CompositionUpdate,
-            composition: Option<ITfComposition>,
+            composition: Option<ActiveComposition>,
             controller: CompositionController,
             completion: PopupActionCompletion,
         ) -> Self {
@@ -592,9 +668,28 @@ mod windows_exports {
                 let state = this.lock_state();
                 (state.composition.clone(), state.controller)
             };
+            if composition
+                .as_ref()
+                .is_some_and(|composition| composition.terminated.get())
+            {
+                return Err(E_UNEXPECTED.into());
+            }
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
-            let result = controller.apply_update(&mut host, &this.update);
+            let result = controller
+                .apply_update(&mut host, &this.update)
+                .and_then(|()| {
+                    if controller.is_active()
+                        && host
+                            .composition
+                            .as_ref()
+                            .is_some_and(|composition| composition.terminated.get())
+                    {
+                        Err(E_UNEXPECTED.into())
+                    } else {
+                        Ok(())
+                    }
+                });
             record_result(Stage::ApplyUpdate, &result);
             let caret = if result.is_ok() && controller.is_active() {
                 host.composition.as_ref().and_then(|composition| {
@@ -680,7 +775,7 @@ mod windows_exports {
         context: &ITfContext,
         client_id: u32,
         update: CompositionUpdate,
-        composition: Option<ITfComposition>,
+        composition: Option<ActiveComposition>,
         controller: CompositionController,
     ) -> Option<EditSessionOutcome> {
         let session: ITfEditSession =
@@ -1011,6 +1106,20 @@ mod windows_exports {
             drop(entry);
             return;
         }
+        if outcome.controller.is_active()
+            && outcome
+                .composition
+                .as_ref()
+                .is_some_and(|composition| composition.terminated.get())
+        {
+            clear_invalid_popup_action(
+                &target.activation,
+                target.token,
+                target.owner_thread,
+                target.key,
+            );
+            return;
+        }
         entry.composition = outcome.composition;
         entry.controller = outcome.controller;
         let caret = outcome.caret;
@@ -1150,6 +1259,13 @@ mod windows_exports {
 
     impl PopupActionCompletion {
         fn preflight(&self) -> bool {
+            if self
+                .entry
+                .as_ref()
+                .is_some_and(ContextEntry::composition_terminated)
+            {
+                return false;
+            }
             if std::thread::current().id() != self.target.owner_thread {
                 return false;
             }
@@ -1506,7 +1622,11 @@ mod windows_exports {
                     return Ok(FALSE);
                 }
                 (
-                    active.contexts.get(&key).map(|entry| entry.router.clone()),
+                    active
+                        .contexts
+                        .get(&key)
+                        .filter(|entry| !entry.composition_terminated())
+                        .map(|entry| entry.router.clone()),
                     active.settings.candidate_page_size,
                 )
             };
@@ -1589,7 +1709,7 @@ mod windows_exports {
             };
 
             let was_existing = entry.is_some();
-            let old_entry = entry.clone();
+            let mut old_entry = entry.clone();
             let mut entry = match entry {
                 Some(entry) => entry,
                 None => match ContextEntry::new(context, &settings) {
@@ -1597,6 +1717,17 @@ mod windows_exports {
                     None => return Ok(FALSE),
                 },
             };
+            if entry.composition_terminated() {
+                clear_invalid_popup_action(&self.get_impl().activation, token, owner_thread, key);
+                let Ok(router) = EngineRouter::with_page_size(settings.candidate_page_size) else {
+                    return Ok(FALSE);
+                };
+                entry.router = router;
+                entry.composition = None;
+                entry.controller = CompositionController::new();
+                entry.popup_model.hide();
+                old_entry = Some(entry.clone());
+            }
 
             let update = match entry.router.process_key(event) {
                 Ok(update) => update,
@@ -1730,6 +1861,242 @@ mod windows_exports {
             Ok(Ok(())) => S_OK,
             Ok(Err(error)) => error.code(),
             Err(_) => E_UNEXPECTED,
+        }
+    }
+
+    #[cfg(test)]
+    mod native_tests {
+        use super::*;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::TextServices::{
+            CLSID_TF_ThreadMgr, ITfCompositionView, ITfContextOwnerCompositionServices,
+            ITfDocumentMgr, TF_ES_READ, TF_POPF_ALL,
+        };
+
+        #[implement(ITfEditSession)]
+        struct ReadDocument {
+            context: ITfContext,
+            terminate: Option<ActiveComposition>,
+            text: Rc<RefCell<String>>,
+        }
+
+        impl ITfEditSession_Impl for ReadDocument_Impl {
+            fn DoEditSession(&self, cookie: u32) -> Result<()> {
+                if let Some(composition) = &self.terminate {
+                    let owner: ITfContextOwnerCompositionServices = self.context.cast()?;
+                    let view: ITfCompositionView = composition.handle.cast()?;
+                    unsafe { owner.TerminateComposition(&view) }?;
+                }
+                let range = unsafe { self.context.GetStart(cookie) }?;
+                let end = unsafe { self.context.GetEnd(cookie) }?;
+                unsafe { range.ShiftEndToRange(cookie, &end, TF_ANCHOR_END) }?;
+                let mut buffer = [0u16; 512];
+                let mut fetched = 0;
+                unsafe { range.GetText(cookie, 0, &mut buffer, &mut fetched) }?;
+                *self.text.borrow_mut() = String::from_utf16(&buffer[..fetched as usize])
+                    .map_err(|_| Error::from(E_UNEXPECTED))?;
+                Ok(())
+            }
+        }
+
+        fn read_document(host: &NativeDocument, terminate: Option<ActiveComposition>) -> String {
+            let flags = if terminate.is_some() {
+                TF_ES_READWRITE
+            } else {
+                TF_ES_READ
+            };
+            let text = Rc::new(RefCell::new(String::new()));
+            let session: ITfEditSession = ReadDocument {
+                context: host.context.clone(),
+                terminate,
+                text: Rc::clone(&text),
+            }
+            .into();
+            unsafe {
+                host.context
+                    .RequestEditSession(host.client, &session, TF_ES_SYNC | flags)
+            }
+            .unwrap()
+            .ok()
+            .unwrap();
+            let result = text.borrow().clone();
+            result
+        }
+
+        fn send_key(sink: &ITfKeyEventSink, context: &ITfContext, key: u8) {
+            assert!(
+                unsafe { sink.OnTestKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                unsafe { sink.OnKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool(),
+                "native TSF key must apply successfully"
+            );
+        }
+
+        struct Apartment;
+        impl Drop for Apartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+
+        struct NativeDocument {
+            manager: ITfThreadMgr,
+            document: ITfDocumentMgr,
+            context: ITfContext,
+            client: u32,
+        }
+
+        impl NativeDocument {
+            fn new() -> Result<Self> {
+                let manager: ITfThreadMgr =
+                    unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) }?;
+                let client = unsafe { manager.Activate() }?;
+                let document = unsafe { manager.CreateDocumentMgr() }?;
+                let mut context = None;
+                let mut cookie = 0;
+                unsafe {
+                    document.CreateContext(
+                        client,
+                        0,
+                        None::<&IUnknown>,
+                        &mut context,
+                        &mut cookie,
+                    )?;
+                }
+                let context = context.ok_or_else(|| Error::from(E_UNEXPECTED))?;
+                unsafe {
+                    document.Push(&context)?;
+                    manager.SetFocus(&document)?;
+                }
+                Ok(Self {
+                    manager,
+                    document,
+                    context,
+                    client,
+                })
+            }
+        }
+
+        impl Drop for NativeDocument {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = self.manager.SetFocus(None::<&ITfDocumentMgr>);
+                    let _ = self.document.Pop(TF_POPF_ALL);
+                    let _ = self.manager.Deactivate();
+                }
+            }
+        }
+
+        #[test]
+        fn native_context_accepts_pinyin_in_write_edit_session() {
+            // Only a new, TSF-owned empty document is used. This never reads a
+            // user document, injects global keys, or changes profile selection.
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let service: ITfTextInputProcessor = TextService::new().into();
+            let implementation =
+                unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
+            let token = next_activation_token();
+            *implementation.activation.borrow_mut() = Some(Activation {
+                thread_manager: host.manager.clone(),
+                keystroke_manager: host.manager.cast().unwrap(),
+                client_id: host.client,
+                contexts: HashMap::new(),
+                token,
+                owner_thread: std::thread::current().id(),
+                focus_epoch: 0,
+                foreground: true,
+                shown_context: None,
+                processing: false,
+                settings: Settings::default(),
+            });
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let tested =
+                unsafe { sink.OnTestKeyDown(&host.context, WPARAM(b'N' as usize), LPARAM(0)) };
+            let handled =
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(b'N' as usize), LPARAM(0)) };
+            assert!(
+                tested.unwrap().as_bool(),
+                "engine must accept a plain letter"
+            );
+            assert!(
+                handled.unwrap().as_bool(),
+                "native TSF edit must apply before eating the letter"
+            );
+            assert_eq!(read_document(&host, None), "n");
+            for key in b"IHAO" {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(read_document(&host, None), "nihao");
+            send_key(&sink, &host.context, b' ');
+            assert_eq!(read_document(&host, None), "你好");
+            for key in b"SHI" {
+                send_key(&sink, &host.context, *key);
+            }
+            send_key(&sink, &host.context, 0x1B);
+            assert_eq!(read_document(&host, None), "你好");
+            for key in b"NI HAO " {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(
+                read_document(&host, None),
+                "你好你好",
+                "commits must follow the caret"
+            );
+            for key in b"SHI" {
+                send_key(&sink, &host.context, *key);
+            }
+            let entry = implementation
+                .activation
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .contexts
+                .get(&context_key(&host.context))
+                .unwrap()
+                .clone();
+            let revision = entry.popup_model.snapshot().unwrap().revision;
+            let composition = entry.composition.unwrap();
+            assert_eq!(
+                read_document(&host, Some(composition.clone())),
+                "你好你好shi"
+            );
+            assert!(
+                composition.terminated.get(),
+                "TSF must notify the real sink"
+            );
+            send_key(&sink, &host.context, b'N');
+            assert!(
+                implementation
+                    .activation
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .contexts
+                    .get(&context_key(&host.context))
+                    .unwrap()
+                    .popup_model
+                    .snapshot()
+                    .unwrap()
+                    .revision
+                    > revision,
+                "old popup actions must stay invalid"
+            );
+            send_key(&sink, &host.context, b'I');
+            send_key(&sink, &host.context, b' ');
+            assert_eq!(read_document(&host, None), "你好你好shi你");
+            implementation.activation.borrow_mut().take();
         }
     }
 }

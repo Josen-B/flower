@@ -13,6 +13,9 @@ pub mod settings_ui;
 #[cfg(target_os = "windows")]
 pub mod registration;
 
+#[cfg(target_os = "windows")]
+pub mod install_path;
+
 pub use candidate::{
     clamp_candidate_popup, position_candidate_popup, AcceptedCandidateAction, CandidatePopupAction,
     CandidatePopupError, CandidatePopupLayout, CandidatePopupModel, CandidatePopupSnapshot,

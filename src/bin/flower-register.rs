@@ -9,6 +9,7 @@ const USAGE: &str = "\
 Flower 注册工具（Windows x64）
 
 用法：
+  flower-register check-install-path --path <目录>  只读检查机器安装目录安全性
   flower-register register [--dll <path>]  注册机器级 COM/TSF 组件（管理员终端）
   flower-register unregister               注销机器级 COM/TSF 组件（管理员终端）
   flower-register enable                   为当前用户添加 Flower 输入法
@@ -53,6 +54,10 @@ fn run_command(command: CliCommand) -> Result<(), String> {
     use flower::registration::OperationOutcome;
 
     match command {
+        CliCommand::CheckInstallPath { path } => {
+            flower::platform::install_path::check_install_path(&PathBuf::from(path))?;
+            println!("安装目录安全检查通过；未创建目录或修改权限。");
+        }
         CliCommand::Register { dll } => {
             let dll = resolve_dll_path(dll)?;
             let outcome = registration::register(&dll).map_err(|error| error.to_string())?;

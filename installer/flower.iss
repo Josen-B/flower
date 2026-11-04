@@ -36,7 +36,8 @@ VersionInfoProductName=Flower
 VersionInfoDescription=Flower 测试版安装器
 DefaultDirName={autopf}\Flower
 DefaultGroupName=Flower
-DisableDirPage=yes
+DisableDirPage=no
+AllowUNCPath=no
 DisableProgramGroupPage=yes
 UsePreviousAppDir=no
 PrivilegesRequired=admin
@@ -64,6 +65,7 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 Name: "zh"; MessagesFile: "compiler:Default.isl,zh-CN.isl"
 
 [Files]
+Source: "{#PackageDir}\flower-register.exe"; DestName: "flower-path-check.exe"; Flags: dontcopy
 #include FilesInclude
 Source: "notice.zh-CN.txt"; DestDir: "{app}\versions\{#BuildId}"; DestName: "INSTALLER-README.txt"; Flags: ignoreversion
 Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion
@@ -83,6 +85,7 @@ const
   InstallerKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{1B8DAF2E-D5F7-49AC-A9BF-4713A0D57224}_is1';
 var
   RegistrationFailed: Boolean;
+  PathCheckerReady: Boolean;
 
 function CreateFileW(Name: String; Access, Share: LongWord; Security: LongWord;
   Creation, Attributes: LongWord; Template: THandle): THandle;
@@ -99,6 +102,36 @@ function CompareStringOrdinal(Left: String; LeftLength: Integer;
 function PayloadDir: String;
 begin
   Result := ExpandConstant('{app}\versions\{#BuildId}');
+end;
+
+function PathChecker: String;
+begin
+  Result := ExpandConstant('{tmp}\flower-path-check.exe');
+end;
+
+function SafeInstallPath(Name: String): Boolean;
+var
+  ExitCode: Integer;
+begin
+  Result := False;
+  if not PathCheckerReady then Exit;
+  if CompareText(GetSHA256OfFile(PathChecker), '{#ExpectedToolHash}') <> 0 then Exit;
+  if Exec(PathChecker, 'check-install-path --path "' + Name + '"',
+    ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    Result := ExitCode = 0;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if CurPageID <> wpSelectDir then Exit;
+  if not PathCheckerReady then begin
+    ExtractTemporaryFile('flower-path-check.exe');
+    PathCheckerReady := True;
+  end;
+  Result := SafeInstallPath(WizardDirValue);
+  if not Result then
+    MsgBox('此目录不满足机器级 DLL 安全要求。请选择本地固定盘上的受保护目录（默认 Program Files），不能使用网络、链接或普通用户可写/可替换的目录。D 盘父目录须由管理员预先保护；安装器不会更改已有目录权限。', mbError, MB_OK);
 end;
 
 function HasSubkeys(Key: String): Boolean;
@@ -219,7 +252,9 @@ begin
   else if DirExists(PayloadDir) then
     Result := '目标版本目录已存在。为保护未知或未完成的安装，拒绝覆盖。'
   else if not HasNativeRuntime then
-    Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。';
+    Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。'
+  else if not SafeInstallPath(ExpandConstant('{app}')) then
+    Result := '安装目录安全检查失败。请返回目录页选择受保护的本地目录。';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -228,7 +263,7 @@ var
 begin
   if CurStep <> ssPostInstall then Exit;
   RegistrationFailed := True;
-  if TrustedPayload then begin
+  if SafeInstallPath(ExpandConstant('{app}')) and TrustedPayload then begin
     if Exec(PayloadDir + '\flower-register.exe',
       'register --dll "' + PayloadDir + '\flower.dll"', PayloadDir,
       SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
@@ -272,6 +307,17 @@ begin
   if SuppressibleMsgBox(
     '请确认每个用户已停用 Flower，并保存工作、退出所有使用过 Flower 的应用。卸载不会替其他账户停用，也不会删除用户设置。是否继续？',
     mbConfirmation, MB_YESNO, IDNO) <> IDYES then Exit;
+  { Never execute a helper directly out of a tree whose ACL may have changed.
+    Copy to Inno's private temporary directory, verify the copy, then inspect. }
+  if not FileCopy(PayloadDir + '\flower-register.exe', PathChecker, False) then begin
+    MsgBox('无法准备只读目录检查工具，已停止卸载并保留文件。', mbError, MB_OK);
+    Exit;
+  end;
+  PathCheckerReady := True;
+  if not SafeInstallPath(ExpandConstant('{app}')) then begin
+    MsgBox('安装目录权限已改变或文件校验失败，已停止卸载并保留文件。请先由管理员检查目录安全性。', mbError, MB_OK);
+    Exit;
+  end;
   if not DllNotInUse then begin
     MsgBox('Flower DLL 仍被占用或不可写。请退出宿主或注销登录后重试；未开始清理文件。', mbError, MB_OK);
     Exit;

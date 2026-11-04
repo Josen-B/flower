@@ -15,6 +15,30 @@ use flower::registration::{
     ILOT_UNINSTALL,
 };
 
+#[test]
+fn install_path_command_requires_exactly_one_nonempty_path() {
+    let args = |v: &[&str]| v.iter().map(OsString::from).collect();
+    assert_eq!(
+        parse_arguments(args(&[
+            "check-install-path",
+            "--path",
+            r"D:\Software\Flower"
+        ])),
+        Ok(CliCommand::CheckInstallPath {
+            path: OsString::from(r"D:\Software\Flower")
+        })
+    );
+    for v in [
+        vec!["check-install-path"],
+        vec!["check-install-path", "--path"],
+        vec!["check-install-path", "--path", ""],
+        vec!["check-install-path", "--dll", "x"],
+        vec!["check-install-path", "--path", "x", "--path", "y"],
+    ] {
+        assert!(parse_arguments(args(&v)).is_err());
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FakeRegistrationBackend {
     snapshot: InstallationSnapshot,

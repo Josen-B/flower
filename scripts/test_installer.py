@@ -15,6 +15,29 @@ from scripts import installer
 from scripts.test_package import PackageFixture, flower_package, make_pe
 
 
+class InstallerSourceTests(unittest.TestCase):
+    """Static integration guards, not a substitute for executing the wizard."""
+
+    def test_directory_selection_and_pre_copy_path_gate(self):
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        self.assertIn("DisableDirPage=no", source)
+        self.assertIn("AllowUNCPath=no", source)
+        self.assertIn("Flags: dontcopy", source)
+        prepare = source.split("function PrepareToInstall", 1)[1].split("procedure CurStepChanged", 1)[0]
+        self.assertIn("SafeInstallPath(ExpandConstant('{app}'))", prepare)
+        checker = source.split("function SafeInstallPath", 1)[1].split("function NextButtonClick", 1)[0]
+        self.assertLess(checker.index("GetSHA256OfFile"), checker.index("if Exec("))
+        self.assertIn("check-install-path --path", checker)
+
+    def test_post_copy_and_uninstall_validate_before_executing_installed_tool(self):
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        post = source.split("procedure CurStepChanged", 1)[1].split("procedure CurPageChanged", 1)[0]
+        self.assertLess(post.index("SafeInstallPath"), post.index("if Exec(PayloadDir"))
+        uninstall = source.split("function InitializeUninstall", 1)[1]
+        self.assertLess(uninstall.index("FileCopy("), uninstall.index("SafeInstallPath"))
+        self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PayloadDir"))
+
+
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -161,6 +184,16 @@ class InstallerTests(unittest.TestCase):
             data[name] = b"[]"
         self.rewrite(mutate, rehash_payload=True)
         with self.assertRaisesRegex(installer.InstallerError, "JSON"):
+            self.build()
+
+    def test_version_must_fit_windows_resource_fields(self):
+        def mutate(data):
+            name = next(k for k in data if k.endswith("/manifest.json"))
+            value = json.loads(data[name])
+            value["version"] = "70000.1.0"
+            data[name] = json.dumps(value).encode()
+        self.rewrite(mutate, rehash_payload=True)
+        with self.assertRaisesRegex(installer.InstallerError, "版本资源"):
             self.build()
 
     def test_existing_output_is_preserved(self):
