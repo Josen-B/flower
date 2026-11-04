@@ -19,31 +19,42 @@ pub const FLOWER_TEXT_SERVICE_CLSID: windows::core::GUID =
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]
 mod windows_exports {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::ptr;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    use std::thread::ThreadId;
 
     use crate::engine::{
         map_windows_virtual_key, CompositionUpdate, EngineRouter, KeyEvent, Modifiers,
     };
+    use crate::platform::candidate::{
+        deferred_action_is_valid, edit_publish_decision, AcceptedCandidateAction,
+        CandidatePopupAction, DeferredActionState, DeferredActionTicket, EditPublishDecision,
+        PopupRect,
+    };
     use crate::platform::composition::{CompositionController, CompositionHost};
+    use crate::platform::{CandidatePopupModel, CandidatePopupWindow, PopupError};
+    use crate::settings::{Settings, SettingsStore};
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER,
-        E_UNEXPECTED, FALSE, LPARAM, S_FALSE, S_OK, TRUE, WPARAM,
+        E_UNEXPECTED, FALSE, LPARAM, RECT, S_FALSE, S_OK, TRUE, WPARAM,
     };
     use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::TextServices::{
-        ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfEditSession,
-        ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl,
-        ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr,
-        TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY,
+        ITfComposition, ITfCompositionSink, ITfContext, ITfContextComposition, ITfContextView,
+        ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection, ITfKeyEventSink,
+        ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange, ITfTextInputProcessor,
+        ITfTextInputProcessor_Impl, ITfThreadMgr, TF_ANCHOR_END, TF_ES_ASYNC, TF_ES_READWRITE,
+        TF_ES_SYNC, TF_IAS_QUERYONLY,
     };
     use windows_core::{ComObjectInterface, IUnknownImpl};
 
@@ -87,6 +98,80 @@ mod windows_exports {
 
     fn can_unload() -> bool {
         OBJECT_COUNT.load(Ordering::SeqCst) == 0 && SERVER_LOCK_COUNT.load(Ordering::SeqCst) == 0
+    }
+
+    type ActivationToken = u64;
+
+    static NEXT_ACTIVATION_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+    fn next_activation_token() -> ActivationToken {
+        NEXT_ACTIVATION_TOKEN.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// A popup window owned by the thread that created it.
+    ///
+    /// The registration guard keeps `DllCanUnloadNow` false for as long as the
+    /// window state exists, including while it is leased out of thread-local
+    /// storage for a Win32 call.
+    struct ThreadPopup {
+        window: CandidatePopupWindow,
+        _registration: ObjectRegistration,
+    }
+
+    thread_local! {
+        static THREAD_POPUPS: RefCell<HashMap<ActivationToken, ThreadPopup>> =
+            RefCell::new(HashMap::new());
+    }
+
+    fn register_thread_popup(token: ActivationToken, window: CandidatePopupWindow) -> bool {
+        let popup = ThreadPopup {
+            window,
+            _registration: ObjectRegistration::new(),
+        };
+        match THREAD_POPUPS.try_with(|popups| popups.borrow_mut().insert(token, popup)) {
+            Ok(displaced) => {
+                // Drop outside the RefCell borrow so a displaced window never
+                // runs Win32 destruction while thread-local storage is
+                // borrowed.
+                drop(displaced);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Leases a window from the owning thread. The RefCell borrow ends before
+    /// the caller performs any Win32 calls, and a non-owner thread is never
+    /// given access to an `HWND` created elsewhere.
+    fn take_thread_popup(token: ActivationToken, owner_thread: ThreadId) -> Option<ThreadPopup> {
+        if std::thread::current().id() != owner_thread {
+            return None;
+        }
+
+        THREAD_POPUPS
+            .try_with(|popups| popups.borrow_mut().remove(&token))
+            .ok()
+            .flatten()
+    }
+
+    fn return_thread_popup(token: ActivationToken, owner_thread: ThreadId, popup: ThreadPopup) {
+        if std::thread::current().id() != owner_thread {
+            drop(popup);
+            return;
+        }
+
+        let displaced = THREAD_POPUPS.try_with(|popups| popups.borrow_mut().insert(token, popup));
+        drop(displaced);
+    }
+
+    fn close_thread_popup(token: ActivationToken, owner_thread: ThreadId) {
+        let Some(mut popup) = take_thread_popup(token, owner_thread) else {
+            return;
+        };
+
+        popup.window.hide();
+        let _ = popup.window.destroy();
+        drop(popup);
     }
 
     #[implement(IClassFactory)]
@@ -153,31 +238,65 @@ mod windows_exports {
         router: EngineRouter,
         composition: Option<ITfComposition>,
         controller: CompositionController,
+        popup_model: CandidatePopupModel,
     }
 
     impl ContextEntry {
-        fn new(context: &ITfContext) -> Option<Self> {
-            let router = EngineRouter::new().ok()?;
+        fn new(context: &ITfContext, settings: &Settings) -> Option<Self> {
+            let router = EngineRouter::with_page_size(settings.candidate_page_size).ok()?;
             Some(Self {
                 context: context.clone(),
                 router,
                 composition: None,
                 controller: CompositionController::new(),
+                popup_model: CandidatePopupModel::new(),
             })
         }
     }
 
     struct Activation {
+        thread_manager: ITfThreadMgr,
         keystroke_manager: ITfKeystrokeMgr,
         client_id: u32,
         contexts: HashMap<ContextKey, ContextEntry>,
+        /// Unique identity for this activation and its thread-local window.
+        token: ActivationToken,
+        /// Thread that created the service and owns the popup window.
+        owner_thread: ThreadId,
+        /// Incremented on every focus transition so stale key work cannot
+        /// republish or show a popup after focus changed.
+        focus_epoch: u64,
+        /// 当前 TSF 服务是否拥有前台焦点。
+        foreground: bool,
+        shown_context: Option<ContextKey>,
+        /// True while a key callback owns the synchronous edit session.
+        /// Recursive key callbacks pass through instead of starting another.
+        processing: bool,
+        /// Immutable settings captured when this activation started.
+        settings: Settings,
     }
+
+    type SharedActivation = Rc<RefCell<Option<Activation>>>;
 
     fn context_key(context: &ITfContext) -> ContextKey {
         // TSF supplies the same COM interface identity across callbacks for a
         // context. The raw interface pointer is stable; a Rust reference
         // address is not.
         context.as_raw() as usize
+    }
+
+    /// 查询当前 TSF 焦点文档的 top context。
+    ///
+    /// 调用方不得同时借用候选激活状态。`None` 表示查询失败或当前没有焦点
+    /// context，二者都必须使延迟鼠标动作失效。
+    fn focused_context_key(thread_manager: &ITfThreadMgr) -> Option<ContextKey> {
+        // SAFETY: The thread manager is retained for the activation lifetime.
+        // `GetFocus` and `GetTop` return counted COM references.
+        unsafe {
+            let document = thread_manager.GetFocus().ok()?;
+            let context = document.GetTop().ok()?;
+            Some(context_key(&context))
+        }
     }
 
     fn virtual_key_is_down(virtual_key: VIRTUAL_KEY) -> bool {
@@ -199,6 +318,14 @@ mod windows_exports {
         }
 
         map_windows_virtual_key(wparam.0 as u32, modifiers)
+    }
+
+    /// Maps a popup construction failure to the HRESULT reported by `Activate`.
+    fn popup_activation_hresult(error: &PopupError) -> HRESULT {
+        match error {
+            PopupError::Win32 { source, .. } => source.code(),
+            PopupError::NoSnapshot | PopupError::Destroyed => E_UNEXPECTED,
+        }
     }
 
     struct TfCompositionHost {
@@ -317,13 +444,44 @@ mod windows_exports {
         }
 
         fn cancel(&mut self) -> Result<()> {
+            let range = self.text_range()?;
+            // SAFETY: The range belongs to the active composition and this edit
+            // session owns its read/write cookie. Clearing it removes only the
+            // preedit inserted by Flower before ending the composition.
+            unsafe { range.SetText(self.edit_cookie, 0, &[]) }?;
             self.end_composition()
         }
     }
 
+    #[derive(Clone)]
     struct EditSessionOutcome {
         composition: Option<ITfComposition>,
         controller: CompositionController,
+        caret: Option<RECT>,
+    }
+
+    #[derive(Clone)]
+    struct EditTarget {
+        activation: SharedActivation,
+        thread_manager: ITfThreadMgr,
+        token: ActivationToken,
+        owner_thread: ThreadId,
+        key: ContextKey,
+        focus_epoch: u64,
+    }
+
+    /// 异步鼠标编辑完成后发布状态所需的数据。
+    ///
+    /// 该结构不持有 `TextService` 的 COM 强引用，只持有一个可失效的激活状态
+    /// 线程本地 `Rc<RefCell<_>>` 和 RAII processing guard，因此不会形成服务与
+    /// 窗口回调环，也不会被错误线程共享。
+    struct PopupActionCompletion {
+        target: EditTarget,
+        expected_revision: u64,
+        entry: Option<ContextEntry>,
+        update: Option<CompositionUpdate>,
+        completed: bool,
+        _processing: ProcessingGuard,
     }
 
     struct EditSessionState {
@@ -337,6 +495,9 @@ mod windows_exports {
         context: ITfContext,
         update: CompositionUpdate,
         state: Mutex<EditSessionState>,
+        completion: Mutex<Option<PopupActionCompletion>>,
+        requires_preflight: bool,
+        _registration: ObjectRegistration,
     }
 
     impl EditSession {
@@ -354,6 +515,30 @@ mod windows_exports {
                     controller,
                     outcome: None,
                 }),
+                completion: Mutex::new(None),
+                requires_preflight: false,
+                _registration: ObjectRegistration::new(),
+            }
+        }
+
+        fn new_popup_action(
+            context: ITfContext,
+            update: CompositionUpdate,
+            composition: Option<ITfComposition>,
+            controller: CompositionController,
+            completion: PopupActionCompletion,
+        ) -> Self {
+            Self {
+                context,
+                update,
+                state: Mutex::new(EditSessionState {
+                    composition,
+                    controller,
+                    outcome: None,
+                }),
+                completion: Mutex::new(Some(completion)),
+                requires_preflight: true,
+                _registration: ObjectRegistration::new(),
             }
         }
 
@@ -368,11 +553,32 @@ mod windows_exports {
             let mut state = self.lock_state();
             state.outcome.take()
         }
+
+        fn take_completion(&self) -> Option<PopupActionCompletion> {
+            match self.completion.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            }
+        }
     }
 
     impl ITfEditSession_Impl for EditSession_Impl {
         fn DoEditSession(&self, edit_cookie: u32) -> Result<()> {
             let this = self.get_impl();
+            let completion = this.take_completion();
+            if this.requires_preflight && completion.is_none() {
+                return Err(E_UNEXPECTED.into());
+            }
+            if completion
+                .as_ref()
+                .is_some_and(|completion| !completion.preflight())
+            {
+                if let Some(completion) = completion {
+                    completion.invalidate();
+                }
+                return Err(E_UNEXPECTED.into());
+            }
+
             let (composition, controller) = {
                 let state = this.lock_state();
                 (state.composition.clone(), state.controller)
@@ -380,79 +586,736 @@ mod windows_exports {
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
             let result = controller.apply_update(&mut host, &this.update);
+            let caret = if result.is_ok() && controller.is_active() {
+                host.composition.as_ref().and_then(|composition| {
+                    composition_caret(&this.context, composition, edit_cookie)
+                })
+            } else {
+                None
+            };
             let composition = host.into_composition();
 
             let mut state = this.lock_state();
             state.composition = composition.clone();
-            if result.is_ok() {
-                state.controller = controller;
-                state.outcome = Some(EditSessionOutcome {
+            let outcome = if result.is_ok() {
+                Some(EditSessionOutcome {
                     composition,
                     controller,
-                });
+                    caret,
+                })
+            } else {
+                None
+            };
+            if result.is_ok() {
+                state.controller = controller;
+                state.outcome = outcome.clone();
             }
-
+            drop(state);
+            if let Some(completion) = completion {
+                completion.finish(result.is_ok(), outcome);
+            }
             result
+        }
+    }
+
+    /// Returns the best-effort screen-space caret rectangle at the end of the
+    /// composition preedit.
+    ///
+    /// This runs inside the synchronous TSF edit session, so the context view
+    /// and composition range are valid. Failure only suppresses popup
+    /// positioning; the document edit has already succeeded.
+    fn composition_caret(
+        context: &ITfContext,
+        composition: &ITfComposition,
+        edit_cookie: u32,
+    ) -> Option<RECT> {
+        // SAFETY: The context, composition, and queried range are live TSF
+        // objects owned by the current edit session. `GetTextExt` only reads
+        // layout information, and `rect`/`clipped` are valid output storage
+        // for the duration of the call.
+        unsafe {
+            let range = composition.GetRange().ok()?;
+            let collapsed = collapsed_range_end(&range, edit_cookie)?;
+            let view: ITfContextView = context.GetActiveView().ok()?;
+            let mut rect = RECT::default();
+            let mut clipped = BOOL::default();
+            view.GetTextExt(edit_cookie, &collapsed, &mut rect, &mut clipped)
+                .ok()?;
+            if clipped.as_bool() {
+                return None;
+            }
+            Some(rect)
+        }
+    }
+
+    /// Clones a range and collapses it to its end for caret positioning.
+    fn collapsed_range_end(range: &ITfRange, edit_cookie: u32) -> Option<ITfRange> {
+        // SAFETY: `range` is a live range owned by the current edit session.
+        // `ITfRange::Clone` creates an independent TSF range object, so
+        // collapsing the clone cannot modify the composition range. Failure to
+        // clone or collapse only suppresses popup positioning.
+        unsafe {
+            let collapsed = range.Clone().ok()?;
+            collapsed.Collapse(edit_cookie, TF_ANCHOR_END).ok()?;
+            Some(collapsed)
+        }
+    }
+
+    /// 请求一次同步键盘编辑并取回编辑会话结果。
+    ///
+    /// TSF `SetText` 与 `EndComposition` 不是单一事务：即使调用返回错误，
+    /// 宿主文档也可能已经被部分修改。调用方只能恢复引擎侧快照，不能把
+    /// `None` 解释为“文档保证未变”或执行自动回滚。
+    fn request_key_edit_session(
+        context: &ITfContext,
+        client_id: u32,
+        update: CompositionUpdate,
+        composition: Option<ITfComposition>,
+        controller: CompositionController,
+    ) -> Option<EditSessionOutcome> {
+        let session: ITfEditSession =
+            EditSession::new(context.clone(), update, composition, controller).into();
+
+        // SAFETY: The context is live and `session` remains alive until the
+        // synchronous request returns.
+        let requested = unsafe {
+            context.RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READWRITE)
+        };
+        match requested {
+            // SAFETY: `session` was created from `EditSession` above.
+            Ok(result) if result.is_ok() => unsafe {
+                <ITfEditSession as AsImpl<EditSession>>::as_impl(&session).take_outcome()
+            },
+            Ok(_) | Err(_) => None,
+        }
+    }
+
+    fn dispatch_popup_action(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        owner_thread: ThreadId,
+        action: CandidatePopupAction,
+    ) {
+        if std::thread::current().id() != owner_thread {
+            return;
+        }
+
+        let initial = {
+            let Ok(activation) = shared.try_borrow() else {
+                return;
+            };
+            let Some(active) = activation
+                .as_ref()
+                .filter(|active| active.token == token && active.foreground)
+            else {
+                return;
+            };
+            if active.processing {
+                return;
+            }
+            let Some(key) = active.shown_context else {
+                return;
+            };
+            let Some(entry) = active.contexts.get(&key) else {
+                return;
+            };
+            let Some(snapshot) = entry.popup_model.snapshot() else {
+                return;
+            };
+            if entry.popup_model.accept_action(&action).is_err() {
+                return;
+            }
+            (
+                active.thread_manager.clone(),
+                key,
+                active.focus_epoch,
+                snapshot.revision,
+            )
+        };
+        let (thread_manager, key, focus_epoch, expected_revision) = initial;
+
+        // Query TSF focus without borrowing the thread-local activation.
+        let focus_context_matches = focused_context_key(&thread_manager) == Some(key);
+        if !focus_context_matches {
+            clear_invalid_popup_action(shared, token, owner_thread, key);
+            return;
+        }
+
+        let ticket = DeferredActionTicket {
+            activation: token,
+            focus_epoch,
+            context: key,
+            revision: expected_revision,
+        };
+        let prepared = {
+            let Ok(mut activation) = shared.try_borrow_mut() else {
+                return;
+            };
+            let Some(active) = activation.as_mut().filter(|active| active.token == token) else {
+                return;
+            };
+            if active.processing {
+                return;
+            }
+            let state = deferred_action_state(active, ticket, owner_thread, focus_context_matches);
+            if !deferred_action_is_valid(ticket, state) {
+                None
+            } else {
+                let Some(entry) = active.contexts.get(&key) else {
+                    return;
+                };
+                let Ok(accepted) = entry.popup_model.accept_action(&action) else {
+                    return;
+                };
+                let entry = entry.clone();
+                active.processing = true;
+                let processing = ProcessingGuard {
+                    activation: Rc::clone(shared),
+                    token,
+                    owner_thread,
+                };
+                Some((
+                    entry,
+                    active.client_id,
+                    thread_manager,
+                    accepted,
+                    processing,
+                ))
+            }
+        };
+        let Some((old_entry, client_id, thread_manager, accepted, processing)) = prepared else {
+            clear_invalid_popup_action(shared, token, owner_thread, key);
+            return;
+        };
+
+        let mut entry = old_entry;
+        let update = match accepted {
+            AcceptedCandidateAction::Select { index, .. } => entry.router.select_candidate(index),
+            AcceptedCandidateAction::PreviousPage { .. } => entry.router.previous_page(),
+            AcceptedCandidateAction::NextPage { .. } => entry.router.next_page(),
+        };
+        let update = match update {
+            Ok(update) => update,
+            Err(_) => {
+                clear_invalid_popup_action(shared, token, owner_thread, key);
+                return;
+            }
+        };
+
+        let update_for_completion = update.clone();
+        let context = entry.context.clone();
+        let composition = entry.composition.take();
+        let controller = entry.controller;
+        let target = EditTarget {
+            activation: Rc::clone(shared),
+            thread_manager,
+            token,
+            owner_thread,
+            key,
+            focus_epoch,
+        };
+        let completion = PopupActionCompletion {
+            target,
+            expected_revision,
+            entry: Some(entry),
+            update: Some(update_for_completion),
+            completed: false,
+            _processing: processing,
+        };
+        let session: ITfEditSession = EditSession::new_popup_action(
+            context.clone(),
+            update,
+            composition,
+            controller,
+            completion,
+        )
+        .into();
+
+        // SAFETY: The context belongs to the retained activation entry and
+        // remains live through the COM session reference. Async dispatch
+        // prevents document edits from running inside the popup WndProc.
+        let requested = unsafe {
+            context.RequestEditSession(client_id, &session, TF_ES_ASYNC | TF_ES_READWRITE)
+        };
+        if !matches!(&requested, Ok(result) if result.is_ok()) {
+            // SAFETY: `session` was created from `EditSession` above.
+            if let Some(completion) = unsafe {
+                <ITfEditSession as AsImpl<EditSession>>::as_impl(&session).take_completion()
+            } {
+                completion.invalidate();
+            }
+        }
+    }
+
+    fn deferred_action_state(
+        active: &Activation,
+        ticket: DeferredActionTicket,
+        owner_thread: ThreadId,
+        focus_context_matches: bool,
+    ) -> DeferredActionState {
+        DeferredActionState {
+            owner_thread_matches: std::thread::current().id() == owner_thread,
+            activation: Some(active.token),
+            foreground: active.foreground,
+            focus_epoch: active.focus_epoch,
+            focus_context_matches,
+            shown_context: active.shown_context,
+            revision: active
+                .contexts
+                .get(&ticket.context)
+                .and_then(|entry| entry.popup_model.snapshot())
+                .map(|snapshot| snapshot.revision),
+        }
+    }
+
+    fn clear_invalid_popup_action(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        owner_thread: ThreadId,
+        key: ContextKey,
+    ) {
+        if std::thread::current().id() != owner_thread {
+            return;
+        }
+        {
+            let Ok(mut activation) = shared.try_borrow_mut() else {
+                return;
+            };
+            if let Some(active) = activation
+                .as_mut()
+                .filter(|active| active.token == token && active.shown_context == Some(key))
+            {
+                active.shown_context = None;
+            }
+        }
+
+        let Some(mut popup) = take_thread_popup(token, owner_thread) else {
+            return;
+        };
+        popup.window.cancel_pending_actions();
+        popup.window.hide();
+        let still_owned = shared.try_borrow().ok().is_some_and(
+            |activation| matches!(activation.as_ref(), Some(active) if active.token == token),
+        );
+        if still_owned {
+            return_thread_popup(token, owner_thread, popup);
         }
     }
 
     #[implement(ITfTextInputProcessor, ITfKeyEventSink)]
     struct TextService {
-        activation: Mutex<Option<Activation>>,
+        activation: SharedActivation,
+        owner_thread: ThreadId,
         _registration: ObjectRegistration,
     }
 
     impl TextService {
         fn new() -> Self {
             Self {
-                activation: Mutex::new(None),
+                activation: Rc::new(RefCell::new(None)),
+                owner_thread: std::thread::current().id(),
                 _registration: ObjectRegistration::new(),
             }
         }
 
-        fn lock_activation(&self) -> MutexGuard<'_, Option<Activation>> {
-            match self.activation.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
+        fn owns_current_thread(&self) -> bool {
+            std::thread::current().id() == self.owner_thread
+        }
+
+        /// Restores a context entry only when the activation that started the
+        /// key is still active. The entry and any displaced entry are dropped
+        /// after the activation borrow is released.
+        fn restore_context(&self, token: ActivationToken, key: ContextKey, entry: ContextEntry) {
+            restore_activation_context(&self.activation, token, key, entry);
+        }
+    }
+
+    fn restore_activation_context(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        key: ContextKey,
+        entry: ContextEntry,
+    ) {
+        let mut entry = Some(entry);
+        let displaced = {
+            let Ok(mut activation) = shared.try_borrow_mut() else {
+                drop(entry);
+                return;
+            };
+            activation
+                .as_mut()
+                .filter(|active| active.token == token)
+                .and_then(|active| {
+                    entry
+                        .take()
+                        .and_then(|entry| active.contexts.insert(key, entry))
+                })
+        };
+
+        // TSF objects and popup state are released after the activation borrow.
+        drop(entry);
+        drop(displaced);
+    }
+
+    /// Clears an activation's in-flight edit flag when the callback exits.
+    ///
+    /// The flag is cleared only while the same activation token is still
+    /// present, so a callback that outlived a Deactivate/Activate cycle cannot
+    /// modify the replacement activation.
+    struct ProcessingGuard {
+        activation: SharedActivation,
+        token: ActivationToken,
+        owner_thread: ThreadId,
+    }
+
+    impl Drop for ProcessingGuard {
+        fn drop(&mut self) {
+            if std::thread::current().id() != self.owner_thread {
+                return;
+            }
+            let token = self.token;
+            let Ok(mut activation) = self.activation.try_borrow_mut() else {
+                return;
+            };
+            if let Some(active) = activation.as_mut().filter(|active| active.token == token) {
+                active.processing = false;
+            }
+        }
+    }
+
+    /// 将一次成功编辑的 router/popup 状态发布回当前激活。
+    ///
+    /// 键盘和鼠标共用此路径。Win32 调用发生在激活借用之外；重入按键由
+    /// `ProcessingGuard` 的 processing 标志拒绝。
+    fn publish_successful_edit(
+        target: &EditTarget,
+        mut entry: ContextEntry,
+        update: &CompositionUpdate,
+        outcome: EditSessionOutcome,
+    ) {
+        if std::thread::current().id() != target.owner_thread {
+            drop(entry);
+            return;
+        }
+        entry.composition = outcome.composition;
+        entry.controller = outcome.controller;
+        let caret = outcome.caret;
+        entry.popup_model.apply_update(update);
+
+        let focus_context_matches = focused_context_key(&target.thread_manager) == Some(target.key);
+        let (decision, shown_context) = {
+            let Ok(activation) = target.activation.try_borrow() else {
+                drop(entry);
+                return;
+            };
+            let (current_token, current_epoch, shown_context) = match activation.as_ref() {
+                Some(active) => (Some(active.token), active.focus_epoch, active.shown_context),
+                None => (None, 0, None),
+            };
+            (
+                edit_publish_decision(
+                    current_token,
+                    target.token,
+                    current_epoch,
+                    target.focus_epoch,
+                ),
+                shown_context,
+            )
+        };
+
+        if decision == EditPublishDecision::Discard {
+            // 新的激活不能接收旧 token 的编辑结果。
+            drop(entry);
+            return;
+        }
+
+        let allow_show = decision == EditPublishDecision::PublishAndShow && focus_context_matches;
+        let mut popup = take_thread_popup(target.token, target.owner_thread);
+        let mut visible = false;
+
+        if let Some(popup) = popup.as_mut() {
+            if shown_context != Some(target.key) {
+                popup.window.hide();
+            }
+
+            if entry
+                .popup_model
+                .snapshot()
+                .is_some_and(|snapshot| popup.window.update(snapshot).is_ok())
+            {
+                let can_show_now = allow_show && {
+                    target
+                        .activation
+                        .try_borrow()
+                        .ok()
+                        .is_some_and(|activation| {
+                            matches!(
+                                activation.as_ref(),
+                                Some(active)
+                                    if active.token == target.token
+                                        && active.focus_epoch == target.focus_epoch
+                            )
+                        })
+                };
+                visible = can_show_now
+                    && caret.is_some_and(|caret| {
+                        popup
+                            .window
+                            .show_at(PopupRect::new(
+                                caret.left,
+                                caret.top,
+                                caret.right,
+                                caret.bottom,
+                            ))
+                            .is_ok()
+                    });
+            }
+
+            if !visible {
+                popup.window.hide();
             }
         }
 
-        fn publish_context(&self, key: ContextKey, entry: ContextEntry) {
-            let mut entry = Some(entry);
-            let displaced = {
-                let mut activation = self.lock_activation();
-                activation.as_mut().and_then(|active| {
-                    let entry = entry.take()?;
-                    Some(active.contexts.insert(key, entry))
-                })
+        // Publish the entry and popup visibility with one short borrow. Focus or
+        // activation changes observed here win over the captured key state.
+        let mut entry = Some(entry);
+        let mut displaced = None;
+        let mut keep_popup = false;
+        let mut hide_now = visible;
+        {
+            let Ok(mut activation) = target.activation.try_borrow_mut() else {
+                drop(entry);
+                return;
             };
+            if let Some(active) = activation
+                .as_mut()
+                .filter(|active| active.token == target.token)
+            {
+                keep_popup = true;
+                let still_focused = active.foreground
+                    && active.focus_epoch == target.focus_epoch
+                    && focus_context_matches;
+                if visible && still_focused {
+                    active.shown_context = Some(target.key);
+                    hide_now = false;
+                } else {
+                    active.shown_context = None;
+                }
+                if let Some(entry) = entry.take() {
+                    displaced = active.contexts.insert(target.key, entry);
+                }
+            }
+        }
+        drop(entry);
+        drop(displaced);
 
-            drop(entry);
-            drop(displaced);
+        if let Some(popup) = popup {
+            if hide_now {
+                popup.window.hide();
+                keep_popup = target
+                    .activation
+                    .try_borrow()
+                    .ok()
+                    .is_some_and(|activation| {
+                        matches!(
+                            activation.as_ref(),
+                            Some(active) if active.token == target.token
+                        )
+                    });
+            }
+
+            if keep_popup {
+                return_thread_popup(target.token, target.owner_thread, popup);
+            } else {
+                // Activation ended while the popup was leased; destroy outside
+                // the activation borrow.
+                drop(popup);
+            }
+        }
+    }
+
+    impl PopupActionCompletion {
+        fn preflight(&self) -> bool {
+            if std::thread::current().id() != self.target.owner_thread {
+                return false;
+            }
+            let focus_context_matches =
+                focused_context_key(&self.target.thread_manager) == Some(self.target.key);
+            let ticket = DeferredActionTicket {
+                activation: self.target.token,
+                focus_epoch: self.target.focus_epoch,
+                context: self.target.key,
+                revision: self.expected_revision,
+            };
+            let Ok(activation) = self.target.activation.try_borrow() else {
+                return false;
+            };
+            let Some(active) = activation
+                .as_ref()
+                .filter(|active| active.token == self.target.token)
+            else {
+                return false;
+            };
+            if !active.processing {
+                return false;
+            }
+            deferred_action_is_valid(
+                ticket,
+                deferred_action_state(
+                    active,
+                    ticket,
+                    self.target.owner_thread,
+                    focus_context_matches,
+                ),
+            )
+        }
+
+        fn invalidate(mut self) {
+            self.completed = true;
+            clear_invalid_popup_action(
+                &self.target.activation,
+                self.target.token,
+                self.target.owner_thread,
+                self.target.key,
+            );
+        }
+
+        fn finish(mut self, succeeded: bool, outcome: Option<EditSessionOutcome>) {
+            self.completed = true;
+            let Some(outcome) = outcome else {
+                clear_invalid_popup_action(
+                    &self.target.activation,
+                    self.target.token,
+                    self.target.owner_thread,
+                    self.target.key,
+                );
+                return;
+            };
+            if !succeeded {
+                clear_invalid_popup_action(
+                    &self.target.activation,
+                    self.target.token,
+                    self.target.owner_thread,
+                    self.target.key,
+                );
+                return;
+            }
+            let Some(entry) = self.entry.take() else {
+                return;
+            };
+            let Some(update) = self.update.take() else {
+                return;
+            };
+            publish_successful_edit(&self.target, entry, &update, outcome);
+        }
+    }
+
+    impl Drop for PopupActionCompletion {
+        fn drop(&mut self) {
+            if !self.completed {
+                clear_invalid_popup_action(
+                    &self.target.activation,
+                    self.target.token,
+                    self.target.owner_thread,
+                    self.target.key,
+                );
+            }
+        }
+    }
+
+    impl Drop for TextService {
+        fn drop(&mut self) {
+            let active = self
+                .activation
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut activation| activation.take());
+
+            if let Some(active) = active {
+                // Best effort: only the owning thread can destroy the window.
+                close_thread_popup(active.token, active.owner_thread);
+                // Release TSF references after the activation borrow is gone.
+                drop(active);
+            }
         }
     }
 
     impl ITfTextInputProcessor_Impl for TextService_Impl {
         fn Activate(&self, thread_manager: Option<&ITfThreadMgr>, client_id: u32) -> Result<()> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             let Some(thread_manager) = thread_manager else {
                 return Err(E_INVALIDARG.into());
             };
 
+            // Load configuration once per activation, before borrowing the
+            // activation state and before creating its popup. Errors use
+            // defaults without rewriting the configured file or surfacing a
+            // host UI.
+            let settings = SettingsStore::for_current_user()
+                .and_then(|store| store.load())
+                .unwrap_or_default();
             let keystroke_manager: ITfKeystrokeMgr = thread_manager.cast()?;
             let key_sink: ITfKeyEventSink =
                 <Self as ComObjectInterface<ITfKeyEventSink>>::as_interface_ref(self).to_owned();
 
             {
-                let mut activation = self.get_impl().lock_activation();
+                let Ok(activation) = self.get_impl().activation.try_borrow() else {
+                    return Err(E_UNEXPECTED.into());
+                };
                 if activation.is_some() {
                     return Err(E_UNEXPECTED.into());
                 }
+            }
 
-                *activation = Some(Activation {
-                    keystroke_manager: keystroke_manager.clone(),
-                    client_id,
-                    contexts: HashMap::new(),
-                });
+            let mut popup = match CandidatePopupWindow::new() {
+                Ok(popup) => popup,
+                Err(error) => return Err(popup_activation_hresult(&error).into()),
+            };
+            if let Err(error) = popup.set_theme(settings.theme) {
+                return Err(popup_activation_hresult(&error).into());
+            }
+            let token = next_activation_token();
+            let owner_thread = std::thread::current().id();
+            let action_activation = Rc::clone(&self.get_impl().activation);
+            let action_sink: Rc<dyn Fn(CandidatePopupAction)> = Rc::new(move |action| {
+                dispatch_popup_action(&action_activation, token, owner_thread, action);
+            });
+            if let Err(error) = popup.set_action_sink(Some(action_sink)) {
+                return Err(popup_activation_hresult(&error).into());
+            }
+            if !register_thread_popup(token, popup) {
+                return Err(E_UNEXPECTED.into());
+            }
+
+            let published = {
+                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                    close_thread_popup(token, owner_thread);
+                    return Err(E_UNEXPECTED.into());
+                };
+                if activation.is_some() {
+                    false
+                } else {
+                    *activation = Some(Activation {
+                        thread_manager: thread_manager.clone(),
+                        keystroke_manager: keystroke_manager.clone(),
+                        client_id,
+                        contexts: HashMap::new(),
+                        token,
+                        owner_thread,
+                        focus_epoch: 0,
+                        foreground: true,
+                        shown_context: None,
+                        processing: false,
+                        settings,
+                    });
+                    true
+                }
+            };
+            if !published {
+                close_thread_popup(token, owner_thread);
+                return Err(E_UNEXPECTED.into());
             }
 
             // SAFETY: Both interfaces belong to live COM objects. TSF retains
@@ -462,10 +1325,13 @@ mod windows_exports {
 
             if let Err(error) = advised {
                 let stale = {
-                    let mut activation = self.get_impl().lock_activation();
+                    let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                        close_thread_popup(token, owner_thread);
+                        return Err(error);
+                    };
                     let should_rollback = matches!(
                         activation.as_ref(),
-                        Some(active) if active.client_id == client_id
+                        Some(active) if active.token == token
                     );
                     if should_rollback {
                         activation.take()
@@ -474,6 +1340,7 @@ mod windows_exports {
                     }
                 };
                 drop(stale);
+                close_thread_popup(token, owner_thread);
                 return Err(error);
             }
 
@@ -481,14 +1348,18 @@ mod windows_exports {
         }
 
         fn Deactivate(&self) -> Result<()> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             let active = {
-                let mut activation = self.get_impl().lock_activation();
+                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                    return Err(E_UNEXPECTED.into());
+                };
                 activation.take()
             };
             let Some(mut active) = active else {
                 return Ok(());
             };
-            active.contexts.clear();
 
             // SAFETY: The keystroke manager was obtained from the thread manager
             // during activation and remains live in this state.
@@ -498,25 +1369,86 @@ mod windows_exports {
                     .UnadviseKeyEventSink(active.client_id)
             };
             if let Err(error) = unadvised {
+                let token = active.token;
+                let owner_thread = active.owner_thread;
                 let displaced = {
-                    let mut activation = self.get_impl().lock_activation();
+                    let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                        close_thread_popup(token, owner_thread);
+                        return Err(error);
+                    };
                     if activation.is_none() {
                         activation.replace(active)
                     } else {
                         Some(active)
                     }
                 };
+                let restored = displaced.is_none();
                 drop(displaced);
+                if !restored {
+                    // A newer activation won the race, so the failed
+                    // deactivation state cannot be restored. Release its
+                    // window rather than leaking a thread-local popup.
+                    close_thread_popup(token, owner_thread);
+                }
                 return Err(error);
             }
 
+            close_thread_popup(active.token, active.owner_thread);
+            active.shown_context = None;
+            active.contexts.clear();
             drop(active);
             Ok(())
         }
     }
 
     impl ITfKeyEventSink_Impl for TextService_Impl {
-        fn OnSetFocus(&self, _foreground: BOOL) -> Result<()> {
+        fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
+            // Every focus transition invalidates key work that started under
+            // the previous focus state. Focus loss additionally hides the
+            // popup and clears its context.
+            let popup = {
+                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                    return Err(E_UNEXPECTED.into());
+                };
+                activation.as_mut().and_then(|active| {
+                    active.focus_epoch = active.focus_epoch.wrapping_add(1);
+                    active.foreground = foreground.as_bool();
+                    if foreground.as_bool() {
+                        None
+                    } else {
+                        active.shown_context = None;
+                        Some((active.token, active.owner_thread))
+                    }
+                })
+            };
+
+            if let Some((token, owner_thread)) = popup {
+                if let Some(mut popup) = take_thread_popup(token, owner_thread) {
+                    popup.window.cancel_pending_actions();
+                    popup.window.hide();
+
+                    let still_owned = {
+                        self.get_impl()
+                            .activation
+                            .try_borrow()
+                            .ok()
+                            .is_some_and(|activation| {
+                                matches!(activation.as_ref(), Some(active) if active.token == token)
+                            })
+                    };
+                    if still_owned {
+                        return_thread_popup(token, owner_thread, popup);
+                    } else {
+                        // The activation ended while the window was leased;
+                        // dropping destroys it outside the activation borrow.
+                        drop(popup);
+                    }
+                }
+            }
+
             Ok(())
         }
 
@@ -526,6 +1458,9 @@ mod windows_exports {
             wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             let Some(context) = context else {
                 return Ok(FALSE);
             };
@@ -534,16 +1469,24 @@ mod windows_exports {
             };
             let key = context_key(context);
 
-            let router = {
-                let activation = self.get_impl().lock_activation();
+            let (router, page_size) = {
+                let Ok(activation) = self.get_impl().activation.try_borrow() else {
+                    return Ok(FALSE);
+                };
                 let Some(active) = activation.as_ref() else {
                     return Ok(FALSE);
                 };
-                active.contexts.get(&key).map(|entry| entry.router.clone())
+                if active.processing {
+                    return Ok(FALSE);
+                }
+                (
+                    active.contexts.get(&key).map(|entry| entry.router.clone()),
+                    active.settings.candidate_page_size,
+                )
             };
             let router = match router {
                 Some(router) => router,
-                None => match EngineRouter::new() {
+                None => match EngineRouter::with_page_size(page_size) {
                     Ok(router) => router,
                     Err(_) => return Ok(FALSE),
                 },
@@ -561,6 +1504,9 @@ mod windows_exports {
             _wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             Ok(FALSE)
         }
 
@@ -570,6 +1516,9 @@ mod windows_exports {
             wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             let Some(context) = context else {
                 return Ok(FALSE);
             };
@@ -578,19 +1527,45 @@ mod windows_exports {
             };
             let key = context_key(context);
 
-            let (entry, client_id) = {
-                let mut activation = self.get_impl().lock_activation();
+            let (entry, client_id, token, owner_thread, focus_epoch, thread_manager, settings) = {
+                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                    return Ok(FALSE);
+                };
                 let Some(active) = activation.as_mut() else {
                     return Ok(FALSE);
                 };
-                (active.contexts.remove(&key), active.client_id)
+                if active.processing {
+                    return Ok(FALSE);
+                }
+                let entry = active.contexts.remove(&key);
+                let client_id = active.client_id;
+                let token = active.token;
+                let owner_thread = active.owner_thread;
+                let focus_epoch = active.focus_epoch;
+                let thread_manager = active.thread_manager.clone();
+                let settings = active.settings.clone();
+                active.processing = true;
+                (
+                    entry,
+                    client_id,
+                    token,
+                    owner_thread,
+                    focus_epoch,
+                    thread_manager,
+                    settings,
+                )
+            };
+            let _guard = ProcessingGuard {
+                activation: Rc::clone(&self.get_impl().activation),
+                token,
+                owner_thread,
             };
 
             let was_existing = entry.is_some();
             let old_entry = entry.clone();
             let mut entry = match entry {
                 Some(entry) => entry,
-                None => match ContextEntry::new(context) {
+                None => match ContextEntry::new(context, &settings) {
                     Some(entry) => entry,
                     None => return Ok(FALSE),
                 },
@@ -600,7 +1575,7 @@ mod windows_exports {
                 Ok(update) => update,
                 Err(_) => {
                     if let Some(old_entry) = old_entry {
-                        self.get_impl().publish_context(key, old_entry);
+                        self.get_impl().restore_context(token, key, old_entry);
                     }
                     return Ok(FALSE);
                 }
@@ -608,48 +1583,42 @@ mod windows_exports {
 
             if !update.handled {
                 if was_existing {
-                    self.get_impl().publish_context(key, entry);
+                    self.get_impl().restore_context(token, key, entry);
                 }
                 return Ok(FALSE);
             }
 
-            let session: ITfEditSession = EditSession::new(
-                entry.context.clone(),
+            let update_for_popup = update.clone();
+            let outcome = request_key_edit_session(
+                &entry.context,
+                client_id,
                 update,
                 entry.composition.take(),
                 entry.controller,
-            )
-            .into();
+            );
 
-            // SAFETY: The context is live and the edit session is kept alive
-            // until the synchronous request returns.
-            let requested = unsafe {
-                entry
-                    .context
-                    .RequestEditSession(client_id, &session, TF_ES_SYNC | TF_ES_READWRITE)
-            };
-            let outcome = match requested {
-                // SAFETY: `session` was created from `EditSession` above.
-                Ok(result) if result.is_ok() => unsafe {
-                    <ITfEditSession as AsImpl<EditSession>>::as_impl(&session).take_outcome()
-                },
-                Ok(_) | Err(_) => None,
+            let Some(outcome) = outcome else {
+                // The edit session did not report success. Restore the engine
+                // and popup snapshots, but do not claim the TSF document is
+                // unchanged: SetText may already have partially applied before
+                // a later EndComposition failure.
+                if let Some(old_entry) = old_entry {
+                    self.get_impl().restore_context(token, key, old_entry);
+                }
+                return Ok(FALSE);
             };
 
-            match outcome {
-                Some(outcome) => {
-                    entry.composition = outcome.composition;
-                    entry.controller = outcome.controller;
-                    self.get_impl().publish_context(key, entry);
-                    Ok(TRUE)
-                }
-                None => {
-                    if let Some(old_entry) = old_entry {
-                        self.get_impl().publish_context(key, old_entry);
-                    }
-                    Ok(FALSE)
-                }
-            }
+            let target = EditTarget {
+                activation: Rc::clone(&self.get_impl().activation),
+                thread_manager,
+                token,
+                owner_thread,
+                key,
+                focus_epoch,
+            };
+            publish_successful_edit(&target, entry, &update_for_popup, outcome);
+
+            Ok(TRUE)
         }
 
         fn OnKeyUp(
@@ -658,6 +1627,9 @@ mod windows_exports {
             _wparam: WPARAM,
             _lparam: LPARAM,
         ) -> Result<BOOL> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             Ok(FALSE)
         }
 
@@ -666,6 +1638,9 @@ mod windows_exports {
             _context: Option<&ITfContext>,
             _guid: *const GUID,
         ) -> Result<BOOL> {
+            if !self.get_impl().owns_current_thread() {
+                return Err(E_UNEXPECTED.into());
+            }
             Ok(FALSE)
         }
     }

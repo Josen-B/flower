@@ -42,6 +42,21 @@ impl EngineRouter {
         self.session.process_key(event)
     }
 
+    /// Selects and commits a zero-based candidate from the current page.
+    pub fn select_candidate(&mut self, index: usize) -> Result<CompositionUpdate, EngineError> {
+        self.session.select_candidate(index)
+    }
+
+    /// Moves to the next candidate page, if one exists.
+    pub fn next_page(&mut self) -> Result<CompositionUpdate, EngineError> {
+        self.session.next_page()
+    }
+
+    /// Moves to the previous candidate page, if one exists.
+    pub fn previous_page(&mut self) -> Result<CompositionUpdate, EngineError> {
+        self.session.previous_page()
+    }
+
     /// Returns true while a composition is active.
     pub fn is_composing(&self) -> bool {
         self.session.is_composing()
