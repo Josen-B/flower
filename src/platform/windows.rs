@@ -6,7 +6,7 @@
 //! text service that maintains per-context engine sessions and applies
 //! composition updates through synchronous TSF edit sessions.
 
-pub const TEXT_SERVICE_DESCRIPTION: &str = "Flower Pinyin input method";
+pub const TEXT_SERVICE_DESCRIPTION: &str = crate::registration::FLOWER_TEXT_SERVICE_DESCRIPTION;
 
 pub fn is_supported_platform() -> bool {
     cfg!(target_os = "windows")
@@ -14,7 +14,7 @@ pub fn is_supported_platform() -> bool {
 
 #[cfg(target_os = "windows")]
 pub const FLOWER_TEXT_SERVICE_CLSID: windows::core::GUID =
-    windows::core::GUID::from_u128(0x3d5b7cb1_96cb_4f44_a792_64304f6e7426);
+    windows::core::GUID::from_u128(crate::registration::FLOWER_TEXT_SERVICE_CLSID_U128);
 
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]

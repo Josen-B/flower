@@ -1,2 +1,4 @@
 /target/
+/dist/
+/scripts/__pycache__/
 **/*.rs.bk

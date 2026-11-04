@@ -27,8 +27,14 @@ Flower 是一款离线运行的 Windows 10/11 x64 拼音输入法。其实现是
 - `DllGetClassObject` 公开 Flower 类工厂，并且只接受 Flower 文本服务
   CLSID。活动文本服务为每个 TSF 上下文保留一个引擎会话，并通过同步编辑
   会话处理键盘更新；鼠标选择与翻页使用异步编辑会话。
-- 完整上下文焦点处理、TSF 配置文件注册、安装打包以及真实 Windows 主机冒烟
-  测试仍属于后续工作。当前 Linux 工作区不能替代 Windows 桌面交互验证。
+- `flower-register` 提供机器级 x64 COM/TSF 注册与当前用户启用分离流程。管理
+  员使用 `register`/`unregister` 写 HKLM，普通用户使用 `enable`/`disable`
+  只管理自己的 zh-CN Flower 配置。机器注册不会自动为所有用户启用输入法。
+- `scripts/package.py` 提供 Windows 10/11 x64 ZIP 打包流程：严格筛选 Cargo
+  release artifact，校验 AMD64 PE32+ 与 DLL 导出，收集依赖和 Rust 标准库
+  许可正文，并生成确定性 ZIP、包内清单和外部 SHA-256。
+- 完整上下文焦点处理、真实签名安装器以及真实 Windows 主机冒烟测试仍属于
+  后续工作。当前 Linux 工作区不能替代 Windows 制品和桌面交互验证。
 
 ## 仓库结构
 
@@ -37,8 +43,14 @@ Cargo.toml
 Cargo.lock
 rust-toolchain.toml
 README.md
+LICENSE-MIT
+LICENSE-APACHE
+scripts/
+  package.py
+  test_package.py
 src/
   bin/
+    flower-register.rs
     flower-settings.rs
   lib.rs
   engine/
@@ -55,15 +67,20 @@ src/
     mod.rs
     composition.rs
     popup.rs
+    registration.rs
     settings_ui.rs
     windows.rs
+  registration.rs
   settings.rs
 tests/
   candidate_popup.rs
   engine_router.rs
   pinyin_session.rs
+  registration.rs
 data/pinyin/mvp_lexicon.tsv
+docs/distribution.md
 docs/plans/
+.github/workflows/windows-package.yml
 ```
 
 分阶段实现与验收标准记录在
@@ -71,7 +88,7 @@ docs/plans/
 
 ## 公开 API
 
-主要 API 位于三个模块中：
+主要 API 位于四个模块中：
 
 - `flower::engine`：按键、按键事件、键位映射、词库加载、组词、候选和
   会话错误。
@@ -80,6 +97,8 @@ docs/plans/
   平台明确返回不支持。
 - `flower::platform`：候选弹窗快照与动作校验、组词宿主适配、平台支持、
   TSF 元数据、Windows COM 导出，以及 Windows-only 的非激活候选窗外壳。
+- `flower::registration`：固定 Flower COM/TSF 身份、严格 `OsString` 命令行
+  解析、x64 PE32+ DLL 校验，以及注册计划、回滚和用户启用操作的平台无关边界。
 
 常见的引擎和设置项也会从 crate 根重新导出：
 
@@ -116,6 +135,7 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
+python -m unittest -v scripts/test_package.py
 ```
 
 安装 MSVC 目标后，可从根目录检查 Windows TSF 边界：
@@ -136,6 +156,112 @@ flower-settings --help
 
 在非 Windows 目标上，`flower::platform::is_supported_platform()` 仍可使用
 并返回 `false`；Windows COM 实现不会被编译。
+
+## 注册、启用与注销
+
+Flower 的 TSF 安装不是单纯写 HKCU。完整机器安装由三部分组成：64 位
+`HKLM\Software\Classes\CLSID` 中的 COM 类、官方 TSF Profile Manager 中的
+zh-CN 语言配置，以及 `ITfCategoryMgr` 中的键盘分类。用户是否在语言列表中
+使用 Flower 是另一项当前用户设置。注册工具使用同一个固定 CLSID、语言配置
+GUID 和描述，不会替换其他输入法，也不会把 Flower 设为全体用户默认输入法。
+当前固定身份是 CLSID `{3D5B7CB1-96CB-4F44-A792-64304F6E7426}`、language
+profile `{6C7782F4-5F59-42CF-8C29-F9A8D46F1B72}`、zh-CN LANGID `0x0804`
+和描述 `Flower Pinyin input method`。
+
+先在 Windows 10/11 x64 上构建：
+
+```text
+cargo build --release --lib --target x86_64-pc-windows-msvc
+cargo build --release --bin flower-register --target x86_64-pc-windows-msvc
+cargo build --release --bin flower-settings --target x86_64-pc-windows-msvc
+```
+
+把 `flower.dll` 与 `flower-register.exe` 放在需要安装的位置。管理员打开
+“以管理员身份运行”的终端并执行：
+
+```text
+flower-register register --dll C:\Path\To\flower.dll
+```
+
+省略 `--dll` 时，工具使用自身所在目录的 `flower.dll`，不依赖当前工作目录。
+它会把指定的 `--dll` 解析为最终绝对路径，并拒绝非 AMD64 PE32+ DLL、缺少
+DLL 文件标志的映像、带 NUL 的 UTF-16 路径、越界头/节数据，以及不符合 Flower
+固定身份的既有 COM/TSF 数据。它不会调用 `LoadLibrary` 加载待注册的
+`flower.dll`。注册路径保留 `canonicalize` 返回的原始 UTF-16 形式，不为了
+显示而简化长路径或特殊路径语义。机器注册与注销使用系统级固定命名 mutex
+串行化，避免多个管理员实例互相回滚对方刚写入的项。
+
+注册完成后，每个需要使用的账户分别以普通用户身份执行：
+
+```text
+flower-register enable
+```
+
+然后按 Win+Space 手动选择 Flower。`enable` 成功表示当前用户的精确 Flower
+profile 已交给 Windows 输入布局系统，不表示当前焦点应用已经切换到 Flower。
+如果语言列表尚未刷新，可注销并重新登录。
+
+停止使用某账户的 Flower：
+
+```text
+flower-register disable
+```
+
+管理员注销机器注册前，应让各用户先执行 `disable`：
+
+```text
+flower-register unregister
+```
+
+`unregister` 先移除 Flower 的 TSF 键盘分类和语言配置，最后才移除 COM 类；
+TSF 清理失败时保留 COM 以支持修复后重试。COM 预检还要求
+`InprocServer32` 没有未知子项；删除时先整键删除它，再整键删除根键，不逐值
+擦除。根键删除失败时会尝试恢复已确认的 `InprocServer32`，失败则同时报告。
+它不会删除 `flower.dll`、设置文件或其他用户的输入配置。重复注销、以及 DLL
+文件已不存在时注销都可以安全执行。
+
+常见限制：
+
+- `register`/`unregister` 必须提升终端，工具不会自动弹 UAC 提权。`enable`/
+  `disable` 不需要管理员权限。
+- 机器注册不会为所有用户启用。其他用户需要自行运行 `enable`；注销也不会
+  代替这些用户执行 `disable`。
+- 已被宿主进程加载的 DLL 可能无法替换或删除。先运行 `disable`，退出正在使用
+  Flower 的应用程序；若仍被占用，注销并重新登录或重启后再替换 DLL。
+- 同一 CLSID 下出现不同 DLL 路径或额外注册数据时，工具会保守拒绝覆盖。
+  确认旧数据确属 Flower 后，先备份对应注册表项，再只删除已经核实的条目并
+  重新执行 `register`。不要用宽泛的树删除清理未知内容。
+- `InstallLayoutOrTip` 返回 `FALSE` 时 Windows 未提供可靠原因，错误文本不会
+  伪造 `GetLastError` 含义。请确认先完成机器注册、以目标用户运行 `enable`，
+  并尝试重新登录后重试。
+
+真实 Windows 上的管理员注册、普通用户启用、Win+Space 选择、注销重试、
+已加载 DLL 和多用户隔离仍需桌面验收。Stage 4c 的 ZIP 流程已实现，但真实
+Windows 包生成、解压运行和安装验收尚未在本 Linux 工作区完成。
+
+## ZIP 分发
+
+在 Windows 10/11 x64 上安装 Visual Studio C++ Build Tools、Windows SDK、
+Rust stable 的 `x86_64-pc-windows-msvc` 目标、`rustfmt`、`clippy` 和
+同工具链 `rust-docs` 后，从仓库任意当前目录运行：
+
+```text
+python C:\Path\To\flower\scripts\package.py
+```
+
+可加 `--output-dir` 指定输出位置。脚本不依赖当前工作目录，在非 Windows
+平台 `--help` 可用，但实际组包会明确拒绝。输出为
+`flower-<version>-windows-x64.zip` 和对应的 `.zip.sha256`；已有目标文件或
+悬空符号链接不会被覆盖。ZIP 包含 DLL、两个 EXE、中文安装说明、词库、
+`Cargo.lock`、项目与第三方许可证正文、`THIRD-PARTY-NOTICES.md`、
+`manifest.json` 和覆盖全部 payload 的 `SHA256SUMS`，不包含 PDB、`.rlib`、
+源码树或用户配置。
+
+完整的构建依赖、SHA-256 校验、稳定目录安装、管理员 `register`、普通用户
+`enable`、设置、停用/注销和升级步骤见
+[`docs/distribution.md`](docs/distribution.md)。该 ZIP 未签名、不是 MSI；
+包内词库改动不会热加载；CI 工作流尚未实际触发，Stage 2/3/4a/4b 的 Windows
+桌面验收也仍未完成。
 
 ## 输入行为
 

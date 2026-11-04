@@ -1,0 +1,1492 @@
+#!/usr/bin/env python3
+"""构建 Flower Windows x64 ZIP 分发包。"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+
+TARGET = "x86_64-pc-windows-msvc"
+EXPECTED_ROOT_LICENSE = "MIT OR Apache-2.0"
+EXPECTED_DLL_EXPORTS = frozenset({"DllGetClassObject", "DllCanUnloadNow"})
+SAFE_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+SUPPORTED_LICENSE_IDS = frozenset(
+    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0"}
+)
+LICENSE_FILE_PREFIXES = (
+    "LICENSE",
+    "COPYING",
+    "NOTICE",
+    "COPYRIGHT",
+    "UNLICENSE",
+)
+
+
+class PackagingError(Exception):
+    """打包失败；消息面向命令行的中文用户。"""
+
+
+class _ChineseHelpFormatter(argparse.HelpFormatter):
+    def add_usage(self, usage, actions, groups, prefix=None):
+        super().add_usage(
+            usage,
+            actions,
+            groups,
+            prefix="用法：" if prefix is None else prefix,
+        )
+
+
+def _localize_argument_error(message: str) -> str:
+    match = re.fullmatch(r"unrecognized arguments: (.+)", message)
+    if match:
+        return f"无法识别的参数：{match.group(1)}"
+    match = re.fullmatch(r"argument (.+): expected one argument", message)
+    if match:
+        return f"参数 {match.group(1)} 缺少值"
+    match = re.fullmatch(r"the following arguments are required: (.+)", message)
+    if match:
+        return f"缺少必需参数：{match.group(1)}"
+    return f"命令行参数无效：{message}"
+
+
+class _ChineseArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: 错误：{_localize_argument_error(message)}\n")
+
+
+@dataclass(frozen=True)
+class Section:
+    virtual_address: int
+    virtual_size: int
+    raw_offset: int
+    raw_size: int
+
+    @property
+    def mapped_size(self) -> int:
+        return max(self.virtual_size, self.raw_size)
+
+
+@dataclass(frozen=True)
+class PeImage:
+    sections: tuple[Section, ...]
+    size_of_image: int
+    export_directory: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class ArtifactPaths:
+    dll: Path
+    settings: Path
+    register: Path
+
+
+@dataclass(frozen=True)
+class PackageResult:
+    zip_path: Path
+    checksum_path: Path
+    version: str
+
+
+@dataclass(frozen=True)
+class PublishedFile:
+    path: Path
+    device: int
+    inode: int
+
+
+Runner = Callable[[Sequence[str], Path], subprocess.CompletedProcess[str]]
+
+
+def _subprocess_runner(
+    args: Sequence[str], cwd: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        cwd=str(cwd),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+    )
+
+
+def _invoke(
+    runner: Runner, args: Sequence[str], cwd: Path, description: str
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return runner(args, cwd)
+    except OSError as error:
+        raise PackagingError(f"{description}无法启动：{error}") from error
+
+
+def _checked_output(
+    runner: Runner, args: Sequence[str], cwd: Path, description: str
+) -> str:
+    completed = _invoke(runner, args, cwd, description)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if len(detail) > 6000:
+            detail = detail[-6000:]
+        suffix = f"\n{detail}" if detail else ""
+        raise PackagingError(
+            f"{description}失败（退出码 {completed.returncode}）。{suffix}"
+        )
+    return completed.stdout or ""
+
+
+def _read_bytes(path: Path, description: str) -> bytes:
+    try:
+        data = path.read_bytes()
+    except OSError as error:
+        raise PackagingError(f"无法读取{description} {path}：{error}") from error
+    if not data:
+        raise PackagingError(f"{description}为空：{path}")
+    return data
+
+
+def _safe_component(value: object, description: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not SAFE_FILE_NAME.fullmatch(value)
+        or value.endswith(".")
+    ):
+        raise PackagingError(
+            f"{description}不能安全用作文件名：{value!r}（仅允许 ASCII 字母、"
+            "数字、点、下划线、加号和连字符，长度 1-128，且不得以点结尾）"
+        )
+    return value
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _package_paths(version: str) -> tuple[str, str, str]:
+    base = f"flower-{version}-windows-x64"
+    return base, f"{base}.zip", f"{base}.zip.sha256"
+
+
+def _exists_even_dangling(path: Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def _reject_existing_outputs(zip_path: Path, checksum_path: Path) -> None:
+    existing = [
+        path for path in (zip_path, checksum_path) if _exists_even_dangling(path)
+    ]
+    if existing:
+        names = "、".join(path.name for path in existing)
+        raise PackagingError(
+            f"输出已存在，拒绝覆盖：{names}。请更换 --output-dir 或先人工处理"
+            "已有文件（包括悬空符号链接）。"
+        )
+
+
+def _load_metadata(stdout: str) -> tuple[dict, dict, dict[str, dict]]:
+    try:
+        metadata = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise PackagingError(f"cargo metadata 未返回合法 JSON：{error}") from error
+    if not isinstance(metadata, dict):
+        raise PackagingError("cargo metadata 的顶层值不是对象")
+
+    resolve = metadata.get("resolve")
+    if not isinstance(resolve, dict):
+        raise PackagingError("cargo metadata 缺少 resolve 信息")
+    root_id = resolve.get("root")
+    if not isinstance(root_id, str) or not root_id:
+        raise PackagingError("cargo metadata 未给出根包 package_id")
+
+    packages = metadata.get("packages")
+    if not isinstance(packages, list):
+        raise PackagingError("cargo metadata 缺少 packages")
+    package_by_id: dict[str, dict] = {}
+    for package in packages:
+        if not isinstance(package, dict):
+            raise PackagingError("cargo metadata 包含无效 package 项")
+        package_id = package.get("id")
+        if not isinstance(package_id, str) or not package_id:
+            raise PackagingError("cargo metadata 包含缺少 id 的 package")
+        if package_id in package_by_id:
+            raise PackagingError(f"cargo metadata 包含重复 package_id：{package_id}")
+        package_by_id[package_id] = package
+
+    root = package_by_id.get(root_id)
+    if root is None:
+        raise PackagingError("cargo metadata 的根 package_id 不在 packages 中")
+    if root.get("name") != "flower":
+        raise PackagingError(
+            f"cargo metadata 根包名称必须为 'flower'，实际为 {root.get('name')!r}"
+        )
+    if root.get("license") != EXPECTED_ROOT_LICENSE:
+        raise PackagingError(
+            "根 Cargo 包 SPDX 表达式必须为 "
+            f"{EXPECTED_ROOT_LICENSE!r}，实际为 {root.get('license')!r}"
+        )
+
+    nodes = resolve.get("nodes")
+    if not isinstance(nodes, list):
+        raise PackagingError("cargo metadata 缺少 resolve.nodes")
+    node_by_id: dict[str, dict] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise PackagingError("cargo metadata 包含无效 resolve node")
+        package_id = node.get("id")
+        if not isinstance(package_id, str) or not package_id:
+            raise PackagingError("cargo metadata 的 resolve node 缺少 id")
+        if package_id in node_by_id:
+            raise PackagingError(f"cargo metadata 包含重复 resolve node：{package_id}")
+        node_by_id[package_id] = node
+    if root_id not in node_by_id:
+        raise PackagingError("cargo metadata 的 resolve 缺少根包节点")
+
+    return metadata, root, package_by_id
+
+
+def _resolved_dependencies(
+    metadata: dict, root_id: str, package_by_id: Mapping[str, dict]
+) -> list[dict]:
+    resolve = metadata["resolve"]
+    node_by_id = {node["id"]: node for node in resolve["nodes"]}
+    pending = [root_id]
+    seen: set[str] = set()
+    while pending:
+        package_id = pending.pop()
+        if package_id in seen:
+            continue
+        seen.add(package_id)
+        node = node_by_id.get(package_id)
+        if node is None:
+            raise PackagingError(f"cargo resolve 缺少依赖节点：{package_id}")
+        dependency_entries: list[object] = []
+        for field_name in ("deps", "dependencies"):
+            value = node.get(field_name, [])
+            if not isinstance(value, list):
+                raise PackagingError(
+                    f"依赖节点 {field_name} 格式无效：{package_id}"
+                )
+            dependency_entries.extend(value)
+        for dependency in dependency_entries:
+            dependency_id = (
+                dependency.get("pkg")
+                if isinstance(dependency, dict)
+                else dependency
+            )
+            if not isinstance(dependency_id, str) or not dependency_id:
+                raise PackagingError(f"依赖节点缺少 package_id：{package_id}")
+            pending.append(dependency_id)
+
+    dependencies = []
+    for package_id in sorted(seen - {root_id}):
+        package = package_by_id.get(package_id)
+        if package is None:
+            raise PackagingError(f"依赖 package_id 不在 packages 中：{package_id}")
+        dependencies.append(package)
+    dependencies.sort(
+        key=lambda package: (
+            str(package.get("name", "")),
+            str(package.get("version", "")),
+            str(package.get("id", "")),
+        )
+    )
+    return dependencies
+
+
+def _license_expression_terms(expression: object, label: str) -> set[str]:
+    if not isinstance(expression, str) or not expression.strip():
+        raise PackagingError(f"{label}缺少 SPDX 许可表达式")
+
+    tokens: list[str] = []
+    position = 0
+    token_pattern = re.compile(
+        r"\s*(?:(AND|OR)|(\()|(\))|([A-Za-z0-9][A-Za-z0-9.+-]*))"
+    )
+    while position < len(expression):
+        match = token_pattern.match(expression, position)
+        if match is None:
+            remaining = expression[position:].strip()
+            if not remaining:
+                break
+            raise PackagingError(f"{label}的 SPDX 表达式无法解析：{expression!r}")
+        tokens.append(next(group for group in match.groups() if group is not None))
+        position = match.end()
+    if not tokens:
+        raise PackagingError(f"{label}缺少 SPDX 许可表达式")
+
+    index = 0
+    terms: set[str] = set()
+
+    def parse_atom() -> None:
+        nonlocal index
+        if index >= len(tokens):
+            raise PackagingError(f"{label}的 SPDX 表达式不完整：{expression!r}")
+        token = tokens[index]
+        if token == "(":
+            index += 1
+            parse_or()
+            if index >= len(tokens) or tokens[index] != ")":
+                raise PackagingError(f"{label}的 SPDX 表达式括号不匹配")
+            index += 1
+        elif token in {"AND", "OR", ")"}:
+            raise PackagingError(f"{label}的 SPDX 表达式位置无效：{expression!r}")
+        else:
+            terms.add(token)
+            index += 1
+
+    def parse_and() -> None:
+        nonlocal index
+        parse_atom()
+        while index < len(tokens) and tokens[index] == "AND":
+            index += 1
+            parse_atom()
+
+    def parse_or() -> None:
+        nonlocal index
+        parse_and()
+        while index < len(tokens) and tokens[index] == "OR":
+            index += 1
+            parse_and()
+
+    parse_or()
+    if index != len(tokens):
+        raise PackagingError(f"{label}的 SPDX 表达式存在多余内容：{expression!r}")
+    unknown = terms - SUPPORTED_LICENSE_IDS
+    if unknown:
+        names = "、".join(sorted(unknown))
+        raise PackagingError(
+            f"{label}含无法从本地正文确认的 SPDX 标识：{names}。"
+            "打包器不会下载许可证，也不会只打印 SPDX 名称。"
+        )
+    return terms
+
+
+def _classify_license_text(name: str, text: str) -> set[str]:
+    upper_name = name.upper()
+    normalized = text.casefold()
+    classes: set[str] = set()
+    if "UNICODE LICENSE V3" in text.upper() or "UNICODE-3.0" in text.upper():
+        classes.add("Unicode-3.0")
+    if (
+        "UNLICENSE" in upper_name
+        or "FREE AND UNENCUMBERED SOFTWARE RELEASED INTO THE PUBLIC DOMAIN"
+        in text.upper()
+    ):
+        classes.add("Unlicense")
+    if "APACHE LICENSE" in text.upper() and "VERSION 2.0" in text.upper():
+        classes.add("Apache-2.0")
+    if (
+        "MIT" in upper_name
+        or "MIT LICENSE" in text.upper()
+    ) and "PERMISSION IS HEREBY GRANTED" in text.upper():
+        classes.add("MIT")
+    if "COPYRIGHT" in upper_name and "permission is hereby granted" in normalized:
+        classes.add("MIT")
+    return classes
+
+
+def _license_files_for_package(package: dict) -> list[Path]:
+    manifest_value = package.get("manifest_path")
+    if not isinstance(manifest_value, str) or not manifest_value:
+        raise PackagingError(
+            f"依赖 {package.get('name')!r} 缺少 Cargo manifest_path"
+        )
+    package_dir = Path(manifest_value).parent.resolve()
+    if not package_dir.is_dir():
+        raise PackagingError(f"依赖本地目录不存在：{package_dir}")
+
+    candidates: set[Path] = set()
+    try:
+        direct_entries = list(package_dir.iterdir())
+    except OSError as error:
+        raise PackagingError(f"无法列出依赖许可证目录 {package_dir}：{error}") from error
+    for path in direct_entries:
+        if path.is_file() and path.name.upper().startswith(LICENSE_FILE_PREFIXES):
+            candidates.add(path)
+
+    license_file = package.get("license_file")
+    if isinstance(license_file, str) and license_file:
+        declared = Path(license_file)
+        if not declared.is_absolute():
+            declared = package_dir / declared
+        declared = declared.resolve()
+        try:
+            declared.relative_to(package_dir)
+        except ValueError as error:
+            raise PackagingError(
+                f"依赖 {package.get('name')!r} 的 license_file 越出包目录"
+            ) from error
+        if not declared.is_file():
+            raise PackagingError(
+                f"依赖 {package.get('name')!r} 声明的许可证文件不存在："
+                f"{declared.name}"
+            )
+        candidates.add(declared)
+
+    return sorted(candidates, key=lambda path: (path.name.casefold(), path.name))
+
+
+def _dependency_license_bundle(
+    dependencies: Sequence[dict],
+) -> tuple[dict[str, bytes], list[dict]]:
+    payload: dict[str, bytes] = {}
+    notices: list[dict] = []
+    casefold_paths: set[str] = set()
+
+    for package in dependencies:
+        name = _safe_component(package.get("name"), "依赖名称")
+        version = _safe_component(package.get("version"), "依赖版本")
+        label = f"依赖 {name} {version}"
+        expression = package.get("license")
+        terms = _license_expression_terms(expression, label)
+        files = _license_files_for_package(package)
+        if not files:
+            raise PackagingError(
+                f"{label}没有可附带的本地许可证正文（LICENSE/COPYING/NOTICE 等）"
+            )
+
+        classes: set[str] = set()
+        destination_dir = f"licenses/{name}-{version}"
+        license_paths: list[str] = []
+        for source in files:
+            data = _read_bytes(source, f"{label}许可证")
+            text = data.decode("utf-8", errors="replace")
+            classes.update(_classify_license_text(source.name, text))
+            destination = f"{destination_dir}/{source.name}"
+            folded = destination.casefold()
+            if folded in casefold_paths:
+                raise PackagingError(
+                    f"许可证目标路径在 Windows 上重复（大小写不敏感）：{destination}"
+                )
+            casefold_paths.add(folded)
+            payload[destination] = data
+            license_paths.append(destination)
+
+        missing = terms - classes
+        if missing:
+            names = "、".join(sorted(missing))
+            raise PackagingError(
+                f"{label}声明 {expression!r}，但本地许可证正文无法确认：{names}。"
+                "请检查依赖是否完整下载并带有相应许可正文。"
+            )
+
+        notices.append(
+            {
+                "name": name,
+                "version": version,
+                "spdx": expression,
+                "source": package.get("source") or "path dependency",
+                "repository": package.get("repository") or "not declared",
+                "license_paths": license_paths,
+            }
+        )
+
+    return payload, notices
+
+
+def _rust_std_bundle(sysroot: Path, rustc_version: str) -> tuple[dict[str, bytes], dict]:
+    doc_root = sysroot / "share" / "doc" / "rust"
+    copyright_path = doc_root / "COPYRIGHT-library.html"
+    if not copyright_path.is_file():
+        raise PackagingError(
+            "当前 rustc sysroot 缺少 "
+            f"{copyright_path}。请安装与当前 rustc 同一工具链的 rust-docs 组件"
+            "（例如 rustup component add rust-docs --toolchain <当前工具链>），"
+            "不能使用网络 master 文档替代。"
+        )
+
+    payload: dict[str, bytes] = {
+        "licenses/rust-std/COPYRIGHT-library.html": _read_bytes(
+            copyright_path, "Rust 标准库版权声明"
+        )
+    }
+    copyright_all = doc_root / "COPYRIGHT.html"
+    if copyright_all.is_file():
+        payload["licenses/rust-std/COPYRIGHT.html"] = _read_bytes(
+            copyright_all, "Rust 通用版权声明"
+        )
+
+    licenses_root = doc_root / "licenses"
+    if not licenses_root.is_dir():
+        raise PackagingError(
+            f"当前 rustc sysroot 缺少许可证正文目录 {licenses_root}。"
+            "请安装同工具链的 rust-docs 组件。"
+        )
+    license_files = sorted(
+        (path for path in licenses_root.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(licenses_root).as_posix(),
+    )
+    if not license_files:
+        raise PackagingError(f"Rust 许可证正文目录为空：{licenses_root}")
+    for source in license_files:
+        relative = source.relative_to(licenses_root)
+        destination = f"licenses/rust-std/licenses/{relative.as_posix()}"
+        payload[destination] = _read_bytes(source, "Rust 许可证正文")
+
+    return payload, {
+        "rustc": rustc_version,
+        "copyright_path": "licenses/rust-std/COPYRIGHT-library.html",
+        "license_paths": sorted(
+            path for path in payload if path.startswith("licenses/rust-std/")
+        ),
+    }
+
+
+def _u16(data: bytes, offset: int, description: str) -> int:
+    if offset < 0 or offset + 2 > len(data):
+        raise PackagingError(f"{description}越界")
+    return int.from_bytes(data[offset : offset + 2], "little")
+
+
+def _u32(data: bytes, offset: int, description: str) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise PackagingError(f"{description}越界")
+    return int.from_bytes(data[offset : offset + 4], "little")
+
+
+def _checked_add(value: int, amount: int, description: str) -> int:
+    result = value + amount
+    if result < value:
+        raise PackagingError(f"{description}偏移溢出")
+    return result
+
+
+def _parse_pe(data: bytes, role: str) -> PeImage:
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise PackagingError(f"{role}缺少 MZ 文件头")
+    pe_offset = _u32(data, 0x3C, f"{role} PE 头偏移")
+    if pe_offset < 0x40 or pe_offset + 4 > len(data):
+        raise PackagingError(f"{role}的 PE 头偏移无效")
+    if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise PackagingError(f"{role}缺少 PE 签名")
+
+    coff = pe_offset + 4
+    coff_end = coff + 20
+    if coff_end > len(data):
+        raise PackagingError(f"{role}的 COFF 头被截断")
+    machine = _u16(data, coff, f"{role}目标架构")
+    if machine != 0x8664:
+        raise PackagingError(f"{role}不是 AMD64（machine=0x{machine:04x}）")
+    section_count = _u16(data, coff + 2, f"{role}节数量")
+    if section_count == 0 or section_count > 96:
+        raise PackagingError(f"{role}节数量无效：{section_count}")
+    optional_size = _u16(data, coff + 16, f"{role}可选头长度")
+    characteristics = _u16(data, coff + 18, f"{role}文件特性")
+    is_dll = bool(characteristics & 0x2000)
+    if role == "flower.dll" and not is_dll:
+        raise PackagingError("flower.dll 缺少 DLL 文件标志")
+    if role != "flower.dll" and is_dll:
+        raise PackagingError(f"{role}不得带 DLL 文件标志")
+    if optional_size < 112:
+        raise PackagingError(f"{role}的 PE32+ 可选头过短")
+
+    optional = coff_end
+    optional_end = optional + optional_size
+    if optional_end > len(data):
+        raise PackagingError(f"{role}的可选头被截断")
+    if _u16(data, optional, f"{role}可选头 magic") != 0x20B:
+        raise PackagingError(f"{role}不是 PE32+")
+
+    directory_count = _u32(data, optional + 108, f"{role}数据目录数量")
+    if directory_count > 16:
+        raise PackagingError(f"{role}数据目录数量异常：{directory_count}")
+    required_optional_size = 112 + directory_count * 8
+    if required_optional_size > optional_size:
+        raise PackagingError(f"{role}的数据目录超出可选头边界")
+
+    size_of_image = _u32(data, optional + 56, f"{role}映像大小")
+    size_of_headers = _u32(data, optional + 60, f"{role}头部大小")
+    if size_of_image == 0:
+        raise PackagingError(f"{role}映像大小为零")
+    section_table_end = optional_end + section_count * 40
+    if section_table_end > len(data):
+        raise PackagingError(f"{role}的节表被截断")
+    if size_of_headers < section_table_end or size_of_headers > len(data):
+        raise PackagingError(f"{role}的 SizeOfHeaders 无效")
+
+    sections: list[Section] = []
+    for index in range(section_count):
+        offset = optional_end + index * 40
+        virtual_size = _u32(data, offset + 8, f"{role}第 {index + 1} 节虚拟大小")
+        virtual_address = _u32(
+            data, offset + 12, f"{role}第 {index + 1} 节虚拟地址"
+        )
+        raw_size = _u32(data, offset + 16, f"{role}第 {index + 1} 节原始大小")
+        raw_offset = _u32(data, offset + 20, f"{role}第 {index + 1} 节原始偏移")
+        section = Section(virtual_address, virtual_size, raw_offset, raw_size)
+        if raw_size:
+            raw_end = _checked_add(raw_offset, raw_size, f"{role}节原始范围")
+            if raw_offset < size_of_headers or raw_end > len(data):
+                raise PackagingError(f"{role}第 {index + 1} 节原始数据越界")
+        virtual_end = _checked_add(
+            section.virtual_address, section.mapped_size, f"{role}节虚拟范围"
+        )
+        if virtual_end > size_of_image:
+            raise PackagingError(f"{role}第 {index + 1} 节虚拟范围越界")
+        sections.append(section)
+
+    virtual_ranges = sorted(
+        (section.virtual_address, section.virtual_address + section.mapped_size)
+        for section in sections
+        if section.mapped_size
+    )
+    for previous, current in zip(virtual_ranges, virtual_ranges[1:]):
+        if current[0] < previous[1]:
+            raise PackagingError(f"{role}的节虚拟地址范围重叠")
+
+    raw_ranges = sorted(
+        (section.raw_offset, section.raw_offset + section.raw_size)
+        for section in sections
+        if section.raw_size
+    )
+    for previous, current in zip(raw_ranges, raw_ranges[1:]):
+        if current[0] < previous[1]:
+            raise PackagingError(f"{role}的节原始数据重叠")
+
+    export_directory = (0, 0)
+    if directory_count >= 1:
+        export_rva = _u32(data, optional + 112, f"{role}导出目录 RVA")
+        export_size = _u32(data, optional + 116, f"{role}导出目录大小")
+        if (export_rva == 0) != (export_size == 0):
+            raise PackagingError(f"{role}导出目录 RVA/大小不匹配")
+        export_directory = (export_rva, export_size)
+        if export_rva:
+            if export_size < 40:
+                raise PackagingError(f"{role}导出目录过短")
+            _mapped_span(
+                data,
+                sections,
+                size_of_image,
+                export_rva,
+                export_size,
+                f"{role}导出目录",
+            )
+
+    return PeImage(tuple(sections), size_of_image, export_directory)
+
+
+def _mapped_span(
+    data: bytes,
+    sections: Sequence[Section],
+    size_of_image: int,
+    rva: int,
+    size: int,
+    description: str,
+) -> int:
+    if size < 0 or rva < 0:
+        raise PackagingError(f"{description}范围无效")
+    end = _checked_add(rva, size, description)
+    if end > size_of_image:
+        raise PackagingError(f"{description}超出映像范围")
+    for section in sections:
+        if rva < section.virtual_address:
+            continue
+        relative = rva - section.virtual_address
+        if relative + size > section.mapped_size:
+            continue
+        if relative + size > section.raw_size:
+            raise PackagingError(f"{description}未完整落在节原始数据中")
+        raw = section.raw_offset + relative
+        if raw + size > len(data):
+            raise PackagingError(f"{description}超出文件边界")
+        return raw
+    raise PackagingError(f"{description}未映射到任何节")
+
+
+def _rva_raw_window(
+    data: bytes,
+    sections: Sequence[Section],
+    size_of_image: int,
+    rva: int,
+    description: str,
+) -> tuple[int, int]:
+    if rva < 0 or rva >= size_of_image:
+        raise PackagingError(f"{description}超出映像范围")
+    for section in sections:
+        if rva < section.virtual_address:
+            continue
+        relative = rva - section.virtual_address
+        if relative >= section.mapped_size:
+            continue
+        if relative >= section.raw_size:
+            raise PackagingError(f"{description}不在节原始数据中")
+        raw = section.raw_offset + relative
+        raw_end = min(len(data), section.raw_offset + section.raw_size)
+        if raw >= raw_end:
+            raise PackagingError(f"{description}超出文件边界")
+        return raw, raw_end
+    raise PackagingError(f"{description}未映射到任何节")
+
+
+def _export_names(image: PeImage, data: bytes) -> set[str]:
+    export_rva, export_size = image.export_directory
+    if not export_rva:
+        raise PackagingError("flower.dll 没有导出目录")
+    export_offset = _mapped_span(
+        data,
+        image.sections,
+        image.size_of_image,
+        export_rva,
+        export_size,
+        "flower.dll 导出目录",
+    )
+    function_count = _u32(data, export_offset + 20, "DLL 导出函数数量")
+    name_count = _u32(data, export_offset + 24, "DLL 导出名称数量")
+    functions_rva = _u32(data, export_offset + 28, "DLL 导出函数数组 RVA")
+    names_rva = _u32(data, export_offset + 32, "DLL 导出名称数组 RVA")
+    ordinals_rva = _u32(data, export_offset + 36, "DLL 导出序号数组 RVA")
+    if function_count == 0 or name_count == 0:
+        raise PackagingError("flower.dll 没有命名导出")
+    if function_count > 0xFFFF or name_count > 0xFFFF:
+        raise PackagingError("flower.dll 导出数组数量异常")
+
+    functions_offset = _mapped_span(
+        data,
+        image.sections,
+        image.size_of_image,
+        functions_rva,
+        function_count * 4,
+        "DLL 导出函数数组",
+    )
+    names_offset = _mapped_span(
+        data,
+        image.sections,
+        image.size_of_image,
+        names_rva,
+        name_count * 4,
+        "DLL 导出名称数组",
+    )
+    ordinals_offset = _mapped_span(
+        data,
+        image.sections,
+        image.size_of_image,
+        ordinals_rva,
+        name_count * 2,
+        "DLL 导出序号数组",
+    )
+    export_end = _checked_add(export_rva, export_size, "DLL 导出目录范围")
+
+    exported: set[str] = set()
+    for index in range(name_count):
+        name_rva = _u32(data, names_offset + index * 4, "DLL 导出名称 RVA")
+        ordinal = _u16(data, ordinals_offset + index * 2, "DLL 导出序号")
+        if ordinal >= function_count:
+            raise PackagingError("flower.dll 导出序号越界")
+        function_rva = _u32(
+            data, functions_offset + ordinal * 4, "DLL 导出函数 RVA"
+        )
+        if function_rva == 0:
+            raise PackagingError("flower.dll 命名导出的函数地址为空")
+        if export_rva <= function_rva < export_end:
+            raise PackagingError(
+                f"flower.dll 导出不是本地函数，疑似 forwarder："
+                f"RVA 0x{function_rva:x}"
+            )
+        _mapped_span(
+            data,
+            image.sections,
+            image.size_of_image,
+            function_rva,
+            1,
+            "DLL 导出函数地址",
+        )
+        name_offset, name_end = _rva_raw_window(
+            data,
+            image.sections,
+            image.size_of_image,
+            name_rva,
+            "DLL 导出名称",
+        )
+        terminator = data.find(
+            b"\0", name_offset, min(name_end, name_offset + 4096)
+        )
+        if terminator < 0:
+            raise PackagingError("flower.dll 导出名称缺少终止符或长度异常")
+        try:
+            name = data[name_offset:terminator].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise PackagingError("flower.dll 导出名称不是 ASCII") from error
+        if not name:
+            raise PackagingError("flower.dll 导出名称为空")
+        if name in exported:
+            raise PackagingError(f"flower.dll 重复导出名称：{name}")
+        exported.add(name)
+    return exported
+
+
+def _validate_binary(path: Path, role: str) -> tuple[bytes, str]:
+    if not path.is_file():
+        raise PackagingError(f"{role}不存在：{path}")
+    data = _read_bytes(path, role)
+    image = _parse_pe(data, role)
+    if role == "flower.dll":
+        export_names = _export_names(image, data)
+        missing = EXPECTED_DLL_EXPORTS - export_names
+        if missing:
+            names = "、".join(sorted(missing))
+            raise PackagingError(f"flower.dll 缺少必需导出：{names}")
+    return data, _sha256(data)
+
+
+def _artifact_output_path(
+    filename: object, target_directory: Path, role: str
+) -> Path:
+    if not isinstance(filename, str) or not filename:
+        raise PackagingError(f"{role} artifact 缺少文件路径")
+    path = Path(filename)
+    if not path.is_absolute():
+        path = target_directory / path
+    resolved = path.resolve()
+    release_directory = (target_directory / TARGET / "release").resolve()
+    if resolved.parent != release_directory:
+        raise PackagingError(
+            f"{role} artifact 不在 {TARGET}/release 目录：{resolved}"
+        )
+    return resolved
+
+
+def _is_release_profile(profile: object) -> bool:
+    return (
+        isinstance(profile, dict)
+        and profile.get("opt_level") == "3"
+        and profile.get("debug_assertions") is False
+        and profile.get("test") is False
+    )
+
+
+def _select_artifacts(
+    stdout: str, root_id: str, target_directory: Path
+) -> ArtifactPaths:
+    dll_candidates: list[Path] = []
+    executable_candidates: dict[str, list[Path]] = {
+        "flower-register.exe": [],
+        "flower-settings.exe": [],
+    }
+    nonrelease_roles: set[str] = set()
+    parsed_lines = 0
+    for line_number, line in enumerate(stdout.splitlines(), start=1):
+        if not line.strip():
+            continue
+        parsed_lines += 1
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise PackagingError(
+                f"cargo build 第 {line_number} 行不是合法 JSON：{error}"
+            ) from error
+        if not isinstance(message, dict):
+            raise PackagingError(f"cargo build 第 {line_number} 行不是对象")
+        if message.get("reason") != "compiler-artifact":
+            continue
+        if message.get("package_id") != root_id:
+            continue
+        target = message.get("target")
+        if not isinstance(target, dict):
+            raise PackagingError("cargo build artifact 缺少 target")
+        kind = target.get("kind")
+        crate_types = target.get("crate_types", [])
+        if not isinstance(kind, list) or not all(isinstance(item, str) for item in kind):
+            raise PackagingError("cargo build artifact 的 target.kind 无效")
+        if not isinstance(crate_types, list) or not all(
+            isinstance(item, str) for item in crate_types
+        ):
+            raise PackagingError("cargo build artifact 的 target.crate_types 无效")
+        target_name = target.get("name")
+        filenames = message.get("filenames", [])
+        if not isinstance(filenames, list):
+            raise PackagingError("cargo build artifact 的 filenames 无效")
+
+        is_cdylib = (
+            target_name == "flower"
+            and (
+                "cdylib" in kind
+                or ("lib" in kind and "cdylib" in crate_types)
+            )
+        )
+        expected_name = {
+            "flower-register": "flower-register.exe",
+            "flower-settings": "flower-settings.exe",
+        }.get(target_name)
+        if not is_cdylib and ("bin" not in kind or expected_name is None):
+            continue
+
+        role = "flower.dll" if is_cdylib else expected_name
+        profile = message.get("profile")
+        if not _is_release_profile(profile):
+            nonrelease_roles.add(role)
+            continue
+
+        if is_cdylib:
+            dll_files = [
+                filename
+                for filename in filenames
+                if isinstance(filename, str)
+                and Path(filename).name.casefold() == "flower.dll"
+            ]
+            if len(dll_files) != 1:
+                raise PackagingError(
+                    "根包 cdylib artifact 必须恰好包含一个 flower.dll"
+                )
+            dll_candidates.append(
+                _artifact_output_path(dll_files[0], target_directory, "flower.dll")
+            )
+            continue
+
+        executable = message.get("executable")
+        exe_files = [
+            filename
+            for filename in filenames
+            if isinstance(filename, str)
+            and Path(filename).name.casefold() == expected_name
+        ]
+        if executable is not None:
+            if not isinstance(executable, str):
+                raise PackagingError(f"{expected_name} artifact executable 无效")
+            if Path(executable).name.casefold() != expected_name:
+                raise PackagingError(
+                    f"{expected_name} artifact 指向了意外可执行文件："
+                    f"{Path(executable).name}"
+                )
+            exe_files.append(executable)
+        unique_exe_files = sorted(set(exe_files))
+        if len(unique_exe_files) != 1:
+            raise PackagingError(
+                f"根包 {target_name} artifact 必须恰好包含一个 {expected_name}"
+            )
+        executable_candidates[expected_name].append(
+            _artifact_output_path(
+                unique_exe_files[0], target_directory, expected_name
+            )
+        )
+
+    if parsed_lines == 0:
+        raise PackagingError("cargo build 未返回任何 JSON artifact")
+    if len(dll_candidates) != 1:
+        if not dll_candidates and "flower.dll" in nonrelease_roles:
+            raise PackagingError(
+                "cargo build 只提供了非 release flower.dll artifact；"
+                "要求 opt_level=3、debug_assertions=false、test=false"
+            )
+        raise PackagingError("cargo build 结果缺少或有歧义的 flower.dll artifact")
+    for role, candidates in executable_candidates.items():
+        if len(candidates) != 1:
+            if not candidates and role in nonrelease_roles:
+                raise PackagingError(
+                    f"cargo build 只提供了非 release {role} artifact；"
+                    "要求 opt_level=3、debug_assertions=false、test=false"
+                )
+            raise PackagingError(
+                f"cargo build 结果缺少或有歧义的 {role} artifact"
+            )
+
+    return ArtifactPaths(
+        dll=dll_candidates[0],
+        settings=executable_candidates["flower-settings.exe"][0],
+        register=executable_candidates["flower-register.exe"][0],
+    )
+
+
+def _binary_records(
+    artifacts: ArtifactPaths,
+) -> tuple[dict[str, bytes], list[dict]]:
+    binary_data: dict[str, bytes] = {}
+    records: list[dict] = []
+    entries = (
+        ("text_service_dll", "flower.dll", artifacts.dll),
+        ("settings_ui", "flower-settings.exe", artifacts.settings),
+        ("registration_cli", "flower-register.exe", artifacts.register),
+    )
+    for role, output_name, source in entries:
+        data, digest = _validate_binary(source, output_name)
+        binary_data[output_name] = data
+        records.append(
+            {
+                "role": role,
+                "path": output_name,
+                "size": len(data),
+                "sha256": digest,
+            }
+        )
+    return binary_data, records
+
+
+def _notices_text(dependencies: Sequence[dict], rust_std: dict) -> bytes:
+    lines = [
+        "# Flower 第三方声明",
+        "",
+        "本文件按 Windows x64 解析后的 Cargo 依赖闭包生成。许可证正文原样位于",
+        "`licenses/`，本文件中的 SPDX 表达式不能替代正文。",
+        "",
+        "## Rust 依赖包",
+        "",
+    ]
+    if not dependencies:
+        lines.extend(["（无）", ""])
+    for dependency in dependencies:
+        lines.extend(
+            [
+                f"### {dependency['name']} {dependency['version']}",
+                "",
+                f"- SPDX 标识：`{dependency['spdx']}`",
+                f"- 来源：`{dependency['source']}`",
+                f"- 仓库：`{dependency['repository']}`",
+                "- 许可证正文：",
+            ]
+        )
+        lines.extend(
+            f"  - `{license_path}`"
+            for license_path in dependency["license_paths"]
+        )
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Rust 标准库",
+            "",
+            f"- rustc 版本：`{rust_std['rustc']}`",
+            f"- 版权声明：`{rust_std['copyright_path']}`",
+            "- 许可证正文：",
+        ]
+    )
+    lines.extend(
+        f"  - `{license_path}`" for license_path in rust_std["license_paths"]
+    )
+    lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _write_payload(root: Path, payload: Mapping[str, bytes]) -> None:
+    for relative, data in sorted(payload.items()):
+        destination = root / Path(relative)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        destination.chmod(0o644)
+
+
+def _write_zip(zip_path: Path, top_level: str, payload: Mapping[str, bytes]) -> None:
+    with zipfile.ZipFile(
+        zip_path,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+        allowZip64=True,
+    ) as archive:
+        for relative, data in sorted(payload.items()):
+            entry = zipfile.ZipInfo(
+                filename=f"{top_level}/{relative}",
+                date_time=(1980, 1, 1, 0, 0, 0),
+            )
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.create_system = 3
+            entry.external_attr = 0o100644 << 16
+            archive.writestr(entry, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+
+
+def _file_identity(path: Path, description: str) -> tuple[int, int]:
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise PackagingError(f"无法读取{description}文件身份：{error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PackagingError(f"{description}不是普通文件")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _publish_no_overwrite(source: Path, destination: Path) -> PublishedFile:
+    if _exists_even_dangling(destination):
+        raise PackagingError(f"输出已存在，拒绝覆盖：{destination.name}")
+    source_identity = _file_identity(source, "暂存产物")
+    try:
+        os.link(source, destination)
+    except FileExistsError as error:
+        raise PackagingError(f"输出已存在，拒绝覆盖：{destination.name}") from error
+    except OSError as error:
+        if error.errno in {
+            errno.EPERM,
+            errno.EXDEV,
+            getattr(errno, "ENOTSUP", errno.EPERM),
+            getattr(errno, "EOPNOTSUPP", errno.EPERM),
+        }:
+            if os.name == "nt":
+                try:
+                    os.rename(source, destination)
+                except FileExistsError as rename_error:
+                    raise PackagingError(
+                        f"输出已存在，拒绝覆盖：{destination.name}"
+                    ) from rename_error
+                except OSError as rename_error:
+                    raise PackagingError(
+                        f"发布 {destination.name} 失败：{rename_error}"
+                    ) from rename_error
+            else:
+                raise PackagingError(
+                    "输出文件系统不支持原子硬链接发布；请选择支持硬链接的本地 "
+                    "NTFS 目录。未发布任何产物。"
+                ) from error
+        else:
+            raise PackagingError(f"发布 {destination.name} 失败：{error}") from error
+    try:
+        destination_identity = _file_identity(destination, "已发布产物")
+    except PackagingError as error:
+        raise PackagingError(
+            f"发布后无法确认 {destination.name} 的文件身份；"
+            "为避免误删，未自动回滚，可能留下该产物。"
+            f"原因：{error}"
+        ) from error
+    if destination_identity != source_identity:
+        raise PackagingError(
+            f"发布后 {destination.name} 的文件身份发生变化；未将其视为本次产物"
+        )
+    return PublishedFile(destination, destination_identity[0], destination_identity[1])
+
+
+def _build_payloads(
+    repo_root: Path,
+    version: str,
+    binary_data: Mapping[str, bytes],
+    binary_records: Sequence[dict],
+    dependency_payload: Mapping[str, bytes],
+    dependency_notices: Sequence[dict],
+    rust_payload: Mapping[str, bytes],
+    rust_std: dict,
+) -> tuple[dict[str, bytes], str]:
+    top_level, _, _ = _package_paths(version)
+    readme = _read_bytes(repo_root / "docs" / "distribution.md", "中文分发说明")
+    lexicon = _read_bytes(
+        repo_root / "data" / "pinyin" / "mvp_lexicon.tsv", "MVP 词库"
+    )
+    cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
+    root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
+    root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
+    root_terms = _license_expression_terms(EXPECTED_ROOT_LICENSE, "根包")
+    root_classes = _classify_license_text(
+        "LICENSE-MIT", root_mit.decode("utf-8", errors="replace")
+    )
+    root_classes.update(
+        _classify_license_text(
+            "LICENSE-APACHE", root_apache.decode("utf-8", errors="replace")
+        )
+    )
+    missing_root_terms = root_terms - root_classes
+    if missing_root_terms:
+        names = "、".join(sorted(missing_root_terms))
+        raise PackagingError(
+            f"根包许可声明 {EXPECTED_ROOT_LICENSE!r} 缺少可确认正文：{names}"
+        )
+
+    payload: dict[str, bytes] = {
+        "flower.dll": binary_data["flower.dll"],
+        "flower-settings.exe": binary_data["flower-settings.exe"],
+        "flower-register.exe": binary_data["flower-register.exe"],
+        "README.md": readme,
+        "LICENSE-MIT": root_mit,
+        "LICENSE-APACHE": root_apache,
+        "data/pinyin/mvp_lexicon.tsv": lexicon,
+        "Cargo.lock": cargo_lock,
+    }
+    for source in (dependency_payload, rust_payload):
+        for relative, data in source.items():
+            if relative in payload:
+                raise PackagingError(f"分发文件路径重复：{relative}")
+            payload[relative] = data
+
+    notices = _notices_text(dependency_notices, rust_std)
+    payload["THIRD-PARTY-NOTICES.md"] = notices
+
+    manifest = {
+        "schema_version": 1,
+        "package": "flower",
+        "version": version,
+        "target": TARGET,
+        "rustc": rust_std["rustc"],
+        "cargo_lock_sha256": _sha256(cargo_lock),
+        "binaries": list(binary_records),
+        "third_party": list(dependency_notices),
+        "rust_standard_library": rust_std,
+        "distribution": {
+            "format": "zip",
+            "authenticode_signed": False,
+            "windows_desktop_verified": False,
+        },
+    }
+    manifest_bytes = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    payload["manifest.json"] = manifest_bytes
+
+    checksum_lines = []
+    for relative, data in sorted(payload.items()):
+        checksum_lines.append(f"{_sha256(data)}  {relative}")
+    payload["SHA256SUMS"] = ("\n".join(checksum_lines) + "\n").encode("utf-8")
+    return payload, top_level
+
+
+def _rollback_published(published: Sequence[PublishedFile]) -> list[str]:
+    issues: list[str] = []
+    for item in reversed(published):
+        try:
+            if not _exists_even_dangling(item.path):
+                continue
+            current_identity = _file_identity(item.path, "已发布产物")
+            if current_identity != (item.device, item.inode):
+                issues.append(
+                    f"{item.path.name} 已被外部替换，未删除外部文件"
+                )
+                continue
+            item.path.unlink()
+        except PackagingError as error:
+            issues.append(f"{item.path.name} 回滚失败：{error}")
+        except OSError as error:
+            issues.append(f"{item.path.name} 回滚失败：{error}")
+    return issues
+
+
+def _cleanup_staging(staging: Path | None) -> None:
+    if staging is None:
+        return
+    try:
+        if not _exists_even_dangling(staging):
+            return
+        if staging.is_symlink() or not staging.is_dir():
+            raise PackagingError(
+                f"临时 staging 路径已不是本次目录，拒绝清理：{staging}"
+            )
+        shutil.rmtree(staging)
+    except PackagingError:
+        raise
+    except OSError as error:
+        raise PackagingError(f"清理临时 staging 失败：{staging}：{error}") from error
+
+
+def build_package(
+    *,
+    repo_root: Path | None = None,
+    output_dir: Path | None = None,
+    host_platform: str | None = None,
+    runner: Runner | None = None,
+) -> PackageResult:
+    """执行真实校验并构建分发包。
+
+    `host_platform` 和 `runner` 仅用于测试内部入口；命令行的实际构建没有跳过
+    校验或使用 fixture PE 的选项。
+    """
+
+    repo = (
+        Path(__file__).resolve().parent.parent
+        if repo_root is None
+        else Path(repo_root).resolve()
+    )
+    output = (
+        repo / "dist"
+        if output_dir is None
+        else Path(output_dir).expanduser().resolve()
+    )
+    platform_name = sys.platform if host_platform is None else host_platform
+    if platform_name != "win32":
+        raise PackagingError(
+            f"实际 ZIP 打包只支持 Windows；当前平台为 {platform_name!r}。"
+            "请在有 MSVC x64 工具链的 Windows 10/11 上运行。"
+        )
+    invoke = _subprocess_runner if runner is None else runner
+
+    metadata_stdout = _checked_output(
+        invoke,
+        [
+            "cargo",
+            "metadata",
+            "--locked",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            TARGET,
+        ],
+        repo,
+        "cargo metadata",
+    )
+    metadata, root_package, package_by_id = _load_metadata(metadata_stdout)
+    root_id = metadata["resolve"]["root"]
+    version = _safe_component(root_package.get("version"), "包版本")
+    _, zip_name, checksum_name = _package_paths(version)
+    zip_path = output / zip_name
+    checksum_path = output / checksum_name
+    _reject_existing_outputs(zip_path, checksum_path)
+
+    target_directory_value = metadata.get("target_directory")
+    if not isinstance(target_directory_value, str) or not target_directory_value:
+        raise PackagingError("cargo metadata 缺少 target_directory")
+    target_directory = Path(target_directory_value).resolve()
+
+    build_stdout = _checked_output(
+        invoke,
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--release",
+            "--lib",
+            "--bin",
+            "flower-register",
+            "--bin",
+            "flower-settings",
+            "--target",
+            TARGET,
+            "--message-format=json-render-diagnostics",
+        ],
+        repo,
+        "cargo build",
+    )
+    artifacts = _select_artifacts(build_stdout, root_id, target_directory)
+    binary_data, binary_records = _binary_records(artifacts)
+
+    rustc_version = _checked_output(
+        invoke, ["rustc", "-Vv"], repo, "获取 rustc 版本"
+    ).strip()
+    if not rustc_version:
+        raise PackagingError("rustc -Vv 未返回版本信息")
+    sysroot_text = _checked_output(
+        invoke, ["rustc", "--print", "sysroot"], repo, "获取 rustc sysroot"
+    ).strip()
+    if not sysroot_text:
+        raise PackagingError("rustc --print sysroot 未返回路径")
+    sysroot = Path(sysroot_text)
+    if not sysroot.is_dir():
+        raise PackagingError(f"rustc sysroot 目录不存在：{sysroot}")
+
+    dependencies = _resolved_dependencies(metadata, root_id, package_by_id)
+    dependency_payload, dependency_notices = _dependency_license_bundle(dependencies)
+    rust_payload, rust_std = _rust_std_bundle(sysroot, rustc_version)
+    payload, top_level = _build_payloads(
+        repo,
+        version,
+        binary_data,
+        binary_records,
+        dependency_payload,
+        dependency_notices,
+        rust_payload,
+        rust_std,
+    )
+
+    if _exists_even_dangling(output):
+        if not output.is_dir() or output.is_symlink():
+            raise PackagingError(f"--output-dir 不是普通目录：{output}")
+    else:
+        try:
+            output.mkdir(parents=True)
+        except OSError as error:
+            raise PackagingError(f"无法创建输出目录 {output}：{error}") from error
+
+    staging: Path | None = None
+    published: list[PublishedFile] = []
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=".flower-package-", dir=output))
+        stage_root = staging / top_level
+        stage_root.mkdir()
+        _write_payload(stage_root, payload)
+
+        staged_zip = staging / zip_name
+        _write_zip(staged_zip, top_level, payload)
+        digest = hashlib.sha256()
+        with staged_zip.open("rb") as archive:
+            for chunk in iter(lambda: archive.read(1024 * 1024), b""):
+                digest.update(chunk)
+        staged_checksum = staging / checksum_name
+        staged_checksum.write_text(
+            f"{digest.hexdigest()}  {zip_name}\n",
+            encoding="ascii",
+            newline="\n",
+        )
+
+        _reject_existing_outputs(zip_path, checksum_path)
+        published.append(_publish_no_overwrite(staged_zip, zip_path))
+        published.append(_publish_no_overwrite(staged_checksum, checksum_path))
+        _cleanup_staging(staging)
+        staging = None
+    except BaseException as original_error:
+        cleanup_issues = _rollback_published(published)
+        try:
+            _cleanup_staging(staging)
+        except PackagingError as error:
+            cleanup_issues.append(str(error))
+        if cleanup_issues:
+            detail = "；".join(cleanup_issues)
+            combined = PackagingError(
+                "打包失败，且未完成全部回滚或清理。"
+                f"原始错误：{type(original_error).__name__}: {original_error}。"
+                f"残留与清理问题：{detail}"
+            )
+            if isinstance(original_error, Exception):
+                raise combined from original_error
+            raise BaseExceptionGroup(
+                "打包失败且清理未完成",
+                [original_error, combined],
+            )
+        raise
+    return PackageResult(zip_path, checksum_path, version)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _ChineseArgumentParser(
+        usage="%(prog)s [选项]",
+        add_help=False,
+        formatter_class=_ChineseHelpFormatter,
+        description=(
+            "构建 Flower Windows 10/11 x64 ZIP 分发包。工具会执行锁定依赖的 "
+            "Cargo 构建，严格校验 DLL/EXE、许可证与 Rust 标准库文档，并生成"
+            "固定顺序和时间的 ZIP 与外部 SHA-256。"
+        ),
+        epilog=(
+            "默认输出到仓库根目录的 dist/；已有 zip 或 .zip.sha256 时拒绝覆盖。"
+            "实际打包仅支持 Windows。"
+        ),
+    )
+    parser._optionals.title = "选项"
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="显示此帮助并退出",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        metavar="目录",
+        help="ZIP 与 .zip.sha256 的输出目录（默认：仓库根目录/dist）",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = build_package(output_dir=args.output_dir)
+    except PackagingError as error:
+        print(f"错误：{error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"错误：打包文件操作失败：{error}", file=sys.stderr)
+        return 1
+    print(f"已生成：{result.zip_path}")
+    print(f"校验值：{result.checksum_path}")
+    print("注意：这是未签名 ZIP，尚未完成 Windows 桌面验收。")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -8,6 +8,9 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod settings_ui;
 
+#[cfg(target_os = "windows")]
+pub mod registration;
+
 pub use candidate::{
     clamp_candidate_popup, position_candidate_popup, AcceptedCandidateAction, CandidatePopupAction,
     CandidatePopupError, CandidatePopupLayout, CandidatePopupModel, CandidatePopupSnapshot,

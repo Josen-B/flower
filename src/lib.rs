@@ -2,11 +2,12 @@
 //! Flower's platform-independent engine, settings, and platform boundary.
 //!
 //! Hosts normally use the public modules directly:
-//! [`engine`], [`settings`], and [`platform`]. The most common engine and
+//! [`engine`], [`settings`], [`registration`], and [`platform`]. The most common engine and
 //! settings items are also re-exported at the crate root for convenience.
 
 pub mod engine;
 pub mod platform;
+pub mod registration;
 pub mod settings;
 
 pub use engine::{
