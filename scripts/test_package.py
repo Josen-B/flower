@@ -243,7 +243,23 @@ class PackageFixture:
         (self.repo / "data" / "pinyin" / "mvp_lexicon.tsv").write_text(
             "ni\t你\t10\n", encoding="utf-8"
         )
+        # Real, byte-locked dictionary bundle, but the PE binaries remain synthetic.
+        for name in (
+            "base_lexicon.tsv", "coverage.json", "sources/manifest.json",
+            "sources/kMandarin_8105.txt", "sources/UNICODE-LICENSE.txt",
+            "sources/LICENSE-pinyin-data.txt", "sources/NOTICE.md",
+        ):
+            destination = self.repo / "data/pinyin" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO_ROOT / "data/pinyin" / name, destination)
         shutil.copyfile(REPO_ROOT / "LICENSE-MIT", self.repo / "LICENSE-MIT")
+        for name in (
+            "phrase_lexicon.tsv", "proper_lexicon.tsv", "coverage.json", "manifest.json",
+            "quality-cases.json", "NOTICE.md", "sources/CC-BY-SA-4.0.txt", "sources/LICENSE-jieba.txt",
+        ):
+            destination = self.repo / "data/pinyin/phrases" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO_ROOT / "data/pinyin/phrases" / name, destination)
         shutil.copyfile(REPO_ROOT / "LICENSE-APACHE", self.repo / "LICENSE-APACHE")
         (self.repo / "Cargo.lock").write_text("# test lock\n", encoding="utf-8")
 
@@ -389,6 +405,36 @@ class PackageTests(unittest.TestCase):
             runner=runner,
         )
 
+    def test_dictionary_bundle_rejects_changed_generated_data_and_missing_license(self):
+        source = self.fixture.repo / "data/pinyin/base_lexicon.tsv"
+        original = source.read_bytes()
+        source.write_bytes(original + b"tampered")
+        with self.assertRaisesRegex(flower_package.PackagingError, "单字库"):
+            flower_package._dictionary_bundle(self.fixture.repo)
+        source.write_bytes(original)
+        (self.fixture.repo / "data/pinyin/sources/UNICODE-LICENSE.txt").unlink()
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._dictionary_bundle(self.fixture.repo)
+
+    def test_dictionary_bundle_rejects_a_forged_coverage_summary(self):
+        path = self.fixture.repo / "data/pinyin/coverage.json"
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["unique_characters"] += 1
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(flower_package.PackagingError, "实际覆盖"):
+            flower_package._dictionary_bundle(self.fixture.repo)
+
+    def test_phrase_bundle_rejects_changed_core_or_missing_sharealike_license(self):
+        path = self.fixture.repo / "data/pinyin/phrases/phrase_lexicon.tsv"
+        original = path.read_bytes()
+        path.write_bytes(original + b"broken")
+        with self.assertRaisesRegex(flower_package.PackagingError, "词组"):
+            flower_package._phrase_bundle(self.fixture.repo)
+        path.write_bytes(original)
+        (self.fixture.repo / "data/pinyin/phrases/sources/CC-BY-SA-4.0.txt").unlink()
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._phrase_bundle(self.fixture.repo)
+
     def test_help_succeeds_and_real_cli_refuses_non_windows(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -498,6 +544,15 @@ class PackageTests(unittest.TestCase):
                 "manifest.json",
                 "SHA256SUMS",
                 "data/pinyin/mvp_lexicon.tsv",
+                "data/pinyin/base_lexicon.tsv",
+                "data/pinyin/coverage.json",
+                "data/pinyin/sources/manifest.json",
+                "data/pinyin/sources/kMandarin_8105.txt",
+                "data/pinyin/phrases/phrase_lexicon.tsv",
+                "data/pinyin/phrases/proper_lexicon.tsv",
+                "data/pinyin/phrases/coverage.json",
+                "data/pinyin/phrases/manifest.json",
+                "data/pinyin/phrases/quality-cases.json",
             }
             self.assertTrue(required <= relative_names)
             self.assertEqual(

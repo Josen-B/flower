@@ -49,6 +49,13 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 自定义机器安装目录不能仅开放向导路径页。用 check-install-path 只读检查本地固定盘、重解析点、owner/DACL、祖先替换权限及实际 payload 树；不要通过增加 users-readexec ACE 假装移除了继承写权限，也不要擅自改 D 盘父目录 ACL。
 - 安装前后及卸载前的 helper 必须来自核对哈希的私有临时副本；在执行安装树内 helper 前完成 ACL 检查。原生 SDDL 内存描述符可验证 allow/deny、inherit-only、null DACL 和未知 ACE，不需修改系统 ACL。SDDL 的 DC 是目录服务权限，不是文件系统 FILE_DELETE_CHILD；后者应使用 0x40。
 
+## 用户词典发布前进程终止回归
+
+- 可用隔离 `DictionaryStore::new` 指向本 Thread scratch 下词典，父进程持有目标的无 delete-sharing 只读句柄，让真实生产写入停留在原子发布前；不得使用真实用户词典或填满工作磁盘。
+- 观察唯一临时文件，并以拒绝 WRITE sharing 的只读打开确认生产写句柄已关闭；结合生产路径 `write_all -> sync_all -> close -> publish` 确定检查点，不用固定 sleep 宣称已进入写入阶段。
+- 用测试程序自身的精确 helper 启动子进程，只终止该测试拥有的 child 并 wait/reap；断言失败也须通过 guard 停止并回收子进程。读取 staged JSON 检查新 generation，再强制结束，验证旧目标逐字节不变、可重新加载与管理写入、orphan 不被误恢复。清理仅限本次测试目录。
+- `tests/user_dictionary_process.rs` 的 `killed_writer_before_atomic_publish_preserves_old_bytes_and_allows_recovery` 是定向入口。此类证据只覆盖同步完成但尚未发布时的进程结束，不证明写入中途、真实磁盘满、系统崩溃或掉电耐久性；不要为扩大表述而自动执行危险注入。
+
 ## 交接
 
 记录源码版本/差异、实际命令、产物哈希、安装绑定、当前用户启用状态、桌面观察及未覆盖项。未签名包或失败的桌面验收不得标为可发布。旧归档保持不可变，并说明其是否包含后续源码修改。日志和探针放当前会话目录，不把会话绝对路径或用户输入沉淀到长期文档/技能。

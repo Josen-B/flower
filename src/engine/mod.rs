@@ -5,10 +5,12 @@
 //! and routes them through [`EngineRouter`]. The resulting
 //! [`CompositionUpdate`] values are rendered by the platform layer.
 
+mod decoder;
 mod error;
 mod key;
 mod lexicon;
 mod router;
+mod segment;
 mod session;
 mod types;
 
@@ -20,4 +22,4 @@ pub use keymap::map_windows_virtual_key;
 pub use lexicon::Lexicon;
 pub use router::EngineRouter;
 pub use session::{EngineSession, PinyinSession, DEFAULT_PAGE_SIZE};
-pub use types::{Candidate, CompositionUpdate};
+pub use types::{Candidate, CompositionUpdate, LearningEvent};

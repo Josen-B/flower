@@ -1,0 +1,21 @@
+{
+  "base_lexicon_sha256": "8f62401ce9f1f902bcb9fbedaae075bf55822e8c57b59d101cb963ca8d61fec2",
+  "baseline_covered": 8105,
+  "baseline_expected": 8105,
+  "baseline_source": "pinyin-data/kMandarin_8105.txt (upstream transcription)",
+  "missing_characters": [],
+  "pinyin_character_pairs": 52841,
+  "pinyin_data_revision": "fe29ad32bdf352b31a02b9936e537f575432e9a6",
+  "pinyin_keys": 424,
+  "ranking": "static-priority-tiers-not-corpus-frequency",
+  "schema_version": 1,
+  "source_sha256": {
+    "LICENSE-pinyin-data.txt": "9c048697be2502a16e8bcb282d5d465a07295b2def0ffb05a269c5d39dbe1586",
+    "UNICODE-LICENSE.txt": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96",
+    "Unihan_Readings.txt": "575e69c9ad85a4737a889a4f94cbd987042a90a1a6cc16dd3f4ed995c715b17c",
+    "kMandarin_8105.txt": "3538219db8ef4809e8de51c82655aedabacbc54f92acbe6a0e6925156f845f76"
+  },
+  "supplementary_characters": 17639,
+  "unicode_version": "17.0.0",
+  "unique_characters": 44350
+}

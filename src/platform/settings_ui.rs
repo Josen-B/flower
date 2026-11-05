@@ -38,13 +38,14 @@ use crate::settings::{
     parse_candidate_page_size_input, Settings, SettingsStore, Theme, MAX_CANDIDATE_PAGE_SIZE,
     MIN_CANDIDATE_PAGE_SIZE,
 };
+use crate::user_dictionary::DictionaryStore;
 
 const WINDOW_CLASS_NAME: PCWSTR = windows::core::w!("Flower.SettingsWindow");
 const WINDOW_TITLE: PCWSTR = windows::core::w!("Flower 设置");
 const FONT_FACE: PCWSTR = windows::core::w!("Microsoft YaHei UI");
 const BASE_DPI: u32 = 96;
 const CLIENT_WIDTH: i32 = 460;
-const CLIENT_HEIGHT: i32 = 350;
+const CLIENT_HEIGHT: i32 = 580;
 
 const PAGE_LABEL_ID: i32 = 100;
 const PAGE_EDIT_ID: i32 = 101;
@@ -52,6 +53,11 @@ const PAGE_HINT_ID: i32 = 102;
 const THEME_LABEL_ID: i32 = 103;
 const THEME_COMBO_ID: i32 = 104;
 const NOTICE_ID: i32 = 105;
+const LEARNING_ID: i32 = 106;
+const CLEAR_LEARNING_ID: i32 = 107;
+const DOMAIN_COMBO_ID: i32 = 108;
+const DOMAIN_ENABLED_ID: i32 = 109;
+const DICTIONARY_STATUS_ID: i32 = 110;
 const SAVE_BUTTON_ID: i32 = IDOK.0;
 const CANCEL_BUTTON_ID: i32 = IDCANCEL.0;
 
@@ -126,6 +132,7 @@ pub fn run_settings_app() -> Result<(), String> {
         fonts: Vec::new(),
         saving: false,
         creation_error: None,
+        domain_names: Vec::new(),
     }));
     let state_pointer = state_pointer(state.as_ref());
     let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
@@ -216,10 +223,16 @@ pub fn run_settings_app() -> Result<(), String> {
                 key if key == VK_ESCAPE.0 as u32 => Some(CANCEL_BUTTON_ID),
                 key if key == VK_RETURN.0 as u32 => {
                     let focus = unsafe { GetFocus() };
-                    let command = if !focus.is_invalid()
-                        && unsafe { GetDlgCtrlID(focus) } == CANCEL_BUTTON_ID
-                    {
-                        CANCEL_BUTTON_ID
+                    let focused_id = if focus.is_invalid() {
+                        0
+                    } else {
+                        unsafe { GetDlgCtrlID(focus) }
+                    };
+                    let command = if matches!(
+                        focused_id,
+                        CANCEL_BUTTON_ID | CLEAR_LEARNING_ID | LEARNING_ID | DOMAIN_ENABLED_ID
+                    ) {
+                        focused_id
                     } else {
                         SAVE_BUTTON_ID
                     };
@@ -298,6 +311,7 @@ struct SettingsUiState {
     fonts: Vec<HFONT>,
     saving: bool,
     creation_error: Option<String>,
+    domain_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -308,6 +322,11 @@ struct SettingsControls {
     cancel_button: HWND,
     notice: HWND,
     labels: [HWND; 3],
+    learning: HWND,
+    clear_learning: HWND,
+    domain_combo: HWND,
+    domain_enabled: HWND,
+    dictionary_status: HWND,
 }
 
 unsafe extern "system" fn settings_window_proc(
@@ -370,6 +389,20 @@ unsafe fn handle_settings_message(
                 }
             } else if control_id == CANCEL_BUTTON_ID {
                 let _ = unsafe { DestroyWindow(hwnd) };
+            } else if matches!(
+                control_id,
+                LEARNING_ID | CLEAR_LEARNING_ID | DOMAIN_ENABLED_ID
+            ) && notification == BN_CLICKED
+            {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    dictionary_action(hwnd, state, control_id);
+                }
+            } else if control_id == DOMAIN_COMBO_ID
+                && notification == windows::Win32::UI::WindowsAndMessaging::CBN_SELCHANGE
+            {
+                if let Some(state) = unsafe { settings_state_pointer(hwnd).as_ref() } {
+                    refresh_dictionary(hwnd, state);
+                }
             }
             LRESULT(0)
         }
@@ -511,11 +544,68 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         hwnd,
         instance,
         windows::core::w!("BUTTON"),
-        windows::core::w!("取消"),
+        windows::core::w!("关闭"),
         WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
         CANCEL_BUTTON_ID,
     )?;
     update_controls(state, |controls| controls.cancel_button = cancel_button)?;
+
+    for (id, class, caption, extra_style) in [
+        (
+            LEARNING_ID,
+            windows::core::w!("BUTTON"),
+            windows::core::w!("启用本地学习（默认关闭，立即保存）"),
+            windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
+        ),
+        (
+            CLEAR_LEARNING_ID,
+            windows::core::w!("BUTTON"),
+            windows::core::w!("清空学习记录…"),
+            BS_PUSHBUTTON as u32,
+        ),
+        (
+            DOMAIN_COMBO_ID,
+            windows::core::w!("COMBOBOX"),
+            PCWSTR::null(),
+            CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0,
+        ),
+        (
+            DOMAIN_ENABLED_ID,
+            windows::core::w!("BUTTON"),
+            windows::core::w!("启用选中专业词库（立即保存）"),
+            windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
+        ),
+        (
+            DICTIONARY_STATUS_ID,
+            windows::core::w!("STATIC"),
+            PCWSTR::null(),
+            0,
+        ),
+    ] {
+        let control = create_control(
+            hwnd,
+            instance,
+            class,
+            caption,
+            WS_CHILD.0
+                | WS_VISIBLE.0
+                | (if id == DICTIONARY_STATUS_ID {
+                    0
+                } else {
+                    WS_TABSTOP.0
+                })
+                | extra_style,
+            id,
+        )?;
+        update_controls(state, |controls| match id {
+            LEARNING_ID => controls.learning = control,
+            CLEAR_LEARNING_ID => controls.clear_learning = control,
+            DOMAIN_COMBO_ID => controls.domain_combo = control,
+            DOMAIN_ENABLED_ID => controls.domain_enabled = control,
+            _ => controls.dictionary_status = control,
+        })?;
+    }
+    refresh_dictionary(hwnd, state);
 
     set_control_text(
         hwnd,
@@ -624,9 +714,14 @@ fn layout_controls(state: &RefCell<SettingsUiState>, dpi: u32) {
     let _ = set_control_rect(controls.labels[1], 120, 52, 300, 24, dpi);
     let _ = set_control_rect(controls.labels[2], 20, 90, 360, 24, dpi);
     let _ = set_control_rect(controls.theme_combo, 20, 118, 180, 110, dpi);
-    let _ = set_control_rect(controls.notice, 20, 240, 420, 44, dpi);
-    let _ = set_control_rect(controls.save_button, 240, 300, 90, 30, dpi);
-    let _ = set_control_rect(controls.cancel_button, 350, 300, 90, 30, dpi);
+    let _ = set_control_rect(controls.learning, 20, 168, 420, 28, dpi);
+    let _ = set_control_rect(controls.clear_learning, 20, 206, 180, 30, dpi);
+    let _ = set_control_rect(controls.domain_combo, 20, 254, 420, 150, dpi);
+    let _ = set_control_rect(controls.domain_enabled, 20, 294, 420, 28, dpi);
+    let _ = set_control_rect(controls.dictionary_status, 20, 334, 420, 120, dpi);
+    let _ = set_control_rect(controls.notice, 20, 470, 420, 44, dpi);
+    let _ = set_control_rect(controls.save_button, 240, 530, 90, 30, dpi);
+    let _ = set_control_rect(controls.cancel_button, 350, 530, 90, 30, dpi);
 }
 
 fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), WindowsError> {
@@ -654,6 +749,11 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         controls.notice,
         controls.save_button,
         controls.cancel_button,
+        controls.learning,
+        controls.clear_learning,
+        controls.domain_combo,
+        controls.domain_enabled,
+        controls.dictionary_status,
     ] {
         if !control.is_invalid() {
             unsafe {
@@ -713,21 +813,182 @@ fn delete_all_fonts(state: &RefCell<SettingsUiState>) {
 }
 
 fn theme_dropdown_open(state: &RefCell<SettingsUiState>) -> bool {
-    let Ok(combo) = state.try_borrow().map(|state| state.controls.theme_combo) else {
+    let Ok(controls) = state.try_borrow().map(|state| state.controls) else {
         return false;
     };
-    if combo.is_invalid() {
-        return false;
-    }
-    unsafe {
+    [controls.theme_combo, controls.domain_combo]
+        .iter()
+        .any(|&combo| {
+            !combo.is_invalid()
+                && unsafe {
+                    SendMessageW(
+                        combo,
+                        CB_GETDROPPEDSTATE,
+                        WPARAM::default(),
+                        LPARAM::default(),
+                    )
+                }
+                .0 != 0
+        })
+}
+
+fn selected_domain(state: &RefCell<SettingsUiState>, combo: HWND) -> Option<String> {
+    let selected = unsafe {
         SendMessageW(
             combo,
-            CB_GETDROPPEDSTATE,
+            windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
             WPARAM::default(),
             LPARAM::default(),
         )
     }
-    .0 != 0
+    .0;
+    usize::try_from(selected)
+        .ok()
+        .and_then(|index| state.try_borrow().ok()?.domain_names.get(index).cloned())
+}
+
+fn set_checked(control: HWND, checked: bool) {
+    unsafe {
+        SendMessageW(
+            control,
+            windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK,
+            WPARAM(usize::from(checked)),
+            LPARAM::default(),
+        );
+    }
+}
+
+fn is_checked(control: HWND) -> bool {
+    unsafe {
+        SendMessageW(
+            control,
+            windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK,
+            WPARAM::default(),
+            LPARAM::default(),
+        )
+    }
+    .0 == 1
+}
+
+/// Re-read rather than treating a failed load as an empty/default dictionary.
+/// No RefCell borrow is held across a Win32 call (which can re-enter WndProc).
+fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
+    let Ok(controls) = state.try_borrow().map(|state| state.controls) else {
+        return;
+    };
+    let selected = selected_domain(state, controls.domain_combo);
+    let result = DictionaryStore::for_current_user().and_then(|store| store.load());
+    match result {
+        Ok(data) => {
+            let names: Vec<_> = data.domains.iter().map(|item| item.name.clone()).collect();
+            let selected_index = selected
+                .as_ref()
+                .and_then(|name| names.iter().position(|item| item == name))
+                .unwrap_or(0);
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.domain_names = names;
+            }
+            unsafe {
+                SendMessageW(
+                    controls.domain_combo,
+                    windows::Win32::UI::WindowsAndMessaging::CB_RESETCONTENT,
+                    WPARAM::default(),
+                    LPARAM::default(),
+                );
+            }
+            for item in &data.domains {
+                let caption = wide_null(&format!("{}（{} 条）", item.name, item.entries.len()));
+                unsafe {
+                    SendMessageW(
+                        controls.domain_combo,
+                        CB_ADDSTRING,
+                        WPARAM::default(),
+                        LPARAM(caption.as_ptr() as isize),
+                    );
+                }
+            }
+            unsafe {
+                SendMessageW(
+                    controls.domain_combo,
+                    CB_SETCURSEL,
+                    WPARAM(selected_index),
+                    LPARAM::default(),
+                );
+            }
+            set_checked(controls.learning, data.learning_enabled);
+            set_checked(
+                controls.domain_enabled,
+                data.domains
+                    .get(selected_index)
+                    .is_some_and(|item| item.enabled),
+            );
+            let status = format!(
+                "个人词条：{}；学习记录：{}；专业词库：{}。\n选中词库：{}。\n词库/学习操作立即保存；导入、导出和删除请使用 dictionary 命令行。\n清空学习不会删除个人词条。",
+                data.entries.len(), data.learned.len(), data.domains.len(),
+                data.domains.get(selected_index).map(|item| if item.enabled { "已启用" } else { "已停用" }).unwrap_or("无"));
+            let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID, &status);
+        }
+        Err(error) => {
+            set_checked(controls.learning, false);
+            set_checked(controls.domain_enabled, false);
+            let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID,
+                &format!("用户词典读取失败：{error}\n未重建或覆盖文件；词典操作不可用。请修复文件后重新打开设置。"));
+        }
+    }
+}
+
+fn dictionary_action(hwnd: HWND, state: &RefCell<SettingsUiState>, id: i32) {
+    let Some(_guard) = SaveGuard::acquire(state) else {
+        return;
+    };
+    let Ok(controls) = state.try_borrow().map(|state| state.controls) else {
+        return;
+    };
+    // Capture the explicit checkbox action before refreshing from disk.
+    let checked = is_checked(if id == LEARNING_ID {
+        controls.learning
+    } else {
+        controls.domain_enabled
+    });
+    let name = selected_domain(state, controls.domain_combo);
+    if id == CLEAR_LEARNING_ID
+        && (message_box(
+            hwnd,
+            "确定清空全部本地学习记录？\n\n不会删除个人词条或专业词库。此操作不可撤销。",
+            "Flower 设置",
+            MB_YESNO,
+        ) != IDYES
+            || !window_is_owned(hwnd, state))
+    {
+        return;
+    }
+    let result = (|| -> Result<(), String> {
+        let store = DictionaryStore::for_current_user().map_err(|e| e.to_string())?;
+        // Fail closed on corruption. The store also validates again under its write lock.
+        store.load().map_err(|e| e.to_string())?;
+        match id {
+            LEARNING_ID => store.set_learning_enabled(checked),
+            CLEAR_LEARNING_ID => store.clear_learning(),
+            DOMAIN_ENABLED_ID => store.set_domain_enabled(
+                name.as_deref()
+                    .ok_or_else(|| "请先导入并选择一个专业词库。".to_owned())?,
+                checked,
+            ),
+            _ => return Ok(()),
+        }
+        .map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        message_box(
+            hwnd,
+            &format!("词典操作失败：{error}\n未使用默认词典覆盖文件。"),
+            "Flower 设置",
+            MB_OK | MB_ICONERROR,
+        );
+    }
+    if window_is_owned(hwnd, state) {
+        refresh_dictionary(hwnd, state);
+    }
 }
 
 fn save_settings(hwnd: HWND, state: &RefCell<SettingsUiState>) {

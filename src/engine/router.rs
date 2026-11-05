@@ -11,7 +11,7 @@ pub struct EngineRouter {
 }
 
 impl EngineRouter {
-    /// Creates a router backed by the embedded MVP lexicon.
+    /// Creates a router backed by the shared embedded lexicon.
     pub fn new() -> Result<Self, EngineError> {
         Self::with_page_size(DEFAULT_PAGE_SIZE)
     }
@@ -65,6 +65,14 @@ impl EngineRouter {
     /// Returns the current raw Pinyin input.
     pub fn preedit(&self) -> &str {
         self.session.preedit()
+    }
+
+    pub fn pending_input(&self) -> &str {
+        self.session.pending_input()
+    }
+
+    pub fn pending_learning(&self) -> &[super::LearningEvent] {
+        self.session.pending_learning()
     }
 
     /// Returns the owned session for read-only inspection.

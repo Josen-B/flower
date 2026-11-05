@@ -32,6 +32,7 @@ mod windows_exports {
     use crate::engine::{
         map_windows_virtual_key, CompositionUpdate, EngineRouter, KeyEvent, Modifiers,
     };
+    use crate::engine::{LearningEvent, Lexicon};
     use crate::platform::candidate::{
         deferred_action_is_valid, edit_publish_decision, AcceptedCandidateAction,
         CandidatePopupAction, DeferredActionState, DeferredActionTicket, EditPublishDecision,
@@ -41,6 +42,7 @@ mod windows_exports {
     use crate::platform::diagnostics::{record, record_result, Stage};
     use crate::platform::{CandidatePopupModel, CandidatePopupWindow, PopupError};
     use crate::settings::{Settings, SettingsStore};
+    use crate::user_dictionary::{DictionaryStore, LearningWorker};
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER,
@@ -285,8 +287,9 @@ mod windows_exports {
                 .is_some_and(|composition| composition.terminated.get())
         }
 
-        fn new(context: &ITfContext, settings: &Settings) -> Option<Self> {
-            let router = EngineRouter::with_page_size(settings.candidate_page_size).ok()?;
+        fn new(context: &ITfContext, settings: &Settings, lexicon: &Lexicon) -> Option<Self> {
+            let router =
+                EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size).ok()?;
             Some(Self {
                 context: context.clone(),
                 router,
@@ -317,6 +320,10 @@ mod windows_exports {
         processing: bool,
         /// Immutable settings captured when this activation started.
         settings: Settings,
+        lexicon: Lexicon,
+        learning: Option<LearningWorker>,
+        _learning_registration: Option<ObjectRegistration>,
+        local_data_error: bool,
     }
 
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
@@ -542,6 +549,76 @@ mod windows_exports {
         composition: Option<ActiveComposition>,
         controller: CompositionController,
         caret: Option<RECT>,
+        learning_allowed: bool,
+    }
+
+    fn learning_scope_value_is_safe(scope: i32) -> bool {
+        matches!(scope, 0 | 57 | 58)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn learning_scope_policy_rejects_password_private_and_unknown_values() {
+        for scope in [0, 57, 58] {
+            assert!(learning_scope_value_is_safe(scope));
+        }
+        for scope in [-1, 31, 61, 999] {
+            assert!(!learning_scope_value_is_safe(scope));
+        }
+    }
+
+    fn scope_allows_learning(context: &ITfContext, cookie: u32) -> bool {
+        use windows::Win32::UI::TextServices::{ITfInputScope, GUID_PROP_INPUTSCOPE};
+        // All document/property access remains inside this edit session. Unknown
+        // or unsupported scopes fail closed, including the default empty test store.
+        unsafe {
+            let mut selection = [TF_SELECTION::default()];
+            let mut fetched = 0;
+            let result = context.GetSelection(cookie, u32::MAX, &mut selection, &mut fetched);
+            let range = std::mem::ManuallyDrop::take(&mut selection[0].range);
+            if result.is_err() || fetched != 1 {
+                return false;
+            }
+            let Some(range) = range else {
+                return false;
+            };
+            let Ok(property) = context.GetProperty(&GUID_PROP_INPUTSCOPE) else {
+                return false;
+            };
+            let Ok(value) = property.GetValue(cookie, &range) else {
+                return false;
+            };
+            let Ok(unknown) = windows::core::IUnknown::try_from(&value) else {
+                return false;
+            };
+            let Ok(scope) = unknown.cast::<ITfInputScope>() else {
+                return false;
+            };
+            let mut scopes = std::ptr::null_mut();
+            let mut count = 0;
+            if scope.GetInputScopes(&mut scopes, &mut count).is_err() {
+                return false;
+            }
+            if scopes.is_null() {
+                return false;
+            }
+            let allowed = count > 0
+                && count <= 256
+                && std::slice::from_raw_parts(scopes, count as usize)
+                    .iter()
+                    .all(|scope| learning_scope_value_is_safe(scope.0));
+            windows::Win32::System::Com::CoTaskMemFree(Some(scopes.cast()));
+            allowed
+        }
+    }
+
+    fn show_local_data_error() {
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+        unsafe {
+            let _ = MessageBoxW(None,
+            windows::core::w!("Flower 的本地词典加载或词频保存失败；已提交的文字不受影响。请打开 Flower 设置检查用户词典，原文件不会被重建或覆盖。"),
+            windows::core::w!("Flower 本地词典"), MB_OK | MB_ICONWARNING);
+        }
     }
 
     #[derive(Clone)]
@@ -674,6 +751,8 @@ mod windows_exports {
             {
                 return Err(E_UNEXPECTED.into());
             }
+            let learning_allowed =
+                this.update.commit.is_some() && scope_allows_learning(&this.context, edit_cookie);
             let mut host = TfCompositionHost::new(this.context.clone(), composition, edit_cookie);
             let mut controller = controller;
             let result = controller
@@ -707,6 +786,7 @@ mod windows_exports {
                     composition,
                     controller,
                     caret,
+                    learning_allowed,
                 })
             } else {
                 None
@@ -1120,6 +1200,12 @@ mod windows_exports {
             );
             return;
         }
+        let learning_allowed = outcome.learning_allowed;
+        let events = if update.commit.is_some() {
+            entry.router.pending_learning().to_vec()
+        } else {
+            Vec::new()
+        };
         entry.composition = outcome.composition;
         entry.controller = outcome.controller;
         let caret = outcome.caret;
@@ -1218,6 +1304,13 @@ mod windows_exports {
                 let still_focused = active.foreground
                     && active.focus_epoch == target.focus_epoch
                     && focus_context_matches;
+                if still_focused && learning_allowed && !events.is_empty() {
+                    if let Some(worker) = active.learning.as_ref() {
+                        if worker.submit(events.clone()).is_err() {
+                            active.local_data_error = true;
+                        }
+                    }
+                }
                 if visible && still_focused {
                     active.shown_context = Some(target.key);
                     hide_now = false;
@@ -1387,6 +1480,46 @@ mod windows_exports {
             let settings = SettingsStore::for_current_user()
                 .and_then(|store| store.load())
                 .unwrap_or_default();
+            let mut lexicon = Lexicon::builtin().map_err(|_| Error::from(E_UNEXPECTED))?;
+            let mut local_data_error = false;
+            let mut learning = None;
+            match DictionaryStore::for_current_user()
+                .and_then(|store| store.load().map(|data| (store, data)))
+            {
+                Ok((store, data)) => {
+                    match data
+                        .lexicon_tsv()
+                        .ok()
+                        .and_then(|tsv| lexicon.with_overlay(&tsv).ok())
+                    {
+                        Some(snapshot) => {
+                            lexicon = snapshot;
+                            if data.learning_enabled {
+                                let counts: Vec<_> = data
+                                    .learned
+                                    .iter()
+                                    .map(|entry| {
+                                        (
+                                            LearningEvent {
+                                                pinyin: entry.pinyin.clone(),
+                                                text: entry.text.clone(),
+                                            },
+                                            entry.count,
+                                        )
+                                    })
+                                    .collect();
+                                lexicon = lexicon.with_learning(&counts);
+                                match LearningWorker::start(store, data.generation) {
+                                    Ok(worker) => learning = Some(worker),
+                                    Err(_) => local_data_error = true,
+                                }
+                            }
+                        }
+                        None => local_data_error = true,
+                    }
+                }
+                Err(_) => local_data_error = true,
+            }
             let keystroke_manager: ITfKeystrokeMgr = thread_manager.cast()?;
             let key_sink: ITfKeyEventSink =
                 <Self as ComObjectInterface<ITfKeyEventSink>>::as_interface_ref(self).to_owned();
@@ -1448,6 +1581,12 @@ mod windows_exports {
                         shown_context: None,
                         processing: false,
                         settings,
+                        lexicon,
+                        _learning_registration: learning
+                            .as_ref()
+                            .map(|_| ObjectRegistration::new()),
+                        learning,
+                        local_data_error,
                     });
                     true
                 }
@@ -1537,7 +1676,16 @@ mod windows_exports {
             close_thread_popup(active.token, active.owner_thread);
             active.shown_context = None;
             active.contexts.clear();
+            if let Some(worker) = active.learning.as_mut() {
+                if worker.shutdown().is_err() {
+                    active.local_data_error = true;
+                }
+            }
+            let local_data_error = active.local_data_error;
             drop(active);
+            if local_data_error {
+                show_local_data_error();
+            }
             Ok(())
         }
     }
@@ -1611,7 +1759,7 @@ mod windows_exports {
             };
             let key = context_key(context);
 
-            let (router, page_size) = {
+            let (router, page_size, lexicon) = {
                 let Ok(activation) = self.get_impl().activation.try_borrow() else {
                     return Ok(FALSE);
                 };
@@ -1628,11 +1776,12 @@ mod windows_exports {
                         .filter(|entry| !entry.composition_terminated())
                         .map(|entry| entry.router.clone()),
                     active.settings.candidate_page_size,
+                    active.lexicon.clone(),
                 )
             };
             let router = match router {
                 Some(router) => router,
-                None => match EngineRouter::with_page_size(page_size) {
+                None => match EngineRouter::from_lexicon(lexicon, page_size) {
                     Ok(router) => router,
                     Err(_) => return Ok(FALSE),
                 },
@@ -1674,7 +1823,16 @@ mod windows_exports {
             };
             let key = context_key(context);
 
-            let (entry, client_id, token, owner_thread, focus_epoch, thread_manager, settings) = {
+            let (
+                entry,
+                client_id,
+                token,
+                owner_thread,
+                focus_epoch,
+                thread_manager,
+                settings,
+                lexicon,
+            ) = {
                 let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
                     return Ok(FALSE);
                 };
@@ -1700,6 +1858,7 @@ mod windows_exports {
                     focus_epoch,
                     thread_manager,
                     settings,
+                    active.lexicon.clone(),
                 )
             };
             let _guard = ProcessingGuard {
@@ -1712,14 +1871,16 @@ mod windows_exports {
             let mut old_entry = entry.clone();
             let mut entry = match entry {
                 Some(entry) => entry,
-                None => match ContextEntry::new(context, &settings) {
+                None => match ContextEntry::new(context, &settings, &lexicon) {
                     Some(entry) => entry,
                     None => return Ok(FALSE),
                 },
             };
             if entry.composition_terminated() {
                 clear_invalid_popup_action(&self.get_impl().activation, token, owner_thread, key);
-                let Ok(router) = EngineRouter::with_page_size(settings.candidate_page_size) else {
+                let Ok(router) =
+                    EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size)
+                else {
                     return Ok(FALSE);
                 };
                 entry.router = router;
@@ -2020,6 +2181,10 @@ mod windows_exports {
                 shown_context: None,
                 processing: false,
                 settings: Settings::default(),
+                lexicon: Lexicon::builtin().unwrap(),
+                learning: None,
+                _learning_registration: None,
+                local_data_error: false,
             });
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let tested =
@@ -2096,6 +2261,36 @@ mod windows_exports {
             send_key(&sink, &host.context, b'I');
             send_key(&sink, &host.context, b' ');
             assert_eq!(read_document(&host, None), "你好你好shi你");
+            // A minimal source isolates UTF-16 edit behavior from candidate rank.
+            // The full dictionary's supplementary lookup is verified separately.
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .contexts
+                .get_mut(&context_key(&host.context))
+                .unwrap()
+                .router = EngineRouter::from_lexicon_tsv("he\t𠀀\t1", 9).unwrap();
+            for key in b"HE " {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(read_document(&host, None), "你好你好shi你𠀀");
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .contexts
+                .get_mut(&context_key(&host.context))
+                .unwrap()
+                .router = EngineRouter::from_lexicon_tsv("ni\t你\t1000\nhao\t好\t1000", 9).unwrap();
+            for key in b"NIHAO2" {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(read_document(&host, None), "你好你好shi你𠀀你hao");
+            send_key(&sink, &host.context, b' ');
+            assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好");
             implementation.activation.borrow_mut().take();
         }
     }

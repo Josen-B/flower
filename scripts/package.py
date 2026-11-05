@@ -1156,6 +1156,115 @@ def _publish_no_overwrite(source: Path, destination: Path) -> PublishedFile:
     return PublishedFile(destination, destination_identity[0], destination_identity[1])
 
 
+def _dictionary_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
+    """Validate the distributable data without depending on dev-only raw Unihan."""
+    names = (
+        "data/pinyin/base_lexicon.tsv",
+        "data/pinyin/coverage.json",
+        "data/pinyin/sources/manifest.json",
+        "data/pinyin/sources/kMandarin_8105.txt",
+    )
+    payload = {name: _read_bytes(repo_root / name, "单字库及来源") for name in names}
+    for name in ("UNICODE-LICENSE.txt", "LICENSE-pinyin-data.txt", "NOTICE.md"):
+        payload[f"licenses/dictionaries/{name}"] = _read_bytes(
+            repo_root / "data/pinyin/sources" / name, "字库许可和归属")
+    try:
+        coverage = json.loads(payload["data/pinyin/coverage.json"])
+        sources = json.loads(payload["data/pinyin/sources/manifest.json"])
+        base = payload["data/pinyin/base_lexicon.tsv"]
+        if (coverage["schema_version"] != 1 or sources["schema_version"] != 1
+                or coverage["baseline_expected"] != 8105 or coverage["baseline_covered"] != 8105
+                or coverage["missing_characters"] != []
+                or coverage["base_lexicon_sha256"] != _sha256(base)):
+            raise ValueError("覆盖声明或生成词库哈希不一致")
+        rows = [line.split("\t") for line in base.decode("utf-8").splitlines()
+                if line and not line.startswith("#")]
+        pairs = set()
+        for row in rows:
+            if (len(row) != 3 or not re.fullmatch("[a-z]{1,8}", row[0])
+                    or len(row[1]) != 1 or not row[2].isascii() or not row[2].isdigit()
+                    or not 0 < int(row[2]) <= 0xffffffff):
+                raise ValueError("无效单字库记录")
+            pairs.add((row[0], row[1]))
+        characters = {char for _, char in pairs}
+        baseline = []
+        for line in payload["data/pinyin/sources/kMandarin_8105.txt"].decode("utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            match = re.fullmatch(r"U\+([0-9A-F]{4,6}):\s*\S+\s+#\s*(\S).*", line)
+            if not match or chr(int(match[1], 16)) != match[2]:
+                raise ValueError("无效 8105 检查集")
+            baseline.append(match[2])
+        if (len(baseline) != 8105 or len(set(baseline)) != 8105
+                or not set(baseline) <= characters or len(pairs) != len(rows)
+                or len(rows) != coverage["pinyin_character_pairs"]
+                or len(characters) != coverage["unique_characters"]):
+            raise ValueError("字库实际覆盖与报告不一致")
+        for name, path in (
+            ("kMandarin_8105.txt", "data/pinyin/sources/kMandarin_8105.txt"),
+            ("UNICODE-LICENSE.txt", "licenses/dictionaries/UNICODE-LICENSE.txt"),
+            ("LICENSE-pinyin-data.txt", "licenses/dictionaries/LICENSE-pinyin-data.txt"),
+        ):
+            if _sha256(payload[path]) != sources["files"][name]["sha256"]:
+                raise ValueError("来源或许可正文哈希不一致")
+        if (b"UNICODE LICENSE V3" not in payload["licenses/dictionaries/UNICODE-LICENSE.txt"]
+                or b"The MIT License" not in payload["licenses/dictionaries/LICENSE-pinyin-data.txt"]):
+            raise ValueError("字库许可正文缺失")
+    except (ValueError, KeyError, TypeError, OverflowError) as error:
+        raise PackagingError(f"单字库校验失败：{error}") from error
+    return payload, {
+        "base_lexicon_sha256": _sha256(base),
+        "coverage": coverage,
+        "sources": sources,
+        "licenses": ["Unicode-3.0", "MIT"],
+        "notice_path": "licenses/dictionaries/NOTICE.md",
+    }
+
+
+def _phrase_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
+    prefix = "data/pinyin/phrases/"
+    payload = {prefix + name: _read_bytes(repo_root / prefix / name, "词组数据")
+               for name in ("phrase_lexicon.tsv", "proper_lexicon.tsv", "coverage.json",
+                            "manifest.json", "quality-cases.json")}
+    for name in ("CC-BY-SA-4.0.txt", "LICENSE-jieba.txt"):
+        payload["licenses/phrases/" + name] = _read_bytes(
+            repo_root / prefix / "sources" / name, "词组数据许可")
+    payload["licenses/phrases/NOTICE.md"] = _read_bytes(repo_root / prefix / "NOTICE.md", "词组归属")
+    try:
+        manifest = json.loads(payload[prefix + "manifest.json"])
+        coverage = json.loads(payload[prefix + "coverage.json"])
+        if manifest["derived_data_license"] != "CC-BY-SA-4.0":
+            raise ValueError("词组数据许可不一致")
+        for name in ("phrase_lexicon.tsv", "proper_lexicon.tsv"):
+            if _sha256(payload[prefix + name]) != coverage[name.replace(".tsv", "_sha256")]:
+                raise ValueError("词组数据哈希不一致")
+        for name in ("CC-BY-SA-4.0.txt", "LICENSE-jieba.txt"):
+            if _sha256(payload["licenses/phrases/" + name]) != manifest["files"][name]["sha256"]:
+                raise ValueError("词组许可正文哈希不一致")
+        if b"Attribution-ShareAlike 4.0 International" not in payload["licenses/phrases/CC-BY-SA-4.0.txt"]:
+            raise ValueError("词组许可正文缺失")
+        actual = []
+        for name in ("phrase_lexicon.tsv", "proper_lexicon.tsv"):
+            pairs = set()
+            for line in payload[prefix + name].decode("utf-8").splitlines():
+                if not line or line.startswith("#"):
+                    continue
+                key, word, weight = line.split("\t")
+                if (not re.fullmatch("[a-z]+(?:'[a-z]+)+", key)
+                        or len(key.split("'")) != len(word)
+                        or not 0 < int(weight) <= 0xffffffff or (key, word) in pairs):
+                    raise ValueError("无效或重复词组记录")
+                pairs.add((key, word))
+            actual.append(pairs)
+        if (actual[0] & actual[1] or len(actual[0]) != coverage["core_pairs"]
+                or len(actual[1]) != coverage["optional_pairs"]):
+            raise ValueError("词组分区与覆盖报告不一致")
+    except (KeyError, TypeError, ValueError) as error:
+        raise PackagingError(f"词组数据校验失败：{error}") from error
+    return payload, {"license": "CC-BY-SA-4.0", "sources": manifest,
+                     "coverage": coverage, "notice_path": "licenses/phrases/NOTICE.md"}
+
+
 def _build_payloads(
     repo_root: Path,
     version: str,
@@ -1171,6 +1280,8 @@ def _build_payloads(
     lexicon = _read_bytes(
         repo_root / "data" / "pinyin" / "mvp_lexicon.tsv", "MVP 词库"
     )
+    dictionary_payload, dictionary_record = _dictionary_bundle(repo_root)
+    phrase_payload, phrase_record = _phrase_bundle(repo_root)
     cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
     root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
     root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
@@ -1200,14 +1311,22 @@ def _build_payloads(
         "data/pinyin/mvp_lexicon.tsv": lexicon,
         "Cargo.lock": cargo_lock,
     }
-    for source in (dependency_payload, rust_payload):
+    for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload):
         for relative, data in source.items():
             if relative in payload:
                 raise PackagingError(f"分发文件路径重复：{relative}")
             payload[relative] = data
 
-    notices = _notices_text(dependency_notices, rust_std)
+    notices = _notices_text(dependency_notices, rust_std) + (
+        "\n## 汉字读音数据\n\nUnicode-3.0 与 MIT 许可；固定来源、覆盖报告及完整许可见\n"
+        "`data/pinyin/sources/manifest.json` 和 `licenses/dictionaries/NOTICE.md`。\n"
+    ).encode("utf-8")
     payload["THIRD-PARTY-NOTICES.md"] = notices
+    payload["THIRD-PARTY-NOTICES.md"] += (
+        "\n## 词组数据\n\n词组表按独立的 CC BY-SA 4.0 分发，词频另保留 jieba MIT 许可。\n"
+        "归属、修改说明、相同方式共享条件和完整许可见 `licenses/phrases/NOTICE.md`。\n"
+        "数据许可不改写 Flower 程序代码的许可。\n"
+    ).encode("utf-8")
 
     manifest = {
         "schema_version": 1,
@@ -1219,6 +1338,8 @@ def _build_payloads(
         "binaries": list(binary_records),
         "third_party": list(dependency_notices),
         "rust_standard_library": rust_std,
+        "dictionaries": dictionary_record,
+        "phrases": phrase_record,
         "distribution": {
             "format": "zip",
             "authenticode_signed": False,

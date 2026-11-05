@@ -28,6 +28,11 @@ ROOT_FILES = frozenset({
     "flower.dll", "flower-register.exe", "flower-settings.exe", "README.md",
     "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "Cargo.lock",
     "manifest.json", "SHA256SUMS", "data/pinyin/mvp_lexicon.tsv",
+    "data/pinyin/base_lexicon.tsv", "data/pinyin/coverage.json",
+    "data/pinyin/sources/manifest.json", "data/pinyin/sources/kMandarin_8105.txt",
+    "data/pinyin/phrases/phrase_lexicon.tsv", "data/pinyin/phrases/proper_lexicon.tsv",
+    "data/pinyin/phrases/coverage.json", "data/pinyin/phrases/manifest.json",
+    "data/pinyin/phrases/quality-cases.json",
 })
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?\Z")
 MAX_PAYLOAD = 256 * 1024 * 1024

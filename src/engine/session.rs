@@ -1,4 +1,15 @@
+use super::{
+    decoder::{decode, Choice},
+    LearningEvent,
+};
 use super::{Candidate, CompositionUpdate, EngineError, Key, KeyEvent, Lexicon};
+
+#[derive(Debug, Clone)]
+struct Confirmed {
+    raw: String,
+    text: String,
+    events: Vec<LearningEvent>,
+}
 
 /// Default number of candidates shown on one page.
 pub const DEFAULT_PAGE_SIZE: usize = 9;
@@ -9,6 +20,10 @@ pub struct PinyinSession {
     lexicon: Lexicon,
     page_size: usize,
     preedit: String,
+    raw: String,
+    confirmed: Vec<Confirmed>,
+    choices: Vec<Choice>,
+    pending_learning: Vec<LearningEvent>,
     candidates: Vec<Candidate>,
     page: usize,
     highlighted: Option<usize>,
@@ -18,7 +33,7 @@ pub struct PinyinSession {
 pub type EngineSession = PinyinSession;
 
 impl PinyinSession {
-    /// Creates a session backed by the embedded MVP lexicon.
+    /// Creates a session backed by the shared embedded lexicon.
     pub fn new() -> Result<Self, EngineError> {
         Self::with_page_size(DEFAULT_PAGE_SIZE)
     }
@@ -48,6 +63,10 @@ impl PinyinSession {
             lexicon,
             page_size,
             preedit: String::new(),
+            raw: String::new(),
+            confirmed: Vec::new(),
+            choices: Vec::new(),
+            pending_learning: Vec::new(),
             candidates: Vec::new(),
             page: 0,
             highlighted: None,
@@ -66,8 +85,25 @@ impl PinyinSession {
 
         match event.key {
             Key::Char(character) if character.is_ascii_alphabetic() => {
-                self.preedit.push(character.to_ascii_lowercase());
+                if self.raw.len() + self.confirmed.iter().map(|s| s.raw.len()).sum::<usize>() >= 128
+                {
+                    return Err(EngineError::InputTooLong);
+                }
+                self.pending_learning.clear();
+                self.raw.push(character.to_ascii_lowercase());
                 self.refresh_candidates();
+                Ok(self.snapshot(true))
+            }
+            Key::Char('\'') if self.is_composing() => {
+                if !self.raw.is_empty() && !self.raw.ends_with('\'') {
+                    if self.raw.len() + self.confirmed.iter().map(|s| s.raw.len()).sum::<usize>()
+                        >= 128
+                    {
+                        return Err(EngineError::InputTooLong);
+                    }
+                    self.raw.push('\'');
+                    self.refresh_candidates();
+                }
                 Ok(self.snapshot(true))
             }
             Key::Char(character) if character.is_ascii_digit() && character != '0' => {
@@ -87,19 +123,36 @@ impl PinyinSession {
                     return Ok(self.snapshot(false));
                 }
 
-                self.preedit.pop();
-                if self.preedit.is_empty() {
+                self.pending_learning.clear();
+                if self.raw.is_empty() {
+                    if let Some(segment) = self.confirmed.pop() {
+                        self.raw = segment.raw;
+                    }
+                } else {
+                    self.raw.pop();
+                }
+                if self.raw.is_empty() && self.confirmed.is_empty() {
                     self.clear_composition();
                 } else {
                     self.refresh_candidates();
                 }
                 Ok(self.snapshot(true))
             }
-            Key::Enter | Key::Space => {
+            Key::Enter => {
                 if !self.is_composing() {
                     return Ok(self.snapshot(false));
                 }
                 self.commit_current()
+            }
+            Key::Space => {
+                if !self.is_composing() {
+                    return Ok(self.snapshot(false));
+                }
+                if let Some(index) = self.highlighted {
+                    self.select_candidate(index)
+                } else {
+                    self.commit_literal()
+                }
             }
             Key::Escape => {
                 if !self.is_composing() {
@@ -148,20 +201,36 @@ impl PinyinSession {
             return Err(EngineError::NoActiveComposition);
         }
 
-        let candidates = self.current_page();
-        let candidate_count = candidates.len();
-        let text = candidates
-            .get(index)
-            .map(|candidate| candidate.text.clone())
+        let candidate_count = self.current_page().len();
+        if index >= candidate_count {
+            return Err(EngineError::CandidateOutOfRange {
+                index,
+                candidate_count,
+            });
+        }
+        let choice = self
+            .choices
+            .get(self.page * self.page_size + index)
+            .cloned()
             .ok_or(EngineError::CandidateOutOfRange {
                 index,
                 candidate_count,
             })?;
 
-        self.clear_composition();
-        let mut update = self.snapshot(true);
-        update.commit = Some(text);
-        Ok(update)
+        let raw = self.raw[..choice.consumed].to_owned();
+        self.raw.drain(..choice.consumed);
+        self.confirmed.push(Confirmed {
+            raw,
+            text: choice.candidate.text,
+            events: choice.events,
+        });
+        if self.raw.is_empty() {
+            self.commit_literal()
+        } else {
+            self.pending_learning.clear();
+            self.refresh_candidates();
+            Ok(self.snapshot(true))
+        }
     }
 
     /// Commits the highlighted candidate or the raw Pinyin input.
@@ -227,6 +296,15 @@ impl PinyinSession {
         &self.preedit
     }
 
+    pub fn pending_input(&self) -> &str {
+        &self.raw
+    }
+
+    /// Events are not permission to persist: the host must first confirm a safe successful edit.
+    pub fn pending_learning(&self) -> &[LearningEvent] {
+        &self.pending_learning
+    }
+
     pub fn page(&self) -> usize {
         self.page
     }
@@ -253,20 +331,51 @@ impl PinyinSession {
     }
 
     fn commit_current(&mut self) -> Result<CompositionUpdate, EngineError> {
-        let text = self
-            .highlighted
-            .and_then(|index| self.current_page().get(index))
-            .map(|candidate| candidate.text.clone())
-            .unwrap_or_else(|| self.preedit.clone());
+        if let Some(index) = self.highlighted {
+            let absolute = self.page * self.page_size + index;
+            if self
+                .choices
+                .get(absolute)
+                .is_some_and(|choice| choice.consumed == self.raw.len())
+            {
+                return self.select_candidate(index);
+            }
+        }
+        self.commit_literal()
+    }
 
+    fn commit_literal(&mut self) -> Result<CompositionUpdate, EngineError> {
+        let text = self
+            .confirmed
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>()
+            + &self.raw;
+        let events: Vec<_> = self
+            .confirmed
+            .iter()
+            .flat_map(|s| s.events.clone())
+            .collect();
         self.clear_composition();
+        self.pending_learning = events;
         let mut update = self.snapshot(true);
         update.commit = Some(text);
         Ok(update)
     }
 
     fn refresh_candidates(&mut self) {
-        self.candidates = self.lexicon.lookup(&self.preedit);
+        self.preedit = self
+            .confirmed
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<String>()
+            + &self.raw;
+        self.choices = decode(&self.lexicon, &self.raw);
+        self.candidates = self
+            .choices
+            .iter()
+            .map(|choice| choice.candidate.clone())
+            .collect();
         self.page = 0;
         self.highlighted = if self.candidates.is_empty() {
             None
@@ -331,6 +440,10 @@ impl PinyinSession {
 
     fn clear_composition(&mut self) {
         self.preedit.clear();
+        self.raw.clear();
+        self.confirmed.clear();
+        self.choices.clear();
+        self.pending_learning.clear();
         self.candidates.clear();
         self.page = 0;
         self.highlighted = None;

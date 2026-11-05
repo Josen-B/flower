@@ -16,11 +16,19 @@ impl Candidate {
 }
 
 /// The complete state change returned after processing a key or selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearningEvent {
+    /// Canonical, explicitly separated syllables, never raw unconverted input.
+    pub pinyin: String,
+    pub text: String,
+}
+
+/// A selected word, not permission to persist before a safe host commit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompositionUpdate {
     /// True when the input session consumed the key.
     pub handled: bool,
-    /// Current raw Pinyin input, for example `nihao`.
+    /// Display preedit: confirmed Chinese prefix plus the still-unselected Pinyin.
     pub preedit: String,
     /// Candidates on the current page only.
     pub candidates: Vec<Candidate>,

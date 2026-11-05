@@ -9,6 +9,7 @@ pub mod engine;
 pub mod platform;
 pub mod registration;
 pub mod settings;
+pub mod user_dictionary;
 
 pub use engine::{
     keymap, Candidate, CompositionUpdate, EngineError, EngineRouter, EngineSession, Key, KeyEvent,

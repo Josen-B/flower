@@ -170,7 +170,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_manifest_metadata_mismatch_is_rejected_even_with_rehashed_payload(self):
         def mutate(data):
-            name = next(k for k in data if k.endswith("/manifest.json"))
+            name = f"{self.archive.stem}/manifest.json"
             value = json.loads(data[name])
             value["binaries"][0]["size"] = 1
             data[name] = json.dumps(value).encode()
@@ -180,7 +180,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_manifest_must_be_a_json_object(self):
         def mutate(data):
-            name = next(k for k in data if k.endswith("/manifest.json"))
+            name = f"{self.archive.stem}/manifest.json"
             data[name] = b"[]"
         self.rewrite(mutate, rehash_payload=True)
         with self.assertRaisesRegex(installer.InstallerError, "JSON"):
@@ -188,7 +188,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_version_must_fit_windows_resource_fields(self):
         def mutate(data):
-            name = next(k for k in data if k.endswith("/manifest.json"))
+            name = f"{self.archive.stem}/manifest.json"
             value = json.loads(data[name])
             value["version"] = "70000.1.0"
             data[name] = json.dumps(value).encode()

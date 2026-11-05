@@ -6,6 +6,12 @@ Flower 是一款离线运行的 Windows 10/11 x64 拼音输入法。其实现是
 ## 当前状态
 
 - `flower::engine` 是一个用安全 Rust 编写、与平台无关的拼音引擎。
+- 正在按[四阶段实施方案](docs/plans/2026-11-04-lexicon-and-input.md)扩充词库和输入方式。
+  单字底库包含 44,350 个有读音字符、52,841 个映射，8105 字检查集无缺字。
+  默认通用词组 66,893 个词音映射，另有 12,165 个可显式导入的专名扩展映射。
+  引擎支持显式分音、连续选词、撤回及有界词图组句；用户词典/专业词库可管理，
+  本地学习默认关闭，只有成功提交且输入范围安全时投递保存。
+  内置词典共享，不随每次按键快照深拷贝；整句评分是离线静态算法，不是云模型。
 - `flower::platform` 包含平台无关的组词/候选状态适配器以及 Windows
   TSF/COM 边界。其 `windows` 依赖仅在 Windows 目标上启用。
 - 候选窗已接入 TSF 上下文：编辑会话成功后更新预编辑、编号候选、高亮和页码，
@@ -34,8 +40,8 @@ Flower 是一款离线运行的 Windows 10/11 x64 拼音输入法。其实现是
   release artifact，校验 AMD64 PE32+ 与 DLL 导出，收集依赖和 Rust 标准库
   许可正文，并生成确定性 ZIP、包内清单和外部 SHA-256。
 - 已在 Windows x64 上生成真实未签名 ZIP，并通过包内外哈希、两个 EXE 帮助和
-  COM 接口查询。桌面测试发现选择 Flower 后仍直通英文，尚未通过输入验收；
-  完整上下文焦点处理和签名安装器也仍待完成。
+  COM 接口查询。0.1.1 修复组词创建后，用户已确认 `nihao` 能提交 `你好`；
+  新单字库及完整上下文焦点、各宿主兼容和签名发行仍需分别验收。
   详见[本机验收记录](docs/windows-validation.md)。
 - 已生成基于 Inno Setup 的 EXE 测试安装器，带樱花图标、中文主要向导和
   当前用户启用/停用快捷方式；尚未在干净机器实际安装或卸载。
@@ -61,6 +67,10 @@ scripts/
   verify_windows_icons.ps1
   installer.py
   test_installer.py
+  build_lexicon.py
+  test_lexicon.py
+  build_phrases.py
+  test_phrases.py
 installer/
   flower.iss
   notice.zh-CN.txt

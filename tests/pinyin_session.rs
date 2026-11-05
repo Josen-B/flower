@@ -8,6 +8,41 @@ fn session() -> PinyinSession {
     PinyinSession::new().expect("embedded MVP lexicon must load")
 }
 
+#[test]
+fn expanded_homophones_can_all_be_reached_and_the_last_candidate_selected() {
+    let lexicon = Lexicon::builtin().unwrap();
+    let expected = lexicon.lookup("yi");
+    assert!(expected.len() > DEFAULT_PAGE_SIZE);
+    let mut session = PinyinSession::from_lexicon(lexicon, DEFAULT_PAGE_SIZE).unwrap();
+    type_text(&mut session, "yi");
+    let mut actual = Vec::new();
+    loop {
+        actual.extend(
+            session
+                .candidates_on_current_page()
+                .iter()
+                .map(|candidate| candidate.text.clone()),
+        );
+        if session.page() + 1 == session.page_count() {
+            break;
+        }
+        session.next_page().unwrap();
+    }
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|candidate| candidate.text.clone())
+            .collect::<Vec<_>>()
+    );
+    let last = session.candidates_on_current_page().len() - 1;
+    let update = session.select_candidate(last).unwrap();
+    assert_eq!(
+        update.commit.as_deref(),
+        Some(expected.last().unwrap().text.as_str())
+    );
+}
+
 fn type_text(session: &mut PinyinSession, text: &str) -> CompositionUpdate {
     let mut update = CompositionUpdate::default();
     for character in text.chars() {
@@ -28,7 +63,9 @@ fn typing_nihao_produces_preedit_and_candidates() {
     assert_eq!(update.candidates[0].text, "你好");
     assert_eq!(update.highlighted, Some(0));
     assert_eq!(update.page, 0);
-    assert_eq!(update.page_count, 1);
+    // Full and partial choices are now available beyond the first page.
+    assert!(update.page_count >= 1);
+    assert_eq!(update.page_count, session.page_count());
     assert_eq!(session.page_size(), DEFAULT_PAGE_SIZE);
 }
 
@@ -133,7 +170,11 @@ fn backspace_edits_then_clears_the_composition() {
 
 #[test]
 fn page_keys_move_between_candidate_pages() {
-    let mut session = session();
+    let mut session = PinyinSession::from_lexicon_tsv(
+        include_str!("../data/pinyin/mvp_lexicon.tsv"),
+        DEFAULT_PAGE_SIZE,
+    )
+    .unwrap();
     let first = type_text(&mut session, "shi");
     assert!(first.page_count > 1);
     assert_eq!(first.page, 0);

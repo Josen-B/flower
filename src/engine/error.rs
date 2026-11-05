@@ -3,6 +3,8 @@ use thiserror::Error;
 /// Errors returned by lexicon loading and session state transitions.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EngineError {
+    #[error("pinyin input exceeds the 128-byte composition limit")]
+    InputTooLong,
     #[error("the pinyin lexicon is empty")]
     EmptyLexicon,
 
