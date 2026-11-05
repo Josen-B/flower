@@ -261,7 +261,7 @@ def build_installer(
             suffix = "" if parent == "." else "\\" + parent.replace("/", "\\")
             lines.append(
                 f'Source: "{{#PackageDir}}\\{windows_path}"; '
-                f'DestDir: "{{commonpf64}}\\Flower\\versions\\{{#BuildId}}{suffix}"; Flags: ignoreversion'
+                f'DestDir: "{{app}}\\versions\\{{#BuildId}}{suffix}"; Flags: ignoreversion'
             )
         include = stage / "payload.iss"
         include.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
@@ -278,6 +278,7 @@ def build_installer(
             f"/DOutputDir={stage}",
             f"/DExpectedDllHash={_digest(verified.payload['flower.dll'])}",
             f"/DExpectedToolHash={_digest(verified.payload['flower-register.exe'])}",
+            f"/DExpectedSettingsHash={_digest(verified.payload['flower-settings.exe'])}",
             f"/DEngineLicense={license_snapshot}",
             str(repo / "installer" / "flower.iss"),
         ]

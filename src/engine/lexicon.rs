@@ -12,7 +12,7 @@ const BUILTIN_LEXICON: &str = concat!(
 // Project-maintained everyday vocabulary, NOT corpus frequency or new readings.
 // Only existing canonical, multi-syllable entries are classified at builtin load.
 const EVERYDAY_WORDS: &str = "\
-你好 您好 谢谢 再见 我们 你们 他们 什么 怎么 为什么 可以 需要 知道 喜欢 \
+你好 您好 谢谢 再见 我们 你们 他们 什么 意思 怎么 为什么 可以 需要 知道 喜欢 \
 今天 明天 现在 时间 工作 学习 电脑 手机 输入法 中国 大家 自己 一个 这个 那个 \
 这些 那些 这里 那里 这样 那样 多少 时候 已经 还是 因为 所以 如果 但是 而且 \
 一起 一直 一定 可能 应该 没有 不是 不要 不能 不好 非常 真的 觉得 希望 \
@@ -49,6 +49,64 @@ fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering
 pub struct Lexicon {
     entries: Arc<HashMap<String, Vec<LexiconEntry>>>,
     initials: Arc<HashMap<String, Vec<LexiconEntry>>>,
+    syllables: Arc<SyllableTrie>,
+}
+
+const MIXED_BUDGET: usize = 4096;
+
+#[derive(Debug, Clone, Default)]
+struct SyllableNode {
+    edges: std::collections::BTreeMap<u8, Vec<(String, usize)>>,
+    words: Vec<LexiconEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct SyllableTrie {
+    nodes: Vec<SyllableNode>,
+}
+
+impl SyllableTrie {
+    fn build(entries: &HashMap<String, Vec<LexiconEntry>>) -> Self {
+        let mut trie = Self {
+            nodes: vec![SyllableNode::default()],
+        };
+        // Sort before insertion so the bounded traversal is independent of HashMap seeds.
+        let mut words: Vec<_> = entries.values().flatten().collect();
+        words.sort_by(|a, b| a.reading.cmp(&b.reading).then_with(|| rank_entries(a, b)));
+        for word in words {
+            let syllables: Vec<_> = word.reading.split('\'').collect();
+            if syllables.len() < 2 || syllables.len() != word.text.chars().count() {
+                continue;
+            }
+            let mut node = 0;
+            for syllable in syllables {
+                let first = syllable.as_bytes()[0];
+                let next = trie.nodes[node]
+                    .edges
+                    .get(&first)
+                    .and_then(|edges| edges.iter().find(|(s, _)| s == syllable))
+                    .map(|(_, next)| *next);
+                node = match next {
+                    Some(next) => next,
+                    None => {
+                        let next = trie.nodes.len();
+                        trie.nodes.push(SyllableNode::default());
+                        trie.nodes[node]
+                            .edges
+                            .entry(first)
+                            .or_default()
+                            .push((syllable.to_owned(), next));
+                        next
+                    }
+                };
+            }
+            trie.nodes[node].words.push(word.clone());
+        }
+        for node in &mut trie.nodes {
+            node.words.sort_by(rank_entries);
+        }
+        trie
+    }
 }
 
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
@@ -72,6 +130,7 @@ impl Lexicon {
                     candidates.sort_by(rank_entries);
                 }
                 lexicon.initials = Arc::new(Self::build_initials(entries));
+                lexicon.syllables = Arc::new(SyllableTrie::build(entries));
                 Ok(lexicon)
             })
             .clone()
@@ -177,6 +236,7 @@ impl Lexicon {
 
         Ok(Self {
             initials: Arc::new(Self::build_initials(&entries)),
+            syllables: Arc::new(SyllableTrie::build(&entries)),
             entries: Arc::new(entries),
         })
     }
@@ -200,6 +260,10 @@ impl Lexicon {
     }
 
     pub(crate) fn initial_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        self.initial_choices_limited(raw, usize::MAX)
+    }
+
+    fn initial_choices_limited(&self, raw: &str, limit: usize) -> Vec<super::decoder::Choice> {
         if raw.contains('\'') {
             return Vec::new();
         }
@@ -207,6 +271,7 @@ impl Lexicon {
             .get(raw)
             .into_iter()
             .flatten()
+            .take(limit)
             .map(|entry| {
                 super::decoder::Choice::word(
                     Candidate::new(&entry.text, &entry.reading),
@@ -215,6 +280,137 @@ impl Lexicon {
                 )
             })
             .collect()
+    }
+
+    /// Bounded traversal of canonical syllables, never a product of spellings.
+    /// Every transition consumes either the entire syllable or its entered initial.
+    #[cfg(test)]
+    pub(crate) fn mixed_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        let mut expanded = 0;
+        self.mixed_prefix_choices(raw, &mut expanded, MIXED_BUDGET)
+            .into_iter()
+            .filter(|c| c.consumed == raw.len())
+            .collect()
+    }
+
+    pub(crate) fn mixed_prefix_choices(
+        &self,
+        raw: &str,
+        expanded: &mut usize,
+        total_limit: usize,
+    ) -> Vec<super::decoder::Choice> {
+        if raw.is_empty()
+            || !raw.bytes().all(|b| b.is_ascii_lowercase() || b == b'\'')
+            || raw.starts_with('\'')
+            || raw.contains("''")
+        {
+            return Vec::new();
+        }
+        if *expanded >= total_limit {
+            return Vec::new();
+        }
+        *expanded += 1;
+        let mut stack = vec![(0usize, 0usize, 0usize, 0usize)];
+        let mut states = std::collections::HashSet::new();
+        let mut matches = Vec::new();
+        let mut admitted = 1;
+        while let Some((node, offset, full, abbreviated)) = stack.pop() {
+            if !states.insert((node, offset, full, abbreviated)) {
+                continue;
+            }
+            if abbreviated > 0 && matches.len() < MIXED_BUDGET {
+                for entry in &self.syllables.nodes[node].words {
+                    if matches.len() == MIXED_BUDGET {
+                        break;
+                    }
+                    matches.push((entry, abbreviated, offset));
+                }
+            }
+            if offset == raw.len() {
+                continue;
+            }
+            let Some(edges) = self.syllables.nodes[node]
+                .edges
+                .get(&raw.as_bytes()[offset])
+            else {
+                continue;
+            };
+            for (syllable, next) in edges {
+                for abbreviated_edge in [true, false] {
+                    let token = if abbreviated_edge {
+                        &syllable[..1]
+                    } else {
+                        syllable.as_str()
+                    };
+                    // A one-letter syllable is full, not an abbreviation.
+                    if abbreviated_edge && syllable.len() == 1 {
+                        continue;
+                    }
+                    if !raw[offset..].starts_with(token) {
+                        continue;
+                    }
+                    let mut end = offset + token.len();
+                    if raw.as_bytes().get(end) == Some(&b'\'') {
+                        end += 1;
+                    }
+                    if admitted == MIXED_BUDGET || *expanded == total_limit {
+                        continue;
+                    }
+                    admitted += 1;
+                    *expanded += 1;
+                    stack.push((
+                        *next,
+                        end,
+                        full + usize::from(!abbreviated_edge),
+                        abbreviated + usize::from(abbreviated_edge),
+                    ));
+                }
+            }
+        }
+        matches.sort_by(|(a, ac, ae), (b, bc, be)| {
+            ae.cmp(be)
+                .then_with(|| rank_entries(a, b))
+                .then_with(|| ac.cmp(bc))
+        });
+        let mut seen = std::collections::HashSet::new();
+        matches
+            .into_iter()
+            .filter(|(entry, _, end)| seen.insert((&entry.text, &entry.reading, *end)))
+            .map(|(entry, abbreviated, end)| {
+                let mut choice = super::decoder::Choice::word(
+                    Candidate::new(&entry.text, &entry.reading),
+                    end,
+                    entry.weight,
+                );
+                choice.abbreviated = abbreviated;
+                choice.penalize_abbreviations();
+                choice
+            })
+            .collect()
+    }
+
+    pub(crate) fn graph_choices(&self, raw: &str, per_end: usize) -> Vec<super::decoder::Choice> {
+        let mut choices = self.prefix_choices_limited(raw, per_end);
+        for end in 1..=raw.len() {
+            if !raw.is_char_boundary(end) || raw.as_bytes().get(end) == Some(&b'\'') {
+                continue;
+            }
+            choices.extend(
+                self.initial_choices_limited(&raw[..end], per_end)
+                    .into_iter()
+                    .map(|mut choice| {
+                        choice.abbreviated = choice
+                            .candidate
+                            .comment
+                            .split('\'')
+                            .filter(|syllable| syllable.len() > 1)
+                            .count();
+                        choice.penalize_abbreviations();
+                        choice
+                    }),
+            );
+        }
+        choices
     }
 
     /// Parses a byte slice, reporting invalid UTF-8 as an engine error.
@@ -256,6 +452,7 @@ impl Lexicon {
             entries.sort_by(rank_entries);
         }
         result.initials = Arc::new(Self::build_initials(table));
+        result.syllables = Arc::new(SyllableTrie::build(table));
         Ok(result)
     }
 
@@ -280,6 +477,7 @@ impl Lexicon {
             }
         }
         result.initials = Arc::new(Self::build_initials(table));
+        result.syllables = Arc::new(SyllableTrie::build(table));
         result
     }
 
@@ -423,6 +621,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first.entries, &snapshot.entries));
         assert!(Arc::ptr_eq(&first.initials, &second.initials));
         assert!(Arc::ptr_eq(&first.initials, &snapshot.initials));
+        assert!(Arc::ptr_eq(&first.syllables, &second.syllables));
+        assert!(Arc::ptr_eq(&first.syllables, &snapshot.syllables));
         let custom = Lexicon::from_tsv("ni\t你\t1").unwrap();
         assert!(!Arc::ptr_eq(&first.entries, &custom.entries));
     }
@@ -434,6 +634,87 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].text, "你");
         assert_eq!(lexicon.entries["ni"][0].weight, 100);
+    }
+
+    #[test]
+    fn mixed_index_snapshots_keep_overlay_and_learning_isolated() {
+        let base = Lexicon::from_tsv("ni'hao\t你好\t100\nni'hao\t拟好\t1").unwrap();
+        assert_eq!(base.mixed_choices("nih")[0].candidate.text, "你好");
+        let overlay = base.with_overlay("ni'hao\t私好\t200").unwrap();
+        assert_eq!(overlay.mixed_choices("nih")[0].candidate.text, "私好");
+        let learned = base.with_learning(&[(
+            super::super::LearningEvent {
+                pinyin: "ni'hao".into(),
+                text: "拟好".into(),
+            },
+            1,
+        )]);
+        assert_eq!(learned.mixed_choices("nih")[0].candidate.text, "拟好");
+        assert_eq!(base.mixed_choices("nih")[0].candidate.text, "你好");
+    }
+
+    #[test]
+    fn limiting_initial_materialization_preserves_rank_and_complete_whole_choices() {
+        let lexicon = Lexicon::builtin().unwrap();
+        for raw in ["ys", "nh", "sm", "zg", "n'h", "unknown"] {
+            let complete = lexicon.initial_choices(raw);
+            for limit in [0, 1, 4, usize::MAX] {
+                let expected: Vec<_> = complete.iter().take(limit).cloned().collect();
+                let actual = lexicon.initial_choices_limited(raw, limit);
+                // Include score, canonical reading, consumed and learning identity.
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"), "{raw}");
+            }
+        }
+        assert!(lexicon.initial_choices("ys").len() > 4);
+        for raw in ["shenmeys", "ninh", "shi", "n'h"] {
+            let mut expected = lexicon.prefix_choices_limited(raw, 4);
+            for end in 1..=raw.len() {
+                if raw.as_bytes().get(end) == Some(&b'\'') {
+                    continue;
+                }
+                expected.extend(
+                    lexicon
+                        .initial_choices(&raw[..end])
+                        .into_iter()
+                        .take(4)
+                        .map(|mut choice| {
+                            choice.abbreviated = choice
+                                .candidate
+                                .comment
+                                .split('\'')
+                                .filter(|s| s.len() > 1)
+                                .count();
+                            choice.penalize_abbreviations();
+                            choice
+                        }),
+                );
+            }
+            assert_eq!(
+                format!("{:?}", lexicon.graph_choices(raw, 4)),
+                format!("{expected:?}"),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_trie_is_linear_not_a_spelling_product_and_query_is_bounded() {
+        let reading = vec!["shen"; 40].join("'");
+        let text = "什".repeat(40);
+        let lexicon = Lexicon::from_tsv(&format!("{reading}\t{text}\t1")).unwrap();
+        assert_eq!(lexicon.syllables.nodes.len(), 41);
+        assert_eq!(lexicon.mixed_choices(&"s".repeat(40)).len(), 1);
+        assert!(lexicon.mixed_choices(&"s".repeat(128)).is_empty());
+        let mut tsv = String::new();
+        for length in 2..=60 {
+            tsv.push_str(&format!(
+                "{}\t{}\t1\n",
+                vec!["a"; length].join("'"),
+                "啊".repeat(length)
+            ));
+        }
+        let ambiguous = Lexicon::from_tsv(&tsv).unwrap();
+        assert!(ambiguous.mixed_choices(&"a".repeat(60)).len() <= MIXED_BUDGET);
     }
 
     #[test]

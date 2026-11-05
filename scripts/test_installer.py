@@ -31,25 +31,31 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertNotIn("fs::copy", copy)
         self.assertIn("user_directory_guard(directory)", source)
 
-    def test_directory_selection_and_pre_copy_path_gate(self):
+    def test_fixed_directory_and_pre_copy_path_gate(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
         self.assertIn("DisableDirPage=yes", source)
         self.assertIn(r"DefaultDirName={commonpf64}\Flower", source)
-        self.assertIn(r"UninstallFilesDir={commonpf64}\Flower", source)
-        self.assertNotIn("{app}", source)
-        self.assertIn("CreateInputDirPage", source)
+        self.assertIn("UsePreviousAppDir=no", source)
+        self.assertIn(r"UninstallFilesDir={app}", source)
+        self.assertIn(r"{app}\versions\{#BuildId}", source)
+        self.assertNotIn("CreateInputDirPage", source)
+        self.assertNotIn("SystemRoot", source)
+        self.assertIn("/DIR", source)
         self.assertIn("AllowUNCPath=no", source)
         self.assertIn("Flags: dontcopy", source)
         prepare = source.split("function PrepareToInstall", 1)[1].split("procedure CurStepChanged", 1)[0]
-        self.assertIn(r"SafeInstallPath(ExpandConstant('{commonpf64}\Flower'))", prepare)
-        checker = source.split("function SafeInstallPath", 1)[1].split("function NextButtonClick", 1)[0]
+        self.assertIn(r"SafeInstallPath(ExpandConstant('{app}'))", prepare)
+        self.assertIn("PrepareInstallPath(WizardDirValue)", prepare)
+        self.assertLess(prepare.index("if not FixedInstallRoot"), prepare.index("PrepareInstallPath("))
+        self.assertIn("ExtractTemporaryFile('flower-path-check.exe')", prepare)
+        checker = source.split("function SafeInstallPath", 1)[1].split("function FixedInstallRoot", 1)[0]
         self.assertLess(checker.index("GetSHA256OfFile"), checker.index("if Exec("))
         self.assertIn("check-install-path --path", checker)
-        page = source.split("function NextButtonClick", 1)[1].split("function PrepareInstallPath", 1)[0]
-        self.assertIn("check-user-install-path --path", page)
-        self.assertNotIn("SafeInstallPath(WizardDirValue)", page)
-        self.assertNotIn("prepare-install-path", page)
-        self.assertNotIn("PrepareInstallPath(", page)
+        fixed = source.split("function FixedInstallRoot", 1)[1].split("function PrepareInstallPath", 1)[0]
+        self.assertIn("CompareStringOrdinal", fixed)
+        self.assertIn("ExpandFileName", fixed)
+        self.assertIn(r"{commonpf64}\Flower", fixed)
+        self.assertNotIn("check-user-install-path", source)
         for gate in ["HasFlowerRegistration", "DirExists(PayloadDir)", "HasNativeRuntime"]:
             self.assertLess(prepare.index(gate), prepare.index("PrepareInstallPath("))
         self.assertLess(prepare.index("PrepareInstallPath("), prepare.index("SafeInstallPath("))
@@ -57,19 +63,41 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertLess(creator.index("GetSHA256OfFile"), creator.index("if Exec("))
         self.assertIn("prepare-install-path --path", creator)
 
+    def test_default_checked_start_is_original_user_and_fail_closed(self):
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        run = source.split("[Run]", 1)[1].split("[Code]", 1)[0]
+        self.assertIn('Parameters: "--start-input-method"', run)
+        self.assertIn('Description: "启动 Flower"', run)
+        self.assertIn("postinstall nowait skipifsilent runasoriginaluser", run)
+        self.assertNotIn("unchecked", run)
+        self.assertIn("Check: CanStartFlower", run)
+        gate = source.split("function CanStartFlower", 1)[1].split("function InitializeSetup", 1)[0]
+        for check in ["RegistrationFailed", "FixedInstallRoot", "SafeInstallPath",
+                      "TrustedPayload", "OwnedRegistrationComplete", "ExpectedSettingsHash"]:
+            self.assertIn(check, gate)
+        self.assertIn("RegistrationFailed := True", source.split("function InitializeSetup", 1)[1])
+        cli = (installer.REPO / "src/bin/flower-settings.rs").read_text(encoding="utf-8-sig")
+        self.assertIn('[arg] if arg == "--start-input-method"', cli)
+        start = cli.split("fn start_input_method()", 1)[1].split("fn execute(", 1)[0]
+        self.assertLess(start.index("require_non_elevated()?"), start.index("registration::enable()"))
+        self.assertLess(start.index("registration::enable()"), start.index("run_settings_app()"))
+        self.assertIn("TokenIsElevated != 0", cli)
+        self.assertIn('command(&["--start-input-method", "extra"]).is_err()', cli)
+        self.assertIn('cfg(not(target_os = "windows"))', start)
+
     def test_post_copy_and_uninstall_validate_before_executing_installed_tool(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
         post = source.split("procedure CurStepChanged", 1)[1].split("procedure CurPageChanged", 1)[0]
         self.assertLess(post.index("SafeInstallPath"), post.index("if Exec(PayloadDir"))
         self.assertNotIn("PrepareInstallPath(", post)
-        self.assertIn("ExecAsOriginalUser", post)
-        self.assertIn("install-user-files --path", post)
-        self.assertLess(post.index("TrustedPayload"), post.index("ExecAsOriginalUser"))
-        self.assertIn("UserFilesFailed := ExitCode <> 0", post)
-        self.assertIn("if UserFilesFailed then Result := 16", source)
+        self.assertNotIn("ExecAsOriginalUser", source)
+        self.assertNotIn("install-user-files", source)
+        self.assertLess(post.index("TrustedPayload"), post.index("if Exec(PayloadDir"))
+        self.assertNotIn("UserFilesFailed", source)
         uninstall = source.split("function InitializeUninstall", 1)[1]
         self.assertLess(uninstall.index("FileCopy("), uninstall.index("SafeInstallPath"))
         self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PayloadDir"))
+        self.assertLess(uninstall.index("TrustedPayload"), uninstall.index("if not Exec(PayloadDir"))
         self.assertNotIn("PrepareInstallPath(", uninstall)
 
 
@@ -105,11 +133,17 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(include.splitlines()), len(list(payload.rglob("*"))) -
                          len([p for p in payload.rglob("*") if p.is_dir()]))
         self.assertNotIn("recursesubdirs", include)
-        self.assertIn(r'DestDir: "{commonpf64}\Flower\versions\{#BuildId}', include)
-        self.assertNotIn("{app}", include)
+        self.assertIn(r'DestDir: "{app}\versions\{#BuildId}', include)
+        self.assertNotIn("{commonpf64}", include)
+        for line in include.splitlines():
+            self.assertIn(r'DestDir: "{app}\versions\{#BuildId}', line)
         self.assertEqual(
             options["ExpectedDllHash"],
             hashlib.sha256((payload / "flower.dll").read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            options["ExpectedSettingsHash"],
+            hashlib.sha256((payload / "flower-settings.exe").read_bytes()).hexdigest(),
         )
         output = Path(options["OutputDir"]) / f"flower-{options['AppVersion']}-windows-x64-setup.exe"
         output.write_bytes(make_pe(is_dll=False))

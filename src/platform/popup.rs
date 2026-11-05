@@ -41,6 +41,16 @@ pub(crate) fn popup_palette(theme: Theme, system: PopupPalette) -> PopupPalette 
     }
 }
 
+/// Convert a validated target-monitor measurement, never an old popup DPI.
+#[cfg(any(target_os = "windows", test))]
+fn target_candidate_width_budget(work_width: i32, target_dpi: u32) -> u32 {
+    if work_width <= 0 || target_dpi == 0 {
+        return 544;
+    }
+    let logical = (work_width as u64 * 96 / u64::from(target_dpi)).min(560);
+    logical.saturating_sub(16).clamp(1, 544) as u32
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use std::cell::RefCell;
@@ -58,18 +68,20 @@ mod windows_impl {
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        GetMonitorInfoW, GetSysColor, InvalidateRect, MonitorFromRect, SelectObject, SetBkMode,
-        SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
-        COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS,
-        DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, HBRUSH, HDC,
-        HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-        TRANSPARENT,
+        GetMonitorInfoW, GetSysColor, InvalidateRect, MonitorFromRect, MonitorFromWindow,
+        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+        COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET,
+        DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
-    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::HiDpi::{
+        AreDpiAwarenessContextsEqual, GetDpiForWindow, GetWindowDpiAwarenessContext,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
         IsWindowVisible, LoadCursorW, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
@@ -87,7 +99,7 @@ mod windows_impl {
     use crate::platform::CandidatePopupSnapshot;
     use crate::settings::Theme;
 
-    use super::{popup_palette, PopupPalette};
+    use super::{popup_palette, target_candidate_width_budget, PopupPalette};
 
     const POPUP_CLASS_NAME: PCWSTR = windows::core::w!("Flower.CandidatePopupWindow");
     const POPUP_WINDOW_NAME: PCWSTR = windows::core::w!("Flower candidates");
@@ -95,6 +107,25 @@ mod windows_impl {
 
     const BASE_DPI: u32 = 96;
     const WM_FLOWER_DISPATCH_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+
+    /// Owns only the temporary built-in hidden window, never the real popup.
+    struct HiddenDpiProbe(Option<HWND>);
+
+    impl HiddenDpiProbe {
+        fn destroy(&mut self) -> bool {
+            match self.0.take() {
+                // SAFETY: This guard exclusively owns the window on its creating thread.
+                Some(hwnd) => unsafe { DestroyWindow(hwnd) }.is_ok(),
+                None => true,
+            }
+        }
+    }
+
+    impl Drop for HiddenDpiProbe {
+        fn drop(&mut self) {
+            let _ = self.destroy();
+        }
+    }
 
     /// A failure while creating, updating, or destroying the candidate popup.
     #[derive(Debug, Error)]
@@ -440,6 +471,77 @@ mod windows_impl {
             }
 
             Ok(())
+        }
+
+        /// 查询插入符目标显示器的逻辑内容宽预算。
+        /// 跨屏时短暂创建独立隐藏探针；不移动弹窗、不更改宿主或线程 DPI。
+        /// 仅供成功编辑后的发布路径使用，不用于按键试探。失败保留默认预算。
+        pub fn candidate_width_budget(&self, caret: PopupRect) -> Result<u32, PopupError> {
+            self.ensure_alive()?;
+            let native = windows_rect(caret);
+            // SAFETY: The rectangle is valid storage and neither query mutates windows.
+            let target = unsafe { MonitorFromRect(&native, MONITOR_DEFAULTTONEAREST) };
+            if target.is_invalid() {
+                return Ok(544);
+            }
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: The monitor is valid and the output structure has its required size.
+            if !unsafe { GetMonitorInfoW(target, &mut info) }.as_bool() {
+                return Ok(544);
+            }
+            // SAFETY: `self.hwnd` is live. Only a same-monitor popup supplies target DPI.
+            let dpi = if unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) } == target
+            {
+                unsafe { GetDpiForWindow(self.hwnd) }
+            } else {
+                // Built-in STATIC needs no custom class or callback. No WS_VISIBLE,
+                // owner, parent, focus API, or awareness mutation is involved.
+                let probe = unsafe {
+                    CreateWindowExW(
+                        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                        windows::core::w!("STATIC"),
+                        PCWSTR::null(),
+                        WS_POPUP,
+                        caret.left,
+                        caret.top,
+                        1,
+                        1,
+                        HWND::default(),
+                        HMENU::default(),
+                        HINSTANCE::default(),
+                        None,
+                    )
+                };
+                let Ok(probe) = probe else {
+                    return Ok(544);
+                };
+                let mut guard = HiddenDpiProbe(Some(probe));
+                // SAFETY: Both windows are live. The guard destroys the probe on
+                // every return path, including monitor/context validation failure.
+                let valid = unsafe {
+                    let probe_context = GetWindowDpiAwarenessContext(probe);
+                    let popup_context = GetWindowDpiAwarenessContext(self.hwnd);
+                    MonitorFromWindow(probe, MONITOR_DEFAULTTONEAREST) == target
+                        && !probe_context.0.is_null()
+                        && !popup_context.0.is_null()
+                        && AreDpiAwarenessContextsEqual(probe_context, popup_context).as_bool()
+                };
+                if !valid {
+                    return Ok(544);
+                }
+                let dpi = unsafe { GetDpiForWindow(probe) };
+                if !guard.destroy() {
+                    return Ok(544);
+                }
+                dpi
+            };
+            Ok(target_candidate_width_budget(
+                rect_from_windows(info.rcWork).width(),
+                dpi,
+            ))
         }
 
         /// 根据插入符位置选择显示器，重算目标 DPI 布局后再显示。
@@ -1278,6 +1380,24 @@ pub use windows_impl::{CandidatePopupWindow, PopupError};
 mod tests {
     use super::{popup_palette, PopupPalette, DARK_PALETTE, LIGHT_PALETTE};
     use crate::settings::Theme;
+
+    #[test]
+    fn target_budget_uses_target_dpi_and_clamps_or_falls_back() {
+        use super::target_candidate_width_budget as budget;
+        // Same physical work area, two possible destination screens.
+        assert_eq!(budget(800, 96), 544);
+        assert_eq!(budget(800, 192), 384);
+        // There is deliberately no old-window DPI input: going in either
+        // direction must produce the destination's budget.
+        for (target_dpi, expected) in [(192, 384), (96, 544), (192, 384)] {
+            assert_eq!(budget(800, target_dpi), expected);
+        }
+        assert_eq!(budget(1120, 192), 544);
+        assert_eq!(budget(1, 192), 1);
+        assert_eq!(budget(0, 192), 544);
+        assert_eq!(budget(800, 0), 544);
+        assert_eq!(budget(i32::MAX, 96), 544);
+    }
 
     fn system_palette() -> PopupPalette {
         PopupPalette {

@@ -23,6 +23,29 @@ pub struct LearningEvent {
     pub text: String,
 }
 
+/// Stable identity for one complete displayed choice; never grants write permission.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankingCandidate {
+    pub pinyin: String,
+    pub text: String,
+    pub consumed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankingOrder {
+    pub input: String,
+    pub candidates: Vec<RankingCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromotionEvent {
+    pub order: RankingOrder,
+    pub selected: RankingCandidate,
+}
+
 /// A selected word, not permission to persist before a safe host commit.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompositionUpdate {

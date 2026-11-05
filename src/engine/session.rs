@@ -2,7 +2,11 @@ use super::{
     decoder::{decode, Choice},
     LearningEvent,
 };
+use super::{
+    paging::candidate_cell_width, ranking_indices, PromotionEvent, RankingCandidate, RankingOrder,
+};
 use super::{Candidate, CompositionUpdate, EngineError, Key, KeyEvent, Lexicon};
+use std::{ops::Range, sync::Arc};
 
 #[derive(Debug, Clone)]
 struct Confirmed {
@@ -19,6 +23,10 @@ pub const DEFAULT_PAGE_SIZE: usize = 9;
 pub struct PinyinSession {
     lexicon: Lexicon,
     page_size: usize,
+    candidate_width: Option<u32>,
+    page_ranges: Vec<Range<usize>>,
+    ranking_orders: Arc<Vec<RankingOrder>>,
+    pending_promotions: Vec<PromotionEvent>,
     preedit: String,
     raw: String,
     confirmed: Vec<Confirmed>,
@@ -62,6 +70,10 @@ impl PinyinSession {
         Ok(Self {
             lexicon,
             page_size,
+            candidate_width: None,
+            page_ranges: Vec::new(),
+            ranking_orders: Arc::new(Vec::new()),
+            pending_promotions: Vec::new(),
             preedit: String::new(),
             raw: String::new(),
             confirmed: Vec::new(),
@@ -90,11 +102,13 @@ impl PinyinSession {
                     return Err(EngineError::InputTooLong);
                 }
                 self.pending_learning.clear();
+                self.pending_promotions.clear();
                 self.raw.push(character.to_ascii_lowercase());
                 self.refresh_candidates();
                 Ok(self.snapshot(true))
             }
             Key::Char('\'') if self.is_composing() => {
+                self.pending_promotions.clear();
                 if !self.raw.is_empty() && !self.raw.ends_with('\'') {
                     if self.raw.len() + self.confirmed.iter().map(|s| s.raw.len()).sum::<usize>()
                         >= 128
@@ -124,6 +138,7 @@ impl PinyinSession {
                 }
 
                 self.pending_learning.clear();
+                self.pending_promotions.clear();
                 if self.raw.is_empty() {
                     if let Some(segment) = self.confirmed.pop() {
                         self.raw = segment.raw;
@@ -210,13 +225,25 @@ impl PinyinSession {
         }
         let choice = self
             .choices
-            .get(self.page * self.page_size + index)
+            .get(self.page_ranges[self.page].start + index)
             .cloned()
             .ok_or(EngineError::CandidateOutOfRange {
                 index,
                 candidate_count,
             })?;
 
+        let promotion = (choice.consumed == self.raw.len()).then(|| PromotionEvent {
+            order: RankingOrder {
+                input: self.raw.clone(),
+                candidates: self
+                    .choices
+                    .iter()
+                    .filter(|c| c.consumed == self.raw.len())
+                    .map(Self::ranking_candidate)
+                    .collect(),
+            },
+            selected: Self::ranking_candidate(&choice),
+        });
         let raw = self.raw[..choice.consumed].to_owned();
         self.raw.drain(..choice.consumed);
         self.confirmed.push(Confirmed {
@@ -225,7 +252,9 @@ impl PinyinSession {
             events: choice.events,
         });
         if self.raw.is_empty() {
-            self.commit_literal()
+            let update = self.commit_literal()?;
+            self.pending_promotions.extend(promotion);
+            Ok(update)
         } else {
             self.pending_learning.clear();
             self.refresh_candidates();
@@ -277,15 +306,25 @@ impl PinyinSession {
         }
 
         self.page_size = page_size;
-        let page_count = self.page_count();
-        if page_count == 0 {
-            self.page = 0;
-            self.highlighted = None;
-        } else {
-            self.page = self.page.min(page_count - 1);
-            self.highlighted = Some(0);
-        }
+        self.rebuild_pages();
         Ok(())
+    }
+
+    /// Reflows pages, preserving the absolute highlighted candidate.
+    pub fn set_candidate_width(&mut self, width: Option<u32>) -> CompositionUpdate {
+        self.candidate_width = width;
+        self.rebuild_pages();
+        self.snapshot(true)
+    }
+
+    /// Changes the next decode's ordering, never the currently displayed choices.
+    pub fn set_ranking_orders(&mut self, orders: Arc<Vec<RankingOrder>>) {
+        self.ranking_orders = orders;
+    }
+
+    /// Events require a successful, safe host commit before they may be applied.
+    pub fn pending_promotions(&self) -> &[PromotionEvent] {
+        &self.pending_promotions
     }
 
     pub fn page_size(&self) -> usize {
@@ -310,11 +349,7 @@ impl PinyinSession {
     }
 
     pub fn page_count(&self) -> usize {
-        if self.candidates.is_empty() {
-            0
-        } else {
-            self.candidates.len().div_ceil(self.page_size)
-        }
+        self.page_ranges.len()
     }
 
     pub fn highlighted(&self) -> Option<usize> {
@@ -332,7 +367,7 @@ impl PinyinSession {
 
     fn commit_current(&mut self) -> Result<CompositionUpdate, EngineError> {
         if let Some(index) = self.highlighted {
-            let absolute = self.page * self.page_size + index;
+            let absolute = self.page_ranges[self.page].start + index;
             if self
                 .choices
                 .get(absolute)
@@ -371,6 +406,24 @@ impl PinyinSession {
             .collect::<String>()
             + &self.raw;
         self.choices = decode(&self.lexicon, &self.raw);
+        let (complete, partial): (Vec<_>, Vec<_>) = self
+            .choices
+            .drain(..)
+            .partition(|choice| choice.consumed == self.raw.len());
+        let identities: Vec<_> = complete.iter().map(Self::ranking_candidate).collect();
+        if let Some(saved) = self
+            .ranking_orders
+            .iter()
+            .find(|order| order.input == self.raw)
+        {
+            self.choices = ranking_indices(&identities, saved)
+                .into_iter()
+                .map(|index| complete[index].clone())
+                .collect();
+        } else {
+            self.choices = complete;
+        }
+        self.choices.extend(partial);
         self.candidates = self
             .choices
             .iter()
@@ -382,22 +435,63 @@ impl PinyinSession {
         } else {
             Some(0)
         };
+        self.page_ranges.clear();
+        self.rebuild_pages();
+    }
+
+    fn ranking_candidate(choice: &Choice) -> RankingCandidate {
+        RankingCandidate {
+            pinyin: choice.candidate.comment.clone(),
+            text: choice.candidate.text.clone(),
+            consumed: choice.consumed,
+        }
+    }
+
+    fn rebuild_pages(&mut self) {
+        let absolute = self
+            .page_ranges
+            .get(self.page)
+            .and_then(|range| self.highlighted.map(|index| range.start + index))
+            .unwrap_or(0);
+        self.page_ranges.clear();
+        let limit = if self.candidate_width.is_some() {
+            self.page_size.min(9)
+        } else {
+            self.page_size
+        };
+        let mut start = 0;
+        while start < self.candidates.len() {
+            let mut end = start;
+            let mut used = 0u32;
+            while end < self.candidates.len() && end - start < limit {
+                let width = candidate_cell_width(&self.candidates[end].text, end - start);
+                if let Some(budget) = self.candidate_width {
+                    if end > start && used.saturating_add(width) > budget {
+                        break;
+                    }
+                }
+                used = used.saturating_add(width);
+                end += 1;
+            }
+            self.page_ranges.push(start..end);
+            start = end;
+        }
+        self.page = self
+            .page_ranges
+            .iter()
+            .position(|range| range.contains(&absolute))
+            .unwrap_or(0);
+        self.highlighted = self
+            .page_ranges
+            .get(self.page)
+            .map(|range| absolute.saturating_sub(range.start).min(range.len() - 1));
     }
 
     fn current_page(&self) -> &[Candidate] {
-        if self.candidates.is_empty() {
-            return &[];
-        }
-
-        let start = self.page.saturating_mul(self.page_size);
-        let end = start
-            .saturating_add(self.page_size)
-            .min(self.candidates.len());
-        if start >= end {
-            &[]
-        } else {
-            &self.candidates[start..end]
-        }
+        self.page_ranges
+            .get(self.page)
+            .map(|range| &self.candidates[range.clone()])
+            .unwrap_or(&[])
     }
 
     fn change_page(&mut self, delta: isize) {
@@ -444,7 +538,9 @@ impl PinyinSession {
         self.confirmed.clear();
         self.choices.clear();
         self.pending_learning.clear();
+        self.pending_promotions.clear();
         self.candidates.clear();
+        self.page_ranges.clear();
         self.page = 0;
         self.highlighted = None;
     }

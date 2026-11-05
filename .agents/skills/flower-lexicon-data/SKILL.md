@@ -5,7 +5,7 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 
 # Flower 词库数据流程
 
-先读当前 `design/input-and-installation.md`、`docs/distribution.md` 及 `data/pinyin/sources/manifest.json`。历史设计若已不存在，不依据旧摘要恢复。以实际阶段和共享行为契约为准，不因数据量扩大就宣称整句输入或用户学习已实现。
+先读当前 `design/adaptive-candidates.md`、`docs/distribution.md` 及 `data/pinyin/sources/manifest.json`，旧基础排序约定见 `design/input-and-installation.md`。历史设计若已不存在，不依据旧摘要恢复。以实际阶段和共享行为契约为准，不因数据量扩大就宣称整句输入或用户学习已实现。
 
 ## 来源与许可
 
@@ -47,6 +47,20 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 - 0.4.1 增加用户已选择的项目日常词优先层，只分类真实既有规范词条，明确不是统计频率，不改 weight 也不造读音。分类、overlay、learning、initial 索引排序须同步；自定义 from_tsv fixture 仍按权重。优先层会影响高权重私词与日常词之间的顺序，更新测试时须保留私词可达、weight不变和快照隔离断言，不简单删除旧断言。
 - 0.4.1 候选顺序为完整全拼→整词简拼→完整组合→部分前缀，防组合字串挤在真实简拼词之前。`nh/wm/sm/ky/zg/xx` 可用真实内置表检验常用词首屏，不给不存在的词补造读音。优先层与实际词频证据应分开报告，不冒充无偏质量基准。
 - `tests/common_ranking.rs` 覆盖真实内置排序和简拼，`tests/pinyin_sentence.rs`、`tests/lexicon_quality.rs` 覆盖状态与快照一致性；原生 Context 回归可验证 NH 到“你好”的编辑路径，仍不证明实机激活。
+
+## 0.4.2 精确选词顺序（当前）
+
+- 用户明确选择默认本地持久保存。使用独立PromotionEvent/RankingOrder/RankingCandidate及共享engine::promote_order，成功完整选择只与直接前驱交换一次；不能以count*512、一次置顶或分词LearningEvent代替。第2项一次变第1，第5项仅变第4，首项不动；保存按输入作用域区分全拼/简拼，未知ID不造候选。
+- schema2新adaptive_ranking_enabled默认true；schema1只读迁移不重写，旧count保留但TSF不再叠旧频次加权。管理开关和清空推进generation，清空同时清counts/rankings；有界队列在clone前限制事件规模，锁内重读最新顺序合并，跨进程不能用过时UI快照覆盖新状态。未知版本或坏文件保留。
+- 选择时仅捕获完整候选快照，partial不记录未消耗后缀；只在安全成功且仍聚焦的TSF发布兑现，使用一次性claim防重复。激活内Arc排序供空会话下次输入同步，正在组词不暗改；试探/取消/失败/密码私密未知scope无内存或磁盘提升。保存失败不回滚已成功文档提交，不宣称入队等于耐久保存。
+- tests/adaptive_input.rs用明确“影射/映射”第2位fixture→成功提交→真实Store写入→新Store及内置词典session重放，验证“映射”变首项。完整候选不遗漏分页与序号/Enter/鼠标索引需和单行width真实page_ranges一起测试；不得仅让popup少画几项。
+
+## 0.4.3 混合输入与整次解码预算
+
+- 当前混输契约见 `design/mixed-input-and-installation.md`。规范词条每音节可全拼或首字母，保留 canonical reading、真实 raw consumed 与 Promotion scope；不预生成 2^n 组合，不每键扫描整词表，overlay/learning 同步共享音节 trie。
+- 组合边的 top4/beam8 是语义与性能边界。真实目标词被裁剪时先取证具体词边排名；可由根明确调整已存在日常词分类，不造整句词条、不随意扩大 beam 或伪改频率。全拼、整词首字母、整词混拼、完整组合、部分前缀分层保持。
+- 混输遍历每起点一次收集所有 prefix 终端；一次 decode 共用最多16384状态展开，单查询最多4096，不可对每 prefix 重置预算。整词 mixed 复用起点0结果，输出收集也有界；exact/initial 不因 mixed 预算耗尽被截断。用实际计数测试跨起点预算，不只断言返回向量长度。
+- release 固定 `lexicon_probe` 包含长密集输入，预算有界不等于时延可忽略。优化前后在未改负载下测量；图区只取少量边时不要先构建整批 Choice 再 take。延迟物化或有界取边必须保持原排名与完整整词候选，不以减少合法匹配隐瞒回退。
 
 ## 最小充分验证
 

@@ -482,7 +482,7 @@ fn assert_all_cells_hittable(
 }
 
 #[test]
-fn horizontal_order_wrap_and_every_supported_page_size_remain_hittable() {
+fn horizontal_single_row_preserves_even_legacy_oversized_pages() {
     for count in 1..=99 {
         let candidates = vec![("词", "ci"); count];
         let mut model = CandidatePopupModel::new();
@@ -491,32 +491,60 @@ fn horizontal_order_wrap_and_every_supported_page_size_remain_hittable() {
         let layout = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
         assert_all_cells_hittable(snapshot, &layout);
         for cells in layout.candidates.windows(2) {
-            if cells[0].top == cells[1].top {
-                assert_eq!(cells[0].right, cells[1].left);
-            } else {
-                assert_eq!(cells[0].bottom, cells[1].top);
-                assert_eq!(cells[1].left, layout.candidates[0].left);
-            }
+            assert_eq!(cells[0].top, cells[1].top);
+            assert_eq!(cells[0].bottom, cells[1].bottom);
+            assert_eq!(cells[0].right, cells[1].left);
         }
         if count == 99 {
-            assert!(layout.candidates.last().unwrap().top > layout.candidates[0].top);
+            assert!(layout.size.width <= 560);
             let doubled = CandidatePopupLayout::new(snapshot, 192, PopupSize::new(1600, 1200));
             assert_all_cells_hittable(snapshot, &doubled);
             assert_eq!(doubled.size.width, layout.size.width * 2);
             assert_eq!(doubled.size.height, layout.size.height * 2);
-            for (normal, high_dpi) in layout.candidates.iter().zip(&doubled.candidates) {
-                assert_eq!(
-                    *high_dpi,
-                    PopupRect::new(
-                        normal.left * 2,
-                        normal.top * 2,
-                        normal.right * 2,
-                        normal.bottom * 2,
-                    )
-                );
-            }
+            assert!(doubled
+                .candidates
+                .iter()
+                .all(|cell| cell.top == doubled.candidates[0].top));
         }
     }
+}
+
+#[test]
+fn shared_estimates_and_one_pixel_cells_preserve_the_whole_page() {
+    let candidates = vec![("词", "ci"); 9];
+    let mut model = CandidatePopupModel::new();
+    model.apply_update(&popup_update("ci", &candidates, Some(8), 0, 1));
+    let snapshot = model.snapshot().unwrap();
+    // Nine 61-pixel cells require 549 pixels, exceeding the 544 content cap.
+    // Verify exact estimates on a genuinely fitting page.
+    let mut fitting = snapshot.clone();
+    fitting.candidates.truncate(8);
+    fitting.highlighted = Some(7);
+    let normal = CandidatePopupLayout::new(&fitting, 96, PopupSize::new(800, 600));
+    for (index, cell) in normal.candidates.iter().enumerate() {
+        assert_eq!(
+            cell.width() as u32,
+            flower::engine::paging::candidate_cell_width(&snapshot.candidates[index].text, index)
+        );
+    }
+    let capped = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
+    assert_all_cells_hittable(snapshot, &capped);
+    assert_eq!(
+        capped
+            .candidates
+            .iter()
+            .map(|cell| cell.width())
+            .sum::<i32>(),
+        544
+    );
+    let tiny = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(25, 600));
+    assert_all_cells_hittable(snapshot, &tiny);
+    assert!(tiny.candidates.iter().all(|cell| cell.width() == 1));
+    let impossible = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(24, 600));
+    assert!(impossible.candidates.is_empty());
+    assert_eq!(impossible.footer, None);
+    assert_eq!(impossible.previous_page, None);
+    assert_eq!(impossible.next_page, None);
 }
 
 #[test]
@@ -539,7 +567,7 @@ fn preedit_and_canonical_comments_do_not_affect_geometry_or_snapshot_data() {
 }
 
 #[test]
-fn long_cells_are_bounded_and_wrap_without_losing_candidates() {
+fn long_cells_shrink_in_one_row_without_losing_candidates_or_identity() {
     let mut model = CandidatePopupModel::new();
     model.apply_update(&popup_update(
         "long",
@@ -552,8 +580,9 @@ fn long_cells_are_bounded_and_wrap_without_losing_candidates() {
     snapshot.candidates[0].text = "长".repeat(1000);
     let layout = CandidatePopupLayout::new(&snapshot, 96, PopupSize::new(340, 600));
     assert_all_cells_hittable(&snapshot, &layout);
-    assert_eq!(layout.candidates[0].width(), 240);
-    assert!(layout.candidates[1].top > layout.candidates[0].top);
+    assert!(layout.candidates[0].width() <= 240);
+    assert_eq!(layout.candidates[1].top, layout.candidates[0].top);
+    assert_eq!(snapshot.candidates[0].text, "长".repeat(1000));
 
     for dpi in [96, 144, 192] {
         let narrow = CandidatePopupLayout::new(&snapshot, dpi, PopupSize::new(160, 600));
@@ -569,9 +598,8 @@ fn insufficient_width_or_total_height_hides_the_whole_page_and_footer() {
     let normal = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
     for bounds in [
         PopupSize::new(1, 1),
-        PopupSize::new(30, 600),
+        PopupSize::new(17, 600),
         PopupSize::new(800, normal.size.height - 1),
-        PopupSize::new(70, 97),
     ] {
         let layout = CandidatePopupLayout::new(snapshot, 96, bounds);
         assert!(layout.size.width <= bounds.width && layout.size.height <= bounds.height);

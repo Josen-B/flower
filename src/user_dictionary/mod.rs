@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::engine::LearningEvent;
+use crate::engine::{promote_order, LearningEvent, PromotionEvent, RankingOrder};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RECORDS: usize = 100_000;
 pub const MAX_LEARNING_COUNT: u32 = 8192;
@@ -80,6 +80,10 @@ pub struct UserDictionary {
     pub schema_version: u32,
     pub generation: u64,
     pub learning_enabled: bool,
+    #[serde(default = "default_adaptive_ranking_enabled")]
+    pub adaptive_ranking_enabled: bool,
+    #[serde(default)]
+    pub rankings: Vec<RankingOrder>,
     pub entries: Vec<DictionaryEntry>,
     pub domains: Vec<DomainDictionary>,
     pub learned: Vec<LearnedEntry>,
@@ -91,6 +95,8 @@ impl Default for UserDictionary {
             schema_version: SCHEMA_VERSION,
             generation: 0,
             learning_enabled: false,
+            adaptive_ranking_enabled: true,
+            rankings: Vec::new(),
             entries: Vec::new(),
             domains: Vec::new(),
             learned: Vec::new(),
@@ -130,12 +136,19 @@ impl UserDictionary {
         if self.schema_version != SCHEMA_VERSION {
             return Err(DictionaryError::UnsupportedVersion);
         }
+        validate_rankings(&self.rankings)?;
         if self.domains.len() > MAX_RECORDS
             || self
                 .entries
                 .len()
                 .saturating_add(self.learned.len())
                 .saturating_add(self.domains.iter().map(|d| d.entries.len()).sum::<usize>())
+                .saturating_add(
+                    self.rankings
+                        .iter()
+                        .map(|r| r.candidates.len())
+                        .sum::<usize>(),
+                )
                 > MAX_RECORDS
         {
             return Err(DictionaryError::LimitExceeded);
@@ -161,6 +174,87 @@ impl UserDictionary {
         }
         Ok(())
     }
+}
+
+fn default_adaptive_ranking_enabled() -> bool {
+    true
+}
+
+fn validate_order(order: &RankingOrder) -> Result<(), DictionaryError> {
+    let input = &order.input;
+    if input.is_empty()
+        || input.len() > 128
+        || input.starts_with('\'')
+        || input.contains("''")
+        || !input.bytes().all(|b| b.is_ascii_lowercase() || b == b'\'')
+    {
+        return Err(DictionaryError::InvalidData);
+    }
+    if order.candidates.len() > 4096 {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    let mut seen = HashSet::new();
+    for candidate in &order.candidates {
+        if candidate.pinyin.is_empty()
+            || candidate.pinyin.len() > 256
+            || !candidate
+                .pinyin
+                .split('\'')
+                .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()))
+            || candidate.text.is_empty()
+            || candidate.text.chars().count() > 128
+            || candidate.text.chars().any(char::is_control)
+            || candidate.consumed != input.len()
+            || !seen.insert((&candidate.pinyin, &candidate.text, candidate.consumed))
+        {
+            return Err(DictionaryError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+fn validate_rankings(orders: &[RankingOrder]) -> Result<(), DictionaryError> {
+    if orders.len() > 256 || orders.iter().map(|o| o.candidates.len()).sum::<usize>() > MAX_RECORDS
+    {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    let mut inputs = HashSet::new();
+    for order in orders {
+        validate_order(order)?;
+        if !inputs.insert(&order.input) {
+            return Err(DictionaryError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
+// Bound borrowed data before cloning it into the bounded worker queue. The
+// serialized-size check also accounts for JSON escaping and selected identities.
+fn validate_promotions(events: &[PromotionEvent]) -> Result<(), DictionaryError> {
+    if events.len() > MAX_BATCH {
+        return Err(DictionaryError::LimitExceeded);
+    }
+    let mut ids = 0usize;
+    let mut bytes = 0usize;
+    for event in events {
+        ids = ids.saturating_add(event.order.candidates.len());
+        if ids > MAX_RECORDS {
+            return Err(DictionaryError::LimitExceeded);
+        }
+        validate_order(&event.order)?;
+        if !event.order.candidates.contains(&event.selected) {
+            return Err(DictionaryError::InvalidData);
+        }
+        bytes = bytes.saturating_add(
+            serde_json::to_vec(event)
+                .map_err(|_| DictionaryError::InvalidData)?
+                .len(),
+        );
+        if bytes > MAX_FILE_BYTES {
+            return Err(DictionaryError::LimitExceeded);
+        }
+    }
+    Ok(())
 }
 
 fn validate_domain(name: &str) -> Result<(), DictionaryError> {
@@ -448,6 +542,7 @@ impl DictionaryStore {
     pub fn set_learning_enabled(&self, enabled: bool) -> Result<(), DictionaryError> {
         self.update(true, |dictionary| {
             dictionary.learning_enabled = enabled;
+            dictionary.adaptive_ranking_enabled = enabled;
             Ok(true)
         })
     }
@@ -455,6 +550,30 @@ impl DictionaryStore {
     pub fn clear_learning(&self) -> Result<(), DictionaryError> {
         self.update(true, |dictionary| {
             dictionary.learned.clear();
+            dictionary.rankings.clear();
+            Ok(true)
+        })
+    }
+
+    pub fn promote_if_generation(
+        &self,
+        generation: u64,
+        events: &[PromotionEvent],
+    ) -> Result<(), DictionaryError> {
+        self.update(false, |dictionary| {
+            if !dictionary.adaptive_ranking_enabled
+                || dictionary.generation != generation
+                || events.is_empty()
+            {
+                return Ok(false);
+            }
+            validate_promotions(events)?;
+            for event in events {
+                promote_order(&mut dictionary.rankings, event);
+                // Reject an oversized intermediate state rather than allowing
+                // a later event to hide a resource-limit violation.
+                dictionary.validate()?;
+            }
             Ok(true)
         })
     }
@@ -510,8 +629,17 @@ fn load_path(path: &Path) -> Result<UserDictionary, DictionaryError> {
         }
         Err(error) => return Err(error),
     };
-    let dictionary: UserDictionary =
+    let mut dictionary: UserDictionary =
         serde_json::from_slice(&bytes).map_err(|_| DictionaryError::InvalidData)?;
+    match dictionary.schema_version {
+        1 => {
+            dictionary.schema_version = SCHEMA_VERSION;
+            dictionary.adaptive_ranking_enabled = true;
+            dictionary.rankings.clear();
+        }
+        SCHEMA_VERSION => {}
+        _ => return Err(DictionaryError::UnsupportedVersion),
+    }
     dictionary.validate()?;
     Ok(dictionary)
 }
@@ -1025,6 +1153,7 @@ fn current_user_path() -> Result<PathBuf, DictionaryError> {
 
 enum WorkerMessage {
     Learn(Vec<LearningEvent>),
+    Promote(Vec<PromotionEvent>),
     Stop,
 }
 
@@ -1049,6 +1178,12 @@ impl LearningWorker {
                                 failed = true;
                             }
                         }
+                        WorkerMessage::Promote(events) => {
+                            if !failed && store.promote_if_generation(generation, &events).is_err()
+                            {
+                                failed = true;
+                            }
+                        }
                     }
                 }
                 failed
@@ -1069,6 +1204,18 @@ impl LearningWorker {
             .as_ref()
             .ok_or(DictionaryError::WorkerStopped)?
             .try_send(WorkerMessage::Learn(events))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => DictionaryError::QueueFull,
+                TrySendError::Disconnected(_) => DictionaryError::WorkerStopped,
+            })
+    }
+
+    pub fn submit_promotions(&self, events: &[PromotionEvent]) -> Result<(), DictionaryError> {
+        validate_promotions(events)?;
+        self.sender
+            .as_ref()
+            .ok_or(DictionaryError::WorkerStopped)?
+            .try_send(WorkerMessage::Promote(events.to_vec()))
             .map_err(|error| match error {
                 TrySendError::Full(_) => DictionaryError::QueueFull,
                 TrySendError::Disconnected(_) => DictionaryError::WorkerStopped,

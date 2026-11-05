@@ -8,6 +8,151 @@ fn session() -> PinyinSession {
     PinyinSession::new().expect("embedded MVP lexicon must load")
 }
 
+const ADAPTIVE_TSV: &str = "shi\t是\t900\nshi\t时\t800\nshi\t十\t700\nshi\t事\t600\nshi\t市\t500\nshi\t世界很长的候选文本\t400\nshi\t诗\t300";
+
+#[test]
+fn adaptive_promotion_is_one_adjacent_step_and_can_be_restored() {
+    use flower::engine::promote_order;
+    use std::sync::Arc;
+    for selected in [1, 4] {
+        let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+        let baseline = type_text(&mut session, "shi").candidates;
+        assert!(session.pending_promotions().is_empty());
+        session.select_candidate(selected).unwrap();
+        let event = session.pending_promotions()[0].clone();
+        assert_eq!(event.order.input, "shi");
+        assert_eq!(event.order.candidates.len(), baseline.len());
+        assert_eq!(event.selected.text, baseline[selected].text);
+        let mut orders = Vec::new();
+        promote_order(&mut orders, &event);
+        let mut expected = baseline.clone();
+        expected.swap(selected - 1, selected);
+        session.set_ranking_orders(Arc::new(orders.clone()));
+        assert_eq!(type_text(&mut session, "shi").candidates, expected);
+        assert!(session.pending_promotions().is_empty());
+        let mut restored = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+        restored.set_ranking_orders(Arc::new(orders));
+        assert_eq!(type_text(&mut restored, "shi").candidates, expected);
+        restored.cancel().unwrap();
+        assert!(restored.pending_promotions().is_empty());
+    }
+}
+
+#[test]
+fn adaptive_pages_cover_all_choices_and_preserve_absolute_highlight() {
+    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+    let baseline = type_text(&mut session, "shi").candidates;
+    session.process_key(KeyEvent::plain(Key::Right)).unwrap();
+    session.process_key(KeyEvent::plain(Key::Right)).unwrap();
+    let update = session.set_candidate_width(Some(130));
+    assert!(update.handled);
+    assert_eq!(update.candidates[update.highlighted.unwrap()], baseline[2]);
+    while session.page() > 0 {
+        session.previous_page().unwrap();
+    }
+    let mut actual = Vec::new();
+    loop {
+        let page = session.candidates_on_current_page();
+        let width: u32 = page
+            .iter()
+            .enumerate()
+            .map(|(i, c)| flower::engine::paging::candidate_cell_width(&c.text, i))
+            .sum();
+        assert!(page.len() == 1 || width <= 130);
+        assert!(page.len() <= 9);
+        actual.extend_from_slice(page);
+        if session.page() + 1 == session.page_count() {
+            break;
+        }
+        session.next_page().unwrap();
+    }
+    assert_eq!(actual, baseline);
+    let expected = session.candidates_on_current_page()[0].text.clone();
+    assert_eq!(
+        session
+            .process_key(KeyEvent::plain(Key::Enter))
+            .unwrap()
+            .commit,
+        Some(expected)
+    );
+}
+
+#[test]
+fn adaptive_local_selection_and_preview_do_not_apply_promotions() {
+    use flower::engine::EngineRouter;
+    for key in [Key::Char('2'), Key::Enter] {
+        let mut router = EngineRouter::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+        router.set_candidate_width(Some(130));
+        for c in "shi".chars() {
+            router.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        router.next_page().unwrap();
+        let before = router.session().candidates_on_current_page().to_vec();
+        assert!(router.test_key(KeyEvent::plain(key)).unwrap());
+        assert_eq!(router.session().candidates_on_current_page(), before);
+        assert!(router.pending_promotions().is_empty());
+        let index = if key == Key::Enter { 0 } else { 1 };
+        let expected = before[index].text.clone();
+        assert_eq!(
+            router.process_key(KeyEvent::plain(key)).unwrap().commit,
+            Some(expected)
+        );
+        assert_eq!(
+            router.pending_promotions()[0].selected.text,
+            before[index].text
+        );
+    }
+    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+    session.set_candidate_width(Some(130));
+    type_text(&mut session, "shi");
+    session.next_page().unwrap();
+    let expected = session.candidates_on_current_page()[1].text.clone();
+    assert_eq!(session.select_candidate(1).unwrap().commit, Some(expected));
+}
+
+#[test]
+fn partial_and_literal_selection_never_capture_unresolved_suffix() {
+    let mut session = PinyinSession::from_lexicon_tsv("ni\t你\t100", 9).unwrap();
+    type_text(&mut session, "nix");
+    session.select_candidate(0).unwrap();
+    assert!(session.pending_promotions().is_empty());
+    session.commit().unwrap();
+    assert!(session.pending_promotions().is_empty());
+    type_text(&mut session, "ni");
+    session.cancel().unwrap();
+    assert!(session.pending_promotions().is_empty());
+}
+
+#[test]
+fn sentence_promotion_is_one_complete_identity_and_active_order_is_stable() {
+    use flower::engine::{promote_order, RankingOrder};
+    use std::sync::Arc;
+    let mut session = PinyinSession::from_lexicon_tsv("ni\t你\t100\nhao\t好\t100", 9).unwrap();
+    let update = type_text(&mut session, "nihao");
+    assert_eq!(update.candidates[0].text, "你好");
+    session.select_candidate(0).unwrap();
+    let events = session.pending_promotions();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].selected.pinyin, "ni'hao");
+    assert_eq!(events[0].selected.text, "你好");
+    assert_eq!(events[0].selected.consumed, 5);
+    assert_eq!(events[0].order.candidates.len(), 1);
+
+    let mut session = PinyinSession::from_lexicon_tsv(ADAPTIVE_TSV, 9).unwrap();
+    let baseline = type_text(&mut session, "shi").candidates;
+    session.select_candidate(1).unwrap();
+    let mut orders: Vec<RankingOrder> = Vec::new();
+    promote_order(&mut orders, &session.pending_promotions()[0]);
+    type_text(&mut session, "shi");
+    session.set_ranking_orders(Arc::new(orders));
+    assert_eq!(session.candidates_on_current_page(), baseline);
+    session.cancel().unwrap();
+    let reordered = type_text(&mut session, "shi");
+    assert_eq!(reordered.candidates[0], baseline[1]);
+    let update = session.set_candidate_width(None);
+    assert_eq!(update.candidates, reordered.candidates);
+}
+
 #[test]
 fn expanded_homophones_can_all_be_reached_and_the_last_candidate_selected() {
     let lexicon = Lexicon::builtin().unwrap();

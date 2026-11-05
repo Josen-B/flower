@@ -26,13 +26,13 @@ mod windows_exports {
     use std::ptr;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread::ThreadId;
 
     use crate::engine::{
         map_windows_virtual_key, CompositionUpdate, EngineRouter, KeyEvent, Modifiers,
     };
-    use crate::engine::{LearningEvent, Lexicon};
+    use crate::engine::{promote_order, Lexicon, RankingOrder};
     use crate::platform::candidate::{
         deferred_action_is_valid, edit_publish_decision, AcceptedCandidateAction,
         CandidatePopupAction, DeferredActionState, DeferredActionTicket, EditPublishDecision,
@@ -292,8 +292,9 @@ mod windows_exports {
         }
 
         fn new(context: &ITfContext, settings: &Settings, lexicon: &Lexicon) -> Option<Self> {
-            let router =
+            let mut router =
                 EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size).ok()?;
+            router.set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
             Some(Self {
                 context: context.clone(),
                 router,
@@ -325,12 +326,43 @@ mod windows_exports {
         /// Immutable settings captured when this activation started.
         settings: Settings,
         lexicon: Lexicon,
+        rankings: Arc<Vec<RankingOrder>>,
+        adaptive_ranking_enabled: bool,
         learning: Option<LearningWorker>,
         _learning_registration: Option<ObjectRegistration>,
         local_data_error: bool,
     }
 
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
+
+    fn claim_promotion(claim: &Cell<bool>, allowed: bool) -> bool {
+        allowed && !claim.replace(true)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn unsafe_or_duplicate_completion_never_claims_a_second_promotion() {
+        let claim = Cell::new(false);
+        assert!(!claim_promotion(&claim, false));
+        assert!(!claim.get());
+        assert!(claim_promotion(&claim, true));
+        assert!(!claim_promotion(&claim, true));
+    }
+
+    fn sync_idle_rankings(
+        shared: &SharedActivation,
+        token: ActivationToken,
+        router: &mut EngineRouter,
+    ) {
+        if router.is_composing() {
+            return;
+        }
+        if let Ok(activation) = shared.try_borrow() {
+            if let Some(active) = activation.as_ref().filter(|a| a.token == token) {
+                router.set_ranking_orders(Arc::clone(&active.rankings));
+            }
+        }
+    }
 
     fn context_key(context: &ITfContext) -> ContextKey {
         // TSF supplies the same COM interface identity across callbacks for a
@@ -573,8 +605,9 @@ mod windows_exports {
 
     fn scope_allows_learning(context: &ITfContext, cookie: u32) -> bool {
         use windows::Win32::UI::TextServices::{ITfInputScope, GUID_PROP_INPUTSCOPE};
-        // All document/property access remains inside this edit session. Unknown
-        // or unsupported scopes fail closed, including the default empty test store.
+        // Read the application's declaration over the actual selection inside
+        // this edit session. Missing, unsupported, or mixed unsafe scopes deny
+        // learning; never fall back to a different property channel.
         unsafe {
             let mut selection = [TF_SELECTION::default()];
             let mut fetched = 0;
@@ -586,10 +619,14 @@ mod windows_exports {
             let Some(range) = range else {
                 return false;
             };
-            let Ok(property) = context.GetProperty(&GUID_PROP_INPUTSCOPE) else {
+            let property = context.GetAppProperty(&GUID_PROP_INPUTSCOPE);
+            record_result(Stage::LearningAppProperty, &property);
+            let Ok(property) = property else {
                 return false;
             };
-            let Ok(value) = property.GetValue(cookie, &range) else {
+            let value = property.GetValue(cookie, &range);
+            record_result(Stage::LearningScopeValue, &value);
+            let Ok(value) = value else {
                 return false;
             };
             let Ok(unknown) = windows::core::IUnknown::try_from(&value) else {
@@ -627,6 +664,7 @@ mod windows_exports {
 
     #[derive(Clone)]
     struct EditTarget {
+        promotion_claim: Rc<Cell<bool>>,
         activation: SharedActivation,
         thread_manager: ITfThreadMgr,
         token: ActivationToken,
@@ -1124,6 +1162,7 @@ mod windows_exports {
         let composition = entry.composition.take();
         let controller = entry.controller;
         let target = EditTarget {
+            promotion_claim: Rc::new(Cell::new(false)),
             activation: Rc::clone(shared),
             thread_manager,
             token,
@@ -1330,14 +1369,13 @@ mod windows_exports {
         }
         let learning_allowed = outcome.learning_allowed;
         let events = if update.commit.is_some() {
-            entry.router.pending_learning().to_vec()
+            entry.router.pending_promotions().to_vec()
         } else {
             Vec::new()
         };
         entry.composition = outcome.composition;
         entry.controller = outcome.controller;
         let caret = outcome.caret;
-        entry.popup_model.apply_update(update);
 
         let focus_context_matches = focused_context_key(&target.thread_manager) == Some(target.key);
         let (decision, shown_context) = {
@@ -1369,6 +1407,20 @@ mod windows_exports {
         let allow_show = decision == EditPublishDecision::PublishAndShow && focus_context_matches;
         let mut popup = take_thread_popup(target.token, target.owner_thread);
         let mut visible = false;
+        let mut display_update = update.clone();
+        if entry.router.is_composing() {
+            if let (Some(popup), Some(caret)) = (popup.as_ref(), caret) {
+                if let Ok(width) = popup.window.candidate_width_budget(PopupRect::new(
+                    caret.left,
+                    caret.top,
+                    caret.right,
+                    caret.bottom,
+                )) {
+                    display_update = entry.router.set_candidate_width(Some(width));
+                }
+            }
+        }
+        entry.popup_model.apply_update(&display_update);
 
         if let Some(popup) = popup.as_mut() {
             if shown_context != Some(target.key) {
@@ -1432,9 +1484,23 @@ mod windows_exports {
                 let still_focused = active.foreground
                     && active.focus_epoch == target.focus_epoch
                     && focus_context_matches;
-                if still_focused && learning_allowed && !events.is_empty() {
+                if !events.is_empty()
+                    && claim_promotion(
+                        &target.promotion_claim,
+                        still_focused && learning_allowed && active.adaptive_ranking_enabled,
+                    )
+                {
+                    let mut orders = active.rankings.as_ref().clone();
+                    for event in &events {
+                        promote_order(&mut orders, event);
+                    }
+                    if orders.iter().map(|o| o.candidates.len()).sum::<usize>() <= 100_000 {
+                        active.rankings = Arc::new(orders);
+                    } else {
+                        active.local_data_error = true;
+                    }
                     if let Some(worker) = active.learning.as_ref() {
-                        if worker.submit(events.clone()).is_err() {
+                        if worker.submit_promotions(&events).is_err() {
                             active.local_data_error = true;
                         }
                     }
@@ -1445,7 +1511,12 @@ mod windows_exports {
                 } else {
                     active.shown_context = None;
                 }
-                if let Some(entry) = entry.take() {
+                if let Some(mut entry) = entry.take() {
+                    if !entry.router.is_composing() {
+                        entry
+                            .router
+                            .set_ranking_orders(Arc::clone(&active.rankings));
+                    }
                     displaced = active.contexts.insert(target.key, entry);
                 }
             }
@@ -1611,6 +1682,8 @@ mod windows_exports {
             let mut lexicon = Lexicon::builtin().map_err(|_| Error::from(E_UNEXPECTED))?;
             let mut local_data_error = false;
             let mut learning = None;
+            let mut rankings = Arc::new(Vec::new());
+            let mut adaptive_ranking_enabled = false;
             match DictionaryStore::for_current_user()
                 .and_then(|store| store.load().map(|data| (store, data)))
             {
@@ -1622,21 +1695,9 @@ mod windows_exports {
                     {
                         Some(snapshot) => {
                             lexicon = snapshot;
-                            if data.learning_enabled {
-                                let counts: Vec<_> = data
-                                    .learned
-                                    .iter()
-                                    .map(|entry| {
-                                        (
-                                            LearningEvent {
-                                                pinyin: entry.pinyin.clone(),
-                                                text: entry.text.clone(),
-                                            },
-                                            entry.count,
-                                        )
-                                    })
-                                    .collect();
-                                lexicon = lexicon.with_learning(&counts);
+                            adaptive_ranking_enabled = data.adaptive_ranking_enabled;
+                            if adaptive_ranking_enabled {
+                                rankings = Arc::new(data.rankings.clone());
                                 match LearningWorker::start(store, data.generation) {
                                     Ok(worker) => learning = Some(worker),
                                     Err(_) => local_data_error = true,
@@ -1710,6 +1771,8 @@ mod windows_exports {
                         processing: false,
                         settings,
                         lexicon,
+                        rankings,
+                        adaptive_ranking_enabled,
                         _learning_registration: learning
                             .as_ref()
                             .map(|_| ObjectRegistration::new()),
@@ -1887,7 +1950,7 @@ mod windows_exports {
             };
             let key = context_key(context);
 
-            let (router, page_size, lexicon) = {
+            let (router, page_size, lexicon, rankings) = {
                 let Ok(activation) = self.get_impl().activation.try_borrow() else {
                     return Ok(FALSE);
                 };
@@ -1905,15 +1968,24 @@ mod windows_exports {
                         .map(|entry| entry.router.clone()),
                     active.settings.candidate_page_size,
                     active.lexicon.clone(),
+                    Arc::clone(&active.rankings),
                 )
             };
-            let router = match router {
+            let mut router = match router {
                 Some(router) => router,
                 None => match EngineRouter::from_lexicon(lexicon, page_size) {
-                    Ok(router) => router,
+                    Ok(mut router) => {
+                        router.set_candidate_width(Some(
+                            crate::engine::paging::DEFAULT_CANDIDATE_WIDTH,
+                        ));
+                        router
+                    }
                     Err(_) => return Ok(FALSE),
                 },
             };
+            if !router.is_composing() {
+                router.set_ranking_orders(rankings);
+            }
 
             match router.test_key(event) {
                 Ok(true) => Ok(TRUE),
@@ -2012,12 +2084,16 @@ mod windows_exports {
                     return Ok(FALSE);
                 };
                 entry.router = router;
+                entry
+                    .router
+                    .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
                 entry.composition = None;
                 entry.controller = CompositionController::new();
                 entry.popup_model.hide();
                 old_entry = Some(entry.clone());
             }
 
+            sync_idle_rankings(&self.get_impl().activation, token, &mut entry.router);
             let update = match entry.router.process_key(event) {
                 Ok(update) => update,
                 Err(_) => {
@@ -2056,6 +2132,7 @@ mod windows_exports {
             };
 
             let target = EditTarget {
+                promotion_claim: Rc::new(Cell::new(false)),
                 activation: Rc::clone(&self.get_impl().activation),
                 thread_manager,
                 token,
@@ -2156,6 +2233,7 @@ mod windows_exports {
     #[cfg(test)]
     mod native_tests {
         use super::*;
+        use windows::core::{BSTR, VARIANT};
         use windows::Win32::System::Com::{
             CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
             COINIT_APARTMENTTHREADED,
@@ -2164,6 +2242,284 @@ mod windows_exports {
             CLSID_TF_ThreadMgr, ITfCompositionView, ITfContextOwnerCompositionServices,
             ITfDocumentMgr, TF_ES_READ, TF_POPF_ALL,
         };
+        use windows::Win32::UI::TextServices::{
+            ITfContextOwner, ITfContextOwner_Impl, ITfInputScope, ITfInputScope_Impl, InputScope,
+            GUID_PROP_INPUTSCOPE, TS_STATUS,
+        };
+
+        #[implement(ITfInputScope)]
+        struct TestScope(Vec<i32>);
+
+        impl ITfInputScope_Impl for TestScope_Impl {
+            fn GetInputScopes(&self, values: *mut *mut InputScope, count: *mut u32) -> Result<()> {
+                unsafe {
+                    *count = self.0.len() as u32;
+                    *values = windows::Win32::System::Com::CoTaskMemAlloc(
+                        self.0.len().max(1) * std::mem::size_of::<InputScope>(),
+                    )
+                    .cast();
+                    if (*values).is_null() {
+                        return Err(E_UNEXPECTED.into());
+                    }
+                    for (index, value) in self.0.iter().enumerate() {
+                        (*values).add(index).write(InputScope(*value));
+                    }
+                }
+                Ok(())
+            }
+            fn GetPhrase(&self, _: *mut *mut BSTR, _: *mut u32) -> Result<()> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetRegularExpression(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetSRGS(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetXML(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+        }
+
+        #[implement(ITfContextOwner)]
+        struct ScopeOwner {
+            value: VARIANT,
+            calls: Rc<Cell<u32>>,
+            fail: bool,
+        }
+
+        impl ITfContextOwner_Impl for ScopeOwner_Impl {
+            fn GetACPFromPoint(&self, _: *const POINT, _: u32) -> Result<i32> {
+                Ok(0)
+            }
+            fn GetTextExt(
+                &self,
+                _: i32,
+                _: i32,
+                rect: *mut RECT,
+                clipped: *mut BOOL,
+            ) -> Result<()> {
+                unsafe {
+                    *rect = self.GetScreenExt()?;
+                    *clipped = FALSE;
+                }
+                Ok(())
+            }
+            fn GetScreenExt(&self) -> Result<RECT> {
+                Ok(RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 20,
+                })
+            }
+            fn GetStatus(&self) -> Result<TS_STATUS> {
+                Ok(TS_STATUS::default())
+            }
+            fn GetWnd(&self) -> Result<windows::Win32::Foundation::HWND> {
+                Ok(windows::Win32::Foundation::HWND::default())
+            }
+            fn GetAttribute(&self, guid: *const GUID) -> Result<VARIANT> {
+                if unsafe { *guid } != GUID_PROP_INPUTSCOPE {
+                    return Err(E_INVALIDARG.into());
+                }
+                self.calls.set(self.calls.get() + 1);
+                if self.fail {
+                    return Err(E_UNEXPECTED.into());
+                }
+                Ok(self.value.clone())
+            }
+        }
+
+        #[implement(ITfEditSession)]
+        struct CompareScope {
+            context: ITfContext,
+            calls: Rc<Cell<u32>>,
+        }
+        impl ITfEditSession_Impl for CompareScope_Impl {
+            fn DoEditSession(&self, cookie: u32) -> Result<()> {
+                unsafe {
+                    fn status<T>(stage: &str, result: &Result<T>, calls: u32) {
+                        eprintln!(
+                            "stage={stage} hr=0x{:08X} owner_calls={calls}",
+                            result.as_ref().err().map_or(0, |e| e.code().0 as u32)
+                        );
+                    }
+                    let mut selection = [TF_SELECTION::default()];
+                    let mut fetched = 0;
+                    let selected =
+                        self.context
+                            .GetSelection(cookie, u32::MAX, &mut selection, &mut fetched);
+                    status("selection", &selected, self.calls.get());
+                    let _range = std::mem::ManuallyDrop::take(&mut selection[0].range);
+                    let start = self.context.GetStart(cookie);
+                    status("start", &start, self.calls.get());
+                    let range = start?;
+                    range.SetText(cookie, 0, &[b'x' as u16])?;
+                    let range = self.context.GetStart(cookie)?;
+                    let end = self.context.GetEnd(cookie)?;
+                    range.ShiftEndToRange(cookie, &end, TF_ANCHOR_END)?;
+                    let property = self.context.GetProperty(&GUID_PROP_INPUTSCOPE);
+                    status("document_property", &property, self.calls.get());
+                    let document = property.and_then(|p| p.GetValue(cookie, &range));
+                    status("document_value", &document, self.calls.get());
+                    assert_eq!(self.calls.get(), 0, "document channel must not query owner");
+                    let property = self.context.GetAppProperty(&GUID_PROP_INPUTSCOPE);
+                    status("app_property", &property, self.calls.get());
+                    let app = property.and_then(|p| p.GetValue(cookie, &range));
+                    status("app_value", &app, self.calls.get());
+                    let app = app?;
+                    let scope: ITfInputScope = IUnknown::try_from(&app)?.cast()?;
+                    assert!(
+                        self.calls.get() > 0,
+                        "application property must query owner"
+                    );
+                    let mut values = std::ptr::null_mut();
+                    let mut count = 0;
+                    scope.GetInputScopes(&mut values, &mut count)?;
+                    assert_eq!(count, 1);
+                    assert_eq!((*values).0, 0);
+                    windows::Win32::System::Com::CoTaskMemFree(Some(values.cast()));
+                }
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn native_scope_commit_publishes_rankings_and_worker() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let root = std::path::PathBuf::from(
+                std::env::var_os("FLOWER_TEST_SCRATCH")
+                    .expect("native learning test requires an explicitly isolated scratch root"),
+            );
+            assert!(root.is_absolute());
+            for (index, (scopes, fail, allowed)) in [
+                (Some(vec![0]), false, true),
+                (Some(vec![57]), false, true),
+                (Some(vec![58]), false, true),
+                (Some(vec![31]), false, false),
+                (Some(vec![61]), false, false),
+                (Some(vec![0, 31]), false, false),
+                (Some(vec![999]), false, false),
+                (Some(vec![]), false, false),
+                (None, false, false),
+                (Some(vec![0]), true, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let value = scopes.map_or_else(VARIANT::default, |s| {
+                    let scope: IUnknown = TestScope(s).into();
+                    VARIANT::from(scope)
+                });
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value,
+                    fail,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let path = root.join(format!(
+                    "native-learning-{index}-{}.json",
+                    std::process::id()
+                ));
+                assert!(!path.exists(), "test never reuses an existing store");
+                let store = DictionaryStore::new(&path);
+                let data = store.load().unwrap();
+                let service: ITfTextInputProcessor = TextService::new().into();
+                let implementation =
+                    unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
+                *implementation.activation.borrow_mut() = Some(Activation {
+                    thread_manager: host.manager.clone(),
+                    keystroke_manager: host.manager.cast().unwrap(),
+                    client_id: host.client,
+                    contexts: HashMap::new(),
+                    token: next_activation_token(),
+                    owner_thread: std::thread::current().id(),
+                    focus_epoch: 0,
+                    foreground: true,
+                    shown_context: None,
+                    processing: false,
+                    settings: Settings::default(),
+                    lexicon: Lexicon::from_tsv("ying'she\t影射\t200\nying'she\t映射\t100").unwrap(),
+                    rankings: Arc::new(Vec::new()),
+                    adaptive_ranking_enabled: true,
+                    learning: Some(LearningWorker::start(store, data.generation).unwrap()),
+                    _learning_registration: None,
+                    local_data_error: false,
+                });
+                let sink: ITfKeyEventSink = service.cast().unwrap();
+                for key in b"YINGSHE2" {
+                    send_key(&sink, &host.context, *key);
+                }
+                assert_eq!(read_document(&host, None), "映射");
+                assert!(calls.get() > 0);
+                let orders = implementation
+                    .activation
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .rankings
+                    .clone();
+                assert_eq!(!orders.is_empty(), allowed, "scope case {index}");
+                if allowed {
+                    assert_eq!(orders[0].candidates[0].text, "映射");
+                }
+                for key in b"YINGSHE " {
+                    send_key(&sink, &host.context, *key);
+                }
+                assert_eq!(
+                    read_document(&host, None),
+                    if allowed {
+                        "映射映射"
+                    } else {
+                        "映射影射"
+                    }
+                );
+                let mut active = implementation.activation.borrow_mut().take().unwrap();
+                assert!(!active.local_data_error);
+                active.learning.as_mut().unwrap().shutdown().unwrap();
+                drop(active);
+                let persisted = DictionaryStore::new(&path).load().unwrap();
+                assert_eq!(!persisted.rankings.is_empty(), allowed);
+                if allowed {
+                    assert_eq!(persisted.rankings[0].candidates[0].text, "映射");
+                }
+            }
+        }
+
+        #[test]
+        fn native_owner_application_scope_path() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let calls = Rc::new(Cell::new(0));
+            let scope: IUnknown = TestScope(vec![0]).into();
+            let owner: IUnknown = ScopeOwner {
+                value: VARIANT::from(scope),
+                calls: calls.clone(),
+                fail: false,
+            }
+            .into();
+            let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+            let session: ITfEditSession = CompareScope {
+                context: host.context.clone(),
+                calls,
+            }
+            .into();
+            unsafe {
+                host.context
+                    .RequestEditSession(host.client, &session, TF_ES_SYNC | TF_ES_READWRITE)
+            }
+            .unwrap()
+            .ok()
+            .unwrap();
+        }
 
         #[implement(ITfEditSession)]
         struct ReadDocument {
@@ -2241,10 +2597,15 @@ mod windows_exports {
             document: ITfDocumentMgr,
             context: ITfContext,
             client: u32,
+            owner_cookie: Option<u32>,
         }
 
         impl NativeDocument {
             fn new() -> Result<Self> {
+                Self::with_owner(None)
+            }
+
+            fn with_owner(owner: Option<&IUnknown>) -> Result<Self> {
                 let manager: ITfThreadMgr =
                     unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) }?;
                 let client = unsafe { manager.Activate() }?;
@@ -2252,15 +2613,15 @@ mod windows_exports {
                 let mut context = None;
                 let mut cookie = 0;
                 unsafe {
-                    document.CreateContext(
-                        client,
-                        0,
-                        None::<&IUnknown>,
-                        &mut context,
-                        &mut cookie,
-                    )?;
+                    document.CreateContext(client, 0, owner, &mut context, &mut cookie)?;
                 }
                 let context = context.ok_or_else(|| Error::from(E_UNEXPECTED))?;
+                let owner_cookie = if let Some(owner) = owner {
+                    let source: windows::Win32::UI::TextServices::ITfSource = context.cast()?;
+                    Some(unsafe { source.AdviseSink(&ITfContextOwner::IID, owner) }?)
+                } else {
+                    None
+                };
                 unsafe {
                     document.Push(&context)?;
                     manager.SetFocus(&document)?;
@@ -2270,6 +2631,7 @@ mod windows_exports {
                     document,
                     context,
                     client,
+                    owner_cookie,
                 })
             }
         }
@@ -2277,6 +2639,14 @@ mod windows_exports {
         impl Drop for NativeDocument {
             fn drop(&mut self) {
                 unsafe {
+                    if let Some(cookie) = self.owner_cookie {
+                        if let Ok(source) = self
+                            .context
+                            .cast::<windows::Win32::UI::TextServices::ITfSource>()
+                        {
+                            let _ = source.UnadviseSink(cookie);
+                        }
+                    }
                     let _ = self.manager.SetFocus(None::<&ITfDocumentMgr>);
                     let _ = self.document.Pop(TF_POPF_ALL);
                     let _ = self.manager.Deactivate();
@@ -2310,6 +2680,8 @@ mod windows_exports {
                 processing: false,
                 settings: Settings::default(),
                 lexicon: Lexicon::builtin().unwrap(),
+                rankings: Arc::new(Vec::new()),
+                adaptive_ranking_enabled: false,
                 learning: None,
                 _learning_registration: None,
                 local_data_error: false,

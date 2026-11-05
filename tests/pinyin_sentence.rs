@@ -38,6 +38,52 @@ fn combines_words_without_a_hardcoded_sentence_entry() {
 }
 
 #[test]
+fn mixed_whole_words_preserve_canonical_identity_and_raw_consumption() {
+    for raw in [
+        "shenmeys",
+        "smeyisi",
+        "smys",
+        "shenmeyisi",
+        "shen'me'y's",
+        "shen'meyi'si",
+        "shen'me'yi'si",
+    ] {
+        // Each syllable is full or its first letter (not an arbitrary prefix).
+        let mut s = PinyinSession::from_lexicon_tsv("shen'me'yi'si\t什么意思\t1000", 9).unwrap();
+        type_text(&mut s, raw);
+        assert_eq!(
+            s.candidates_on_current_page()[0].comment,
+            "shen'me'yi'si",
+            "{raw}"
+        );
+        assert_eq!(
+            choose(&mut s, "什么意思").commit.as_deref(),
+            Some("什么意思")
+        );
+        assert!(s.pending_input().is_empty(), "{raw}");
+        assert_eq!(s.pending_learning().len(), 1);
+        assert_eq!(s.pending_learning()[0].pinyin, "shen'me'yi'si");
+    }
+}
+
+#[test]
+fn mixed_graph_uses_real_words_and_learns_the_word_edges() {
+    for raw in ["shenmeys", "shen'me'y's", "shenmeyisi"] {
+        let mut s =
+            PinyinSession::from_lexicon_tsv("shen'me\t什么\t2000\nyi'si\t意思\t2000", 9).unwrap();
+        type_text(&mut s, raw);
+        assert_eq!(s.candidates_on_current_page()[0].text, "什么意思", "{raw}");
+        assert_eq!(
+            choose(&mut s, "什么意思").commit.as_deref(),
+            Some("什么意思")
+        );
+        assert_eq!(s.pending_learning().len(), 2);
+        assert_eq!(s.pending_learning()[0].pinyin, "shen'me");
+        assert_eq!(s.pending_learning()[1].pinyin, "yi'si");
+    }
+}
+
+#[test]
 fn partial_selection_keeps_one_composition_and_can_be_cancelled() {
     let mut s = session();
     type_text(&mut s, "nihao");
@@ -174,8 +220,18 @@ fn whole_word_initials_commit_with_canonical_learning() {
 }
 
 #[test]
-fn explicit_quotes_do_not_enable_initial_word_matching() {
+fn explicit_quotes_match_only_real_initial_word_boundaries() {
     for raw in ["n'h", "nh'"] {
+        let mut s = session();
+        type_text(&mut s, raw);
+        assert!(s
+            .candidates_on_current_page()
+            .iter()
+            .any(|c| c.text == "你好" && c.comment == "ni'hao"));
+    }
+    // Leading/repeated delimiters are rejected by the key layer; direct decoder
+    // tests cover those raw strings. These inputs reach the decoder unchanged.
+    for raw in ["ni'h'ao", "nih'ao", "niha'o"] {
         let mut s = session();
         type_text(&mut s, raw);
         assert!(!s
@@ -236,7 +292,7 @@ fn full_matches_precede_initials_then_combinations_then_partial_choices() {
 fn partial_undo_then_initial_commit_preserves_canonical_events() {
     let mut s = session();
     type_text(&mut s, "ninh");
-    assert!(!s
+    assert!(s
         .candidates_on_current_page()
         .iter()
         .any(|c| c.text == "你你好"));

@@ -554,7 +554,7 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         (
             LEARNING_ID,
             windows::core::w!("BUTTON"),
-            windows::core::w!("启用本地学习（默认关闭，立即保存）"),
+            windows::core::w!("记住选词顺序（默认开启，仅保存在本机）"),
             windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
         ),
         (
@@ -915,7 +915,7 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
                     LPARAM::default(),
                 );
             }
-            set_checked(controls.learning, data.learning_enabled);
+            set_checked(controls.learning, data.adaptive_ranking_enabled);
             set_checked(
                 controls.domain_enabled,
                 data.domains
@@ -923,8 +923,8 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
                     .is_some_and(|item| item.enabled),
             );
             let status = format!(
-                "个人词条：{}；学习记录：{}；专业词库：{}。\n选中词库：{}。\n词库/学习操作立即保存；导入、导出和删除请使用 dictionary 命令行。\n清空学习不会删除个人词条。",
-                data.entries.len(), data.learned.len(), data.domains.len(),
+                "个人词条：{}；排序作用域：{}；专业词库：{}。\n选中词库：{}。\n成功选词前移一位；设置保存后重新切换输入法生效。\n清空学习不会删除个人词条。",
+                data.entries.len(), data.rankings.len(), data.domains.len(),
                 data.domains.get(selected_index).map(|item| if item.enabled { "已启用" } else { "已停用" }).unwrap_or("无"));
             let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID, &status);
         }

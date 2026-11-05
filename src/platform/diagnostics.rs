@@ -23,6 +23,8 @@ pub(super) enum Stage {
     StartComposition,
     SetInitialText,
     ApplyUpdate,
+    LearningAppProperty,
+    LearningScopeValue,
 }
 
 pub(super) fn record_result<T>(stage: Stage, result: &Result<T>) {

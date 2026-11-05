@@ -9,6 +9,7 @@ const USAGE: &str = "Flower 设置程序
 用法：
   flower-settings
   flower-settings --help
+  flower-settings --start-input-method
   flower-settings dictionary status
   flower-settings dictionary import <path> [--domain <name>]
   flower-settings dictionary export <path> [--domain <name>]
@@ -20,12 +21,13 @@ const USAGE: &str = "Flower 设置程序
 
 无参数打开设置窗口。词典管理仅操作当前用户本地数据，不提权。
 导入/导出使用三列 TSV（拼音、文字、正整数权重）；读音以单引号分音。
-学习默认关闭；clear-learning 仅清空学习记录，不删除个人词条。
+选词顺序默认本地保存；成功选中前移一位。可关闭或清空，不删除个人词条。
 修改后请重新切换到 Flower 输入法使设置生效。";
 
 #[derive(Debug, PartialEq)]
 enum Command {
     Gui,
+    StartInputMethod,
     Help,
     Unicode(char),
     Status,
@@ -85,6 +87,7 @@ fn unicode_scalar(value: &str) -> Result<char, String> {
 fn parse(args: &[OsString]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Gui),
+        [arg] if arg == "--start-input-method" => Ok(Command::StartInputMethod),
         [arg] if arg == "--help" || arg == "-h" => Ok(Command::Help),
         [cmd, value] if cmd == "unicode" => Ok(Command::Unicode(unicode_scalar(&text(value)?)?)),
         [cmd, rest @ ..] if cmd == "dictionary" => match rest {
@@ -118,8 +121,53 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn require_non_elevated() -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| e.to_string())?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        result.map_err(|e| e.to_string())?;
+        if returned != std::mem::size_of::<TOKEN_ELEVATION>() as u32
+            || elevation.TokenIsElevated != 0
+        {
+            return Err("启动 Flower 拒绝提升令牌；请由原始普通用户运行。".into());
+        }
+    }
+    Ok(())
+}
+
+fn start_input_method() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        require_non_elevated()?;
+        flower::platform::registration::enable().map_err(|e| e.to_string())?;
+        println!("已为当前用户启用 Flower，请按 Win+Space 手动切换；尚未切换当前焦点的输入法。");
+        flower::platform::settings_ui::run_settings_app()
+    }
+    #[cfg(not(target_os = "windows"))]
+    Err("启动 Flower 输入法仅支持 Windows 10/11 x64。".to_owned())
+}
+
 fn execute(command: Command) -> Result<(), String> {
     match command {
+        Command::StartInputMethod => return start_input_method(),
         Command::Help => {
             println!("{USAGE}");
             return Ok(());
@@ -141,16 +189,16 @@ fn execute(command: Command) -> Result<(), String> {
         Command::Status => {
             let data = store.load().map_err(|e| e.to_string())?;
             println!(
-                "格式版本：{}\n代次：{}\n学习：{}\n个人词条：{}\n学习记录：{}",
+                "格式版本：{}\n代次：{}\n记住选词顺序：{}\n个人词条：{}\n排序作用域：{}",
                 data.schema_version,
                 data.generation,
-                if data.learning_enabled {
+                if data.adaptive_ranking_enabled {
                     "开启"
                 } else {
                     "关闭"
                 },
                 data.entries.len(),
-                data.learned.len()
+                data.rankings.len()
             );
             for item in data.domains {
                 println!(
@@ -177,10 +225,27 @@ fn execute(command: Command) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    match parse(&args).and_then(execute) {
+    let command = parse(&args);
+    let only_start = matches!(&command, Ok(Command::StartInputMethod));
+    match command.and_then(execute) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Flower 设置程序失败：{error}\n\n{USAGE}");
+            if only_start {
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows::core::w;
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        MessageBoxW, MB_ICONERROR, MB_OK,
+                    };
+                    MessageBoxW(
+                        None,
+                        w!("Flower 启动或启用失败，设置窗口可能未能打开。请以普通用户身份从开始菜单运行“启用 Flower（当前用户）”并打开 Flower 设置重试；若已启用，可按 Win+Space 手动选择 Flower。"),
+                        w!("Flower 启动失败"),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
             ExitCode::FAILURE
         }
     }
@@ -195,6 +260,12 @@ mod tests {
     #[test]
     fn strict_arguments() {
         assert_eq!(command(&[]).unwrap(), Command::Gui);
+        assert_eq!(
+            command(&["--start-input-method"]).unwrap(),
+            Command::StartInputMethod
+        );
+        assert!(command(&["--start-input-method", "extra"]).is_err());
+        assert!(command(&["--start-input-method", "--help"]).is_err());
         assert!(command(&["dictionary", "status", "--help"]).is_err());
         assert!(command(&["--help", "extra"]).is_err());
         assert!(command(&["dictionary", "learning", "yes"]).is_err());

@@ -1,6 +1,23 @@
 use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 
 #[test]
+fn builtin_mixed_sentence_is_on_the_first_page_without_a_sentence_entry() {
+    let lexicon = Lexicon::builtin().unwrap();
+    assert!(!lexicon
+        .lookup("shenmeyisi")
+        .iter()
+        .any(|c| c.text == "什么意思"));
+    let mut session = PinyinSession::from_lexicon(lexicon, 9).unwrap();
+    for c in "shenmeys".chars() {
+        session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+    }
+    assert!(session
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "什么意思" && c.comment == "shen'me'yi'si"));
+}
+
+#[test]
 fn frequent_primary_readings_precede_rare_and_secondary_readings() {
     let lexicon = Lexicon::builtin().unwrap();
     for (pinyin, expected) in [

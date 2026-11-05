@@ -5,7 +5,7 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 # Flower Windows 验证
 
-先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
+先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/mixed-input-and-installation.md`，分页与调序见 `design/adaptive-candidates.md`，旧版补充见 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
 
 ## 环境与构建
 
@@ -55,7 +55,21 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - `check-install-path` 始终只读；`prepare-install-path` 是显式管理员写操作。后者仅对缺失组件用创建时的受保护 SDDL，新建即可信 owner/管理员SYSTEM全控/Users RX，保留禁止删除共享句柄后复查；不先创建可写目录再收紧，不修复已有对象，不自动改 D 盘根或父目录 ACL。同名竞争失败，不递归清理未知内容。
 - 安装器必须在旧注册/目录冲突及运行库门禁后、复制前 prepare/check。只读新路径检查通过不代表管理员创建/向导安装成功；完整许可和源ZIP核验也不等于运行期安装验收。新制品仍不得自动运行。
 
-## 0.4.1 分组件安装与候选窗
+## 0.4.3 固定安装、启动与真实学习链路
+
+- 最新用户决定取消自选目录，EXE 固定 `{commonpf64}\Flower`、隐藏目录页、拒绝 `/DIR` 异根。下文自选目录章节仅为历史/helper能力，不是当前安装器承诺。不修改已有父目录权限或 owner，不把普通应用的 HKCU 安装方案当成已证实的 per-user TSF 注册。
+- 完成页默认启动用 `postinstall nowait skipifsilent runasoriginaluser`，不加 `unchecked`；先检查安装/注册成功、安全树和设置程序哈希。启动入口严格解析，提升 token 或查询失败均拒绝；普通用户 enable 后打开设置，不改默认输入法、不声称焦点已切换。nowait GUI 错误必须有固定 MessageBox，不能只有 stderr。包验收不能运行该入口，因为会修改用户启用状态。
+- `GUID_PROP_INPUTSCOPE` 应用声明读取使用同一编辑会话的 `GetAppProperty`；`GetProperty` 的文档属性不等价。未知、空、失败及敏感仍拒绝学习，不能为修复正向通路放宽门禁。
+- 原生 ITfContextOwner 测试除 CreateContext 外，还须对 context 的 ITfSource 显式 AdviseSink，并在析构解除。用生产按键→成功提交→安全发布→Activation 排名→worker drain→隔离 Store 重载串起前移证据；仅 Store fixture 或 adaptive=false 测试不证明学习生产链。测试目录必须显式隔离，不用真实用户数据。
+
+## 0.4.2 安装与严格单行（历史安装策略）
+
+- 用户明确选择全部载荷放所选目录并保留安全限制；安装器恢复真实 `{app}` 根、版本载荷、注册/快捷方式/卸载器均同根，不再固定 Program Files 第二份，不调用用户副本部署。已有不安全祖先仍拒绝，不将深度当原因，也不改其 owner/ACL。Windows 注册表、快捷方式和用户配置不属于可搬迁程序载荷。
+- 严格单行必须与 engine 真分页一起改。session page_ranges 是所有数字、鼠标、Enter、页码真源，不能 popup 少画尾项。共享 engine::paging::candidate_cell_width，560逻辑像素总宽、默认544内容宽，最多min(设置上限,9)；超长项独页省略但提交不截断。预算变化保留绝对高亮并发布新revision，旧票据失效。
+- 跨屏不能在发布前拿旧 popup DPI 换算目标工作区。同屏可读取实时DPI；跨屏用无owner/parent、不显示、不激活的内置STATIC隐藏探针，先核对目标monitor与awareness context相同再GetDpiForWindow，所有路径销毁；失败默认预算并由单行布局缩窄。不移动已有popup、不改宿主或线程awareness，不在OnTestKey预演创建资源。
+- GetDpiForMonitor 有调用方 awareness 限制，GetScaleFactorForMonitor 也不能未经核实当作精确窗口DPI。不要只替换API名称就宣称修复；纯96/192预算测试应接入真实生产查询链，真实多屏仍另验收。
+
+## 0.4.1 分组件安装与候选窗（历史）
 
 - 深层用户目录与机器 DLL 分离：系统载荷、公共入口及卸载器固定 commonpf64 Flower；自选目录仅固定用户文件副本。不得把关闭祖先 ACL 门禁或改已有父 owner 当作深路径支持。向导明确两种位置，ExecAsOriginalUser 从已核对安全载荷运行 helper，helper 查询 token 失败/提升均拒绝，不回退提升复制。
 - install_user_files 的非提升检查、严格 source 检查、目标 guard 不能被 private copy helper 抽取绕过。固定文件 create_new、独占句柄、sync，失败仅通过本次持有句柄标记删除。源/目标 guard 覆盖复制及回滚，卸载不递归清理可替换用户树。

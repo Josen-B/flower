@@ -9,6 +9,161 @@ use flower::user_dictionary::{
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+fn promotion(selected: usize) -> flower::engine::PromotionEvent {
+    use flower::engine::{PromotionEvent, RankingCandidate, RankingOrder};
+    let candidates: Vec<_> = ["一", "二", "三", "四", "五"]
+        .into_iter()
+        .map(|text| RankingCandidate {
+            pinyin: "ni".into(),
+            text: text.into(),
+            consumed: 2,
+        })
+        .collect();
+    PromotionEvent {
+        selected: candidates[selected].clone(),
+        order: RankingOrder {
+            input: "ni".into(),
+            candidates,
+        },
+    }
+}
+
+#[test]
+fn schema_one_migrates_only_on_update() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let bytes = br#"{"schema_version":1,"generation":7,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#;
+    fs::write(store.path(), bytes).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.schema_version, 2);
+    assert!(snapshot.adaptive_ranking_enabled);
+    assert!(!snapshot.learning_enabled);
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    store.promote_if_generation(7, &[promotion(4)]).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.rankings[0].candidates[3].text, "五");
+    assert_eq!(snapshot.generation, 7);
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(snapshot, store.load().unwrap());
+}
+
+#[test]
+fn promotions_merge_latest_order_and_generation_blocks_resurrection() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let other = DictionaryStore::new(store.path());
+    store.promote_if_generation(0, &[promotion(4)]).unwrap();
+    other.promote_if_generation(0, &[promotion(4)]).unwrap();
+    assert_eq!(
+        store.load().unwrap().rankings[0]
+            .candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>(),
+        ["一", "二", "五", "三", "四"]
+    );
+    store.promote_if_generation(0, &[promotion(2)]).unwrap();
+    assert_eq!(store.load().unwrap().rankings[0].candidates[2].text, "三");
+    store.clear_learning().unwrap();
+    store.promote_if_generation(0, &[promotion(4)]).unwrap();
+    assert!(store.load().unwrap().rankings.is_empty());
+    assert!(store.load().unwrap().adaptive_ranking_enabled);
+    store.set_learning_enabled(false).unwrap();
+    store.promote_if_generation(2, &[promotion(4)]).unwrap();
+    let snapshot = store.load().unwrap();
+    assert!(!snapshot.adaptive_ranking_enabled);
+    assert!(!snapshot.learning_enabled);
+    assert!(snapshot.rankings.is_empty());
+}
+
+#[test]
+fn invalid_promotion_batch_preserves_file_and_worker_is_bounded() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store.promote_if_generation(0, &[promotion(4)]).unwrap();
+    let bytes = fs::read(store.path()).unwrap();
+    let mut invalid = promotion(1);
+    invalid.order.candidates[0].consumed = 1;
+    assert!(store
+        .promote_if_generation(0, &[promotion(4), invalid])
+        .is_err());
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    for input in ["", "'ni", "n''i", "Ni", "n i"] {
+        let mut event = promotion(1);
+        event.order.input = input.into();
+        assert!(store.promote_if_generation(0, &[event]).is_err());
+    }
+    let mut duplicate = promotion(1);
+    duplicate.order.candidates.push(duplicate.selected.clone());
+    assert!(store.promote_if_generation(0, &[duplicate]).is_err());
+    let mut oversized = promotion(1);
+    oversized.order.candidates = vec![oversized.selected.clone(); 4097];
+    let mut worker = LearningWorker::start(store.clone(), 0).unwrap();
+    assert!(matches!(
+        worker.submit_promotions(&[oversized]),
+        Err(DictionaryError::LimitExceeded)
+    ));
+    worker.submit_promotions(&[promotion(4)]).unwrap();
+    worker.shutdown().unwrap();
+    assert_eq!(store.load().unwrap().rankings[0].candidates[2].text, "五");
+}
+
+#[test]
+fn ranking_scope_lru_and_candidate_limits() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let events: Vec<_> = (0..257)
+        .map(|index| {
+            let mut event = promotion(1);
+            event.order.input = format!(
+                "n{}{}",
+                (b'a' + (index / 26) as u8) as char,
+                (b'a' + (index % 26) as u8) as char
+            );
+            for candidate in &mut event.order.candidates {
+                candidate.consumed = 3;
+            }
+            event.selected = event.order.candidates[1].clone();
+            event
+        })
+        .collect();
+    store.promote_if_generation(0, &events).unwrap();
+    let snapshot = store.load().unwrap();
+    assert_eq!(snapshot.rankings.len(), 256);
+    assert_eq!(snapshot.rankings[0].input, events[1].order.input);
+    store
+        .promote_if_generation(0, &[events[1].clone()])
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().rankings.last().unwrap().input,
+        events[1].order.input
+    );
+    let bytes = fs::read(store.path()).unwrap();
+    let mut event = promotion(1);
+    event.order.candidates = (0..4096)
+        .map(|index| {
+            let mut candidate = event.selected.clone();
+            candidate.text = index.to_string();
+            candidate
+        })
+        .collect();
+    event.selected = event.order.candidates[4095].clone();
+    // Twenty-five full scopes exceed the aggregate 100,000-identity limit.
+    let batch: Vec<_> = (0..25)
+        .map(|index| {
+            let mut event = event.clone();
+            event.order.input = format!("n{}", (b'a' + index) as char);
+            event
+        })
+        .collect();
+    assert!(matches!(
+        store.promote_if_generation(0, &batch),
+        Err(DictionaryError::LimitExceeded)
+    ));
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+}
+
 // The caller can direct all test-owned files to its session scratch.
 struct Fixture(PathBuf);
 
@@ -57,7 +212,8 @@ fn missing_load_has_no_side_effect_and_learning_defaults_off() {
     let fixture = Fixture::new();
     let store = DictionaryStore::new(fixture.path("missing").join("dictionary.json"));
     let dictionary = store.load().unwrap();
-    assert_eq!(dictionary.schema_version, 1);
+    assert_eq!(dictionary.schema_version, 2);
+    assert!(dictionary.adaptive_ranking_enabled);
     assert!(!dictionary.learning_enabled);
     assert_eq!(dictionary.generation, 0);
     assert!(dictionary.lexicon_tsv().unwrap().is_empty());
@@ -154,7 +310,7 @@ fn corrupt_unknown_and_oversized_data_are_not_replaced() {
     let store = fixture.store();
     for bytes in [
         b"{not json".to_vec(),
-        br#"{"schema_version":2,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
+        br#"{"schema_version":3,"generation":0,"learning_enabled":false,"entries":[],"domains":[],"learned":[]}"#.to_vec(),
         vec![b' '; MAX_FILE_BYTES + 1],
     ] {
         fs::write(store.path(), &bytes).unwrap();
@@ -267,7 +423,7 @@ fn cooperative_public_loads_and_updates_preserve_complete_monotonic_snapshots() 
                     let mut previous_count = 0;
                     for _ in 0..32 {
                         let snapshot = store.load()?;
-                        assert_eq!(snapshot.schema_version, 1);
+                        assert_eq!(snapshot.schema_version, 2);
                         assert_eq!(snapshot.generation, generation);
                         assert!(snapshot.learning_enabled);
                         assert!(snapshot.learned.len() <= 1);

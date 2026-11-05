@@ -11,6 +11,63 @@ fn event() -> LearningEvent {
     }
 }
 
+fn promotion() -> flower::engine::PromotionEvent {
+    use flower::engine::{PromotionEvent, RankingCandidate, RankingOrder};
+    let candidates: Vec<_> = (0..9)
+        .map(|index| RankingCandidate {
+            pinyin: "ni".into(),
+            text: index.to_string(),
+            consumed: 2,
+        })
+        .collect();
+    PromotionEvent {
+        selected: candidates[8].clone(),
+        order: RankingOrder {
+            input: "ni".into(),
+            candidates,
+        },
+    }
+}
+
+#[test]
+fn process_promotion_writer() {
+    let Some(path) = std::env::var_os("FLOWER_PROMOTION_TEST_DICTIONARY") else {
+        return;
+    };
+    DictionaryStore::new(PathBuf::from(path))
+        .promote_if_generation(0, &[promotion()])
+        .unwrap();
+}
+
+#[test]
+fn independent_processes_merge_adjacent_steps() {
+    let fixture = CrashFixture::new();
+    let path = fixture.0.join("dictionary.json");
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process_promotion_writer", "--quiet"])
+                .env("FLOWER_PROMOTION_TEST_DICTIONARY", &path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let snapshot = DictionaryStore::new(path).load().unwrap();
+    assert_eq!(snapshot.rankings[0].candidates[4].text, "8");
+    assert!(snapshot.entries.is_empty());
+    assert!(snapshot.learned.is_empty());
+}
+
 #[test]
 fn process_writer() {
     let Some(path) = std::env::var_os("FLOWER_PROCESS_TEST_DICTIONARY") else {

@@ -75,6 +75,18 @@ impl EngineRouter {
         self.session.pending_learning()
     }
 
+    pub fn pending_promotions(&self) -> &[super::PromotionEvent] {
+        self.session.pending_promotions()
+    }
+
+    pub fn set_candidate_width(&mut self, width: Option<u32>) -> CompositionUpdate {
+        self.session.set_candidate_width(width)
+    }
+
+    pub fn set_ranking_orders(&mut self, orders: std::sync::Arc<Vec<super::RankingOrder>>) {
+        self.session.set_ranking_orders(orders);
+    }
+
     /// Returns the owned session for read-only inspection.
     pub fn session(&self) -> &PinyinSession {
         &self.session

@@ -1,6 +1,6 @@
 //! 候选弹窗的不可变快照、布局命中、屏幕定位与陈旧动作校验。
 
-use crate::engine::{Candidate, CompositionUpdate};
+use crate::engine::{paging::candidate_cell_width, Candidate, CompositionUpdate};
 use thiserror::Error;
 
 const BASE_DPI: u32 = 96;
@@ -10,9 +10,7 @@ const FOOTER_HEIGHT: i32 = 22;
 const FOOTER_BUTTON_WIDTH: i32 = 28;
 const MIN_FOOTER_BUTTON_WIDTH: i32 = 12;
 const MIN_CONTENT_WIDTH: i32 = 240;
-const MAX_CONTENT_WIDTH: i32 = 640;
-const MIN_CELL_WIDTH: i32 = 48;
-const MAX_CELL_WIDTH: i32 = 240;
+const MAX_CONTENT_WIDTH: i32 = 544;
 
 /// 与平台无关的屏幕或客户区坐标点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +91,7 @@ pub struct CandidatePopupLayout {
     pub size: PopupSize,
     /// 兼容保留的预编辑区域，始终为零面积，不参与绘制或命中。
     pub preedit: PopupRect,
-    /// 当前页候选按从左到右、从上到下顺序排列的单元格。
+    /// 当前页候选按从左到右单行排列的单元格。
     pub candidates: Vec<PopupRect>,
     /// 页脚区域；无候选页时为 `None`。
     pub footer: Option<PopupRect>,
@@ -109,7 +107,8 @@ impl CandidatePopupLayout {
     /// 根据快照、DPI 和可用最大尺寸计算布局。
     ///
     /// `bounds` 的左上角按客户区原点处理。单元格限宽，长文字由绘制层省略。
-    /// 最小可读单元格或全部行与页脚的总高度放不下时，整体隐藏候选及页脚，
+    /// 空间变窄时按比例压缩整页；每项一物理像素或单行与页脚高度放不下时，
+    /// 整体隐藏候选及页脚，
     /// 不截断当前页；键盘选择和引擎分页不受影响。窗口尺寸始终限制在边界内。
     pub fn new(snapshot: &CandidatePopupSnapshot, dpi: u32, bounds: PopupSize) -> Self {
         let dpi = effective_dpi(dpi);
@@ -118,54 +117,57 @@ impl CandidatePopupLayout {
         let padding = scaled(PADDING, dpi);
         let candidate_height = scaled(CANDIDATE_HEIGHT, dpi).max(1);
         let footer_height = scaled(FOOTER_HEIGHT, dpi);
-        // Only displayed text contributes to geometry. Bound work on very long
-        // candidates as each cell is ellipsized at MAX_CELL_WIDTH anyway.
+        // Share the engine's page estimator; comments and preedit never affect geometry.
         let cell_widths: Vec<i32> = snapshot
             .candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
-                let label_width = ((index + 1).to_string().len() as i32 + 2) * 9;
-                let text_width = candidate
-                    .text
-                    .chars()
-                    .take(MAX_CELL_WIDTH as usize)
-                    .fold(0i32, |width, character| {
-                        width + if character.is_ascii() { 9 } else { 18 }
-                    });
-                scaled(
-                    (label_width + text_width + PADDING * 2).clamp(MIN_CELL_WIDTH, MAX_CELL_WIDTH),
-                    dpi,
-                )
-                .max(1)
+                scaled(candidate_cell_width(&candidate.text, index) as i32, dpi).max(1)
             })
             .collect();
-        let content_width = cell_widths
+        let total_width = cell_widths
             .iter()
-            .fold(0i32, |sum, width| sum.saturating_add(*width))
-            .clamp(
-                scaled(MIN_CONTENT_WIDTH, dpi),
-                scaled(MAX_CONTENT_WIDTH, dpi),
-            );
+            .fold(0i64, |sum, width| sum.saturating_add(i64::from(*width)));
+        let content_width = total_width.clamp(
+            i64::from(scaled(MIN_CONTENT_WIDTH, dpi)),
+            i64::from(scaled(MAX_CONTENT_WIDTH, dpi)),
+        ) as i32;
         let natural_width = content_width.saturating_add(padding.saturating_mul(2));
         let width = natural_width.min(width_limit).max(1);
         let inner_width = width.saturating_sub(padding.saturating_mul(2)).max(0);
         let mut candidates = Vec::with_capacity(cell_widths.len());
         let mut x = padding;
-        let mut y = padding;
-        for cell_width in cell_widths {
-            let cell_width = cell_width.min(inner_width);
-            if x > padding && x.saturating_add(cell_width) > width.saturating_sub(padding) {
-                x = padding;
-                y = y.saturating_add(candidate_height);
+        let count = cell_widths.len();
+        let cells_fit = count <= inner_width as usize;
+        if cells_fit {
+            // Reserve one physical pixel per item, then distribute remaining space
+            // proportionally. Cumulative division preserves every last pixel.
+            let available = i64::from(inner_width).min(total_width);
+            let extra = available - count as i64;
+            let weight_total = total_width - count as i64;
+            let mut weight = 0i64;
+            for (index, cell_width) in cell_widths.iter().enumerate() {
+                weight += i64::from(*cell_width) - 1;
+                let right = if i64::from(inner_width) >= total_width {
+                    x.saturating_add(*cell_width)
+                } else {
+                    padding
+                        + (index + 1) as i32
+                        + if weight_total > 0 {
+                            (extra * weight / weight_total) as i32
+                        } else {
+                            0
+                        }
+                };
+                candidates.push(PopupRect::new(
+                    x,
+                    padding,
+                    right,
+                    padding.saturating_add(candidate_height),
+                ));
+                x = right;
             }
-            candidates.push(PopupRect::new(
-                x,
-                y,
-                x.saturating_add(cell_width),
-                y.saturating_add(candidate_height),
-            ));
-            x = x.saturating_add(cell_width);
         }
         let has_page_count = snapshot.page_count > 0 && !candidates.is_empty();
         let body_bottom = candidates.last().map_or(padding, |cell| cell.bottom);
@@ -173,8 +175,7 @@ impl CandidatePopupLayout {
             .saturating_add(padding)
             .saturating_add(if has_page_count { footer_height } else { 0 });
         let height = natural_height.min(height_limit).max(1);
-        let fits =
-            inner_width >= scaled(MIN_CELL_WIDTH, dpi).max(1) && natural_height <= height_limit;
+        let fits = cells_fit && natural_height <= height_limit;
         if !fits {
             candidates.clear();
         }

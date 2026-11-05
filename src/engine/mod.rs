@@ -9,6 +9,8 @@ mod decoder;
 mod error;
 mod key;
 mod lexicon;
+pub mod paging;
+mod ranking;
 mod router;
 mod segment;
 mod session;
@@ -20,6 +22,9 @@ pub use error::EngineError;
 pub use key::{Key, KeyEvent, Modifiers};
 pub use keymap::map_windows_virtual_key;
 pub use lexicon::Lexicon;
+pub use ranking::{promote_order, ranking_indices};
 pub use router::EngineRouter;
 pub use session::{EngineSession, PinyinSession, DEFAULT_PAGE_SIZE};
-pub use types::{Candidate, CompositionUpdate, LearningEvent};
+pub use types::{
+    Candidate, CompositionUpdate, LearningEvent, PromotionEvent, RankingCandidate, RankingOrder,
+};
