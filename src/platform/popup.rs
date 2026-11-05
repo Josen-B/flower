@@ -550,7 +550,7 @@ mod windows_impl {
                     placement.top,
                     layout.size.width,
                     layout.size.height,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
             }
             .map_err(|error| PopupError::win32("show", error))?;
@@ -1078,15 +1078,6 @@ mod windows_impl {
             dpi,
             PopupSize::new(client.right - client.left, client.bottom - client.top),
         );
-        let mut preedit_rect = windows_rect(layout.preedit);
-        set_text_color(hdc, COLORREF(palette.text));
-        draw_text(
-            hdc,
-            &snapshot.preedit,
-            &mut preedit_rect,
-            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-
         for (index, (row, candidate)) in layout
             .candidates
             .iter()
@@ -1102,11 +1093,7 @@ mod windows_impl {
                 set_text_color(hdc, COLORREF(palette.text));
             }
 
-            let line = if candidate.comment.is_empty() {
-                format!("{}. {}", index + 1, candidate.text)
-            } else {
-                format!("{}. {}  {}", index + 1, candidate.text, candidate.comment)
-            };
+            let line = format!("{}. {}", index + 1, candidate.text);
             draw_text(
                 hdc,
                 &line,
@@ -1116,7 +1103,7 @@ mod windows_impl {
         }
 
         set_text_color(hdc, COLORREF(palette.text));
-        for (button, label) in [(layout.previous_page, "‹"), (layout.next_page, "›")] {
+        for (button, label) in [(layout.previous_page, "-"), (layout.next_page, "+")] {
             if let Some(button) = button {
                 let mut rect = windows_rect(button);
                 draw_text(

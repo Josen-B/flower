@@ -250,7 +250,7 @@ fn create_protected_directory(path: &Path) -> Result<(), String> {
     }
 }
 
-fn check_path(path: &Path, require_existing: bool) -> Result<(Vec<File>, Vec<PathBuf>), String> {
+fn validate_local_path(path: &Path) -> Result<(), String> {
     let text = path.to_str().ok_or("目录必须为有效 Unicode")?;
     validate_spelling(text)?;
     unsafe {
@@ -279,6 +279,11 @@ fn check_path(path: &Path, require_existing: bool) -> Result<(Vec<File>, Vec<Pat
             return Err("不能安装到 Windows 系统目录树。".into());
         }
     }
+    Ok(())
+}
+
+fn check_path(path: &Path, require_existing: bool) -> Result<(Vec<File>, Vec<PathBuf>), String> {
+    validate_local_path(path)?;
     let mut ancestors: Vec<_> = path.ancestors().collect();
     ancestors.reverse();
     let mut existing = Vec::new();
@@ -339,9 +344,376 @@ fn check_path(path: &Path, require_existing: bool) -> Result<(Vec<File>, Vec<Pat
     Ok((guards, missing_components))
 }
 
+const USER_FILES: [&str; 4] = [
+    "flower-settings.exe",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+];
+
+fn user_directory_guard(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .access_mode(0x80) // FILE_READ_ATTRIBUTES, no ACL/owner requirement
+        .share_mode(1) // deny write and delete, including reparse mutation
+        .custom_flags(0x0220_0000)
+        .open(path)
+        .map_err(|e| format!("{}：{e}", path.display()))?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !ordinary_user_directory(metadata.is_dir(), metadata.file_attributes()) {
+        return Err(format!("{} 不是普通目录（不允许重解析点）", path.display()));
+    }
+    Ok(file)
+}
+
+fn ordinary_user_directory(is_directory: bool, attributes: u32) -> bool {
+    is_directory && attributes & REPARSE_POINT == 0
+}
+
+fn user_path_guards(path: &Path, create: bool) -> Result<Vec<File>, String> {
+    validate_local_path(path)?;
+    let mut ancestors: Vec<_> = path.ancestors().collect();
+    ancestors.reverse();
+    let mut guards = Vec::new();
+    let mut missing = false;
+    for directory in ancestors {
+        match fs::symlink_metadata(directory) {
+            Ok(_) if missing => return Err("用户目录在检查期间发生变化。".into()),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    missing = true;
+                    continue;
+                }
+                // No create_dir_all and no adoption of ERROR_ALREADY_EXISTS.
+                fs::create_dir(directory)
+                    .map_err(|e| format!("无法以普通用户创建 {}：{e}", directory.display()))?;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+        guards.push(user_directory_guard(directory)?);
+    }
+    if !missing {
+        for name in USER_FILES {
+            match fs::symlink_metadata(path.join(name)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => return Err(format!("目标文件 {name} 已存在，拒绝覆盖。")),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+    Ok(guards)
+}
+
+/// Read-only syntax/volume/reparse checks, intentionally without machine ACL rules.
+pub fn check_user_install_path(path: &Path) -> Result<(), String> {
+    user_path_guards(path, false).map(|_| ())
+}
+
+fn require_non_elevated() -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| e.to_string())?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        result.map_err(|e| e.to_string())?;
+        if elevation.TokenIsElevated != 0 {
+            return Err(
+                "用户文件部署拒绝提升令牌；请由原始普通用户运行，不会回退管理员写入。".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Copy only fixed names beside this executable. Never overwrite or traverse
+/// arbitrary payload entries. Cleanup uses owned handles, never a replaceable name.
+pub fn install_user_files(path: &Path) -> Result<(), String> {
+    require_non_elevated()?;
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    // current_exe may return the Win32 extended-length spelling. Normalize only
+    // this OS-provided source; user-supplied extended/device paths stay rejected.
+    let executable = match executable.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(dos_path) => PathBuf::from(dos_path),
+        None => executable,
+    };
+    let source = executable.parent().ok_or("无法确定工具目录")?;
+    // Also pin the trusted source tree for the duration of all reads.
+    let (source_guards, _) = check_path(source, true)?;
+    let target_guards = user_path_guards(path, true)?;
+    let result = copy_fixed_user_files(source, path);
+    drop(target_guards);
+    drop(source_guards);
+    result
+}
+
+// Private implementation, not a trust-bypassing CLI. The caller holds source
+// and destination guards; production must first pass token and source checks.
+fn copy_fixed_user_files(source: &Path, path: &Path) -> Result<(), String> {
+    use windows::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+    let mut created: Vec<File> = Vec::new();
+    let result = (|| {
+        for name in USER_FILES {
+            let mut input = OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .custom_flags(0x0020_0000)
+                .open(source.join(name))
+                .map_err(|e| format!("无法读取系统副本 {name}：{e}"))?;
+            let metadata = input.metadata().map_err(|e| e.to_string())?;
+            if !metadata.is_file() || metadata.file_attributes() & REPARSE_POINT != 0 {
+                return Err(format!("系统副本 {name} 不是普通文件"));
+            }
+            let output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .access_mode(0x4001_0000) // GENERIC_WRITE | DELETE for handle-only rollback
+                .share_mode(0)
+                .custom_flags(0x0020_0000)
+                .open(path.join(name))
+                .map_err(|e| format!("无法新建 {name}（拒绝覆盖/竞争）：{e}"))?;
+            created.push(output);
+            let output = created.last_mut().unwrap();
+            std::io::copy(&mut input, output).map_err(|e| e.to_string())?;
+            output.sync_all().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for file in &created {
+            let disposition = FILE_DISPOSITION_INFO {
+                DeleteFile: true.into(),
+            };
+            // Owned exclusive handles remain open: cannot delete a competitor's file.
+            let cleanup = unsafe {
+                SetFileInformationByHandle(
+                    HANDLE(file.as_raw_handle()),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            };
+            if let Err(error) = cleanup {
+                eprintln!("本次创建文件清理失败，保留供用户检查：{error}");
+            }
+        }
+    }
+    drop(created);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explicit opt-in keeps ordinary test runs from writing to a global temp
+    /// directory. The runner must supply this Thread's scratch, never another
+    /// session's directory. Each fixture exclusively owns one newly created child.
+    struct UserCopyFixture {
+        root: PathBuf,
+        source: PathBuf,
+        target: PathBuf,
+    }
+
+    impl UserCopyFixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            require_non_elevated()
+                .expect("隔离复制测试必须非提升运行；提升令牌已被拒绝，未执行文件 I/O");
+            let scratch = PathBuf::from(
+                std::env::var_os("FLOWER_INSTALL_PATH_TEST_SCRATCH")
+                    .expect("请显式指定本 Thread 的 scratch；没有全局临时目录回退"),
+            );
+            assert!(scratch.is_absolute(), "scratch 必须为绝对路径");
+            assert_eq!(scratch.file_name(), Some(OsStr::new("scratch")));
+            let root = scratch.join(format!(
+                "user-copy-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            // No adoption, overwrite, or cleanup of a pre-existing test root.
+            fs::create_dir(&root).expect("无法独占创建测试目录");
+            let fixture = Self {
+                source: root.join("source"),
+                target: root.join("deep").join("nested").join("target"),
+                root,
+            };
+            fs::create_dir(&fixture.source).unwrap();
+            for (index, name) in USER_FILES.iter().enumerate() {
+                // The .exe is inert data; nothing in these tests launches it.
+                fs::write(
+                    fixture.source.join(name),
+                    format!("inert fixture {index}: {name}\r\n\0payload"),
+                )
+                .unwrap();
+            }
+            fixture
+        }
+    }
+
+    impl Drop for UserCopyFixture {
+        fn drop(&mut self) {
+            // This newly created fixture contains only our regular directories
+            // and inert files. Tests never create live junctions or symlinks.
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                eprintln!("保留本次测试目录 {}：{error}", self.root.display());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires non-elevated token and explicit Thread scratch"]
+    fn isolated_user_copy_creates_deep_target_with_matching_content_hashes() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let fixture = UserCopyFixture::new();
+        let source_guard = user_directory_guard(&fixture.source).unwrap();
+        let guards = user_path_guards(&fixture.target, true).unwrap();
+        copy_fixed_user_files(&fixture.source, &fixture.target).unwrap();
+        for name in USER_FILES {
+            let original = fs::read(fixture.source.join(name)).unwrap();
+            let copied = fs::read(fixture.target.join(name)).unwrap();
+            // Hash equality is supplemented with exact bytes, not used as a
+            // substitute for the production cryptographic payload verification.
+            let hash = |bytes: &[u8]| {
+                let mut hasher = DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            };
+            assert_eq!(hash(&original), hash(&copied), "{name}");
+            assert_eq!(original, copied, "{name}");
+        }
+        assert_eq!(fs::read_dir(&fixture.target).unwrap().count(), 4);
+        drop(guards);
+        drop(source_guard);
+    }
+
+    #[test]
+    #[ignore = "requires non-elevated token and explicit Thread scratch"]
+    fn isolated_user_copy_existing_target_is_never_overwritten() {
+        let fixture = UserCopyFixture::new();
+        fs::create_dir_all(&fixture.target).unwrap();
+        fs::write(fixture.target.join("README.md"), b"existing owner").unwrap();
+        assert!(user_path_guards(&fixture.target, true).is_err());
+        assert_eq!(
+            fs::read(fixture.target.join("README.md")).unwrap(),
+            b"existing owner"
+        );
+        assert!(!fixture.target.join(USER_FILES[0]).exists());
+    }
+
+    #[test]
+    #[ignore = "requires non-elevated token and explicit Thread scratch"]
+    fn isolated_user_copy_later_missing_source_rolls_back_only_owned_files() {
+        let fixture = UserCopyFixture::new();
+        fs::remove_file(fixture.source.join(USER_FILES[2])).unwrap();
+        fs::create_dir_all(fixture.target.join("unrelated")).unwrap();
+        let unknown = fixture.target.join("unrelated").join("keep.txt");
+        fs::write(&unknown, b"unknown data").unwrap();
+        let source_guard = user_directory_guard(&fixture.source).unwrap();
+        let guards = user_path_guards(&fixture.target, true).unwrap();
+        let error = copy_fixed_user_files(&fixture.source, &fixture.target).unwrap_err();
+        assert!(error.contains(USER_FILES[2]), "{error}");
+        // The first two files were really created, copied and then removed via
+        // their exclusive handles when opening the third source failed.
+        for name in USER_FILES {
+            assert!(!fixture.target.join(name).exists(), "{name}");
+        }
+        assert_eq!(fs::read(unknown).unwrap(), b"unknown data");
+        drop(guards);
+        drop(source_guard);
+    }
+
+    #[test]
+    #[ignore = "requires non-elevated token and explicit Thread scratch"]
+    fn isolated_user_copy_create_new_rejects_file_racing_after_precheck() {
+        let fixture = UserCopyFixture::new();
+        let source_guard = user_directory_guard(&fixture.source).unwrap();
+        let guards = user_path_guards(&fixture.target, true).unwrap();
+        // Deterministic competitor between the real target precheck and copy.
+        let raced = fixture.target.join(USER_FILES[1]);
+        fs::write(&raced, b"competitor").unwrap();
+        let error = copy_fixed_user_files(&fixture.source, &fixture.target).unwrap_err();
+        assert!(error.contains("拒绝覆盖/竞争"), "{error}");
+        assert!(!fixture.target.join(USER_FILES[0]).exists());
+        assert_eq!(fs::read(raced).unwrap(), b"competitor");
+        assert!(!fixture.target.join(USER_FILES[2]).exists());
+        drop(guards);
+        drop(source_guard);
+    }
+
+    #[test]
+    #[ignore = "requires non-elevated token and explicit Thread scratch"]
+    fn isolated_user_copy_create_new_rejects_directory_racing_after_precheck() {
+        let fixture = UserCopyFixture::new();
+        let source_guard = user_directory_guard(&fixture.source).unwrap();
+        let guards = user_path_guards(&fixture.target, true).unwrap();
+        let raced = fixture.target.join(USER_FILES[1]);
+        fs::create_dir(&raced).unwrap();
+        fs::write(raced.join("keep.txt"), b"competitor directory").unwrap();
+        assert!(copy_fixed_user_files(&fixture.source, &fixture.target).is_err());
+        assert!(!fixture.target.join(USER_FILES[0]).exists());
+        assert_eq!(
+            fs::read(raced.join("keep.txt")).unwrap(),
+            b"competitor directory"
+        );
+        drop(guards);
+        drop(source_guard);
+    }
+
+    #[test]
+    fn user_directory_reparse_attributes_are_rejected_without_creating_links() {
+        assert!(ordinary_user_directory(true, 0x10));
+        assert!(!ordinary_user_directory(true, 0x10 | REPARSE_POINT));
+        assert!(!ordinary_user_directory(false, 0x20));
+        assert!(!ordinary_user_directory(false, 0x20 | REPARSE_POINT));
+    }
+
+    #[test]
+    fn user_files_are_fixed_and_never_include_machine_components() {
+        assert_eq!(
+            USER_FILES,
+            [
+                "flower-settings.exe",
+                "README.md",
+                "LICENSE-MIT",
+                "LICENSE-APACHE",
+            ]
+        );
+        assert!(!USER_FILES.contains(&"flower.dll"));
+        assert!(!USER_FILES.contains(&"flower-register.exe"));
+    }
+
+    #[test]
+    fn user_path_spelling_accepts_deep_paths_without_acl_assumptions() {
+        assert!(validate_spelling(r"D:\software\Flower").is_ok());
+        for invalid in [
+            r"D:\",
+            r"D:\software\..\Flower",
+            r"D:\software\Flower.",
+            r"\\server\Flower",
+            r"D:\software\NUL",
+            r"D:\software\file:stream",
+        ] {
+            assert!(validate_spelling(invalid).is_err(), "{invalid}");
+        }
+    }
 
     fn check_sddl(sddl: &str, strict: bool) -> Result<(), String> {
         use windows::Win32::Foundation::BOOL;

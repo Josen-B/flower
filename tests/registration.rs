@@ -16,6 +16,35 @@ use flower::registration::{
 };
 
 #[test]
+fn user_file_commands_require_exact_path_arguments() {
+    for command in ["check-user-install-path", "install-user-files"] {
+        let path = OsString::from(r"D:\software\Flower");
+        let expected = if command == "check-user-install-path" {
+            CliCommand::CheckUserInstallPath { path: path.clone() }
+        } else {
+            CliCommand::InstallUserFiles { path: path.clone() }
+        };
+        assert_eq!(
+            parse_arguments(vec![command.into(), "--path".into(), path]),
+            Ok(expected)
+        );
+        for tail in [
+            vec![],
+            vec!["--path"],
+            vec!["--path", ""],
+            vec!["--dll", "x"],
+            vec!["--path", "x", "extra"],
+            vec!["--path", "x", "--path", "y"],
+            vec!["--help"],
+        ] {
+            let mut args = vec![OsString::from(command)];
+            args.extend(tail.into_iter().map(OsString::from));
+            assert!(parse_arguments(args).is_err());
+        }
+    }
+}
+
+#[test]
 fn prepare_install_path_requires_exact_os_path_arguments() {
     let args = |v: &[&str]| v.iter().map(OsString::from).collect();
     assert_eq!(

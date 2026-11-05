@@ -5,14 +5,14 @@ use thiserror::Error;
 
 const BASE_DPI: u32 = 96;
 const PADDING: i32 = 8;
-const HEADER_HEIGHT: i32 = 30;
 const CANDIDATE_HEIGHT: i32 = 30;
 const FOOTER_HEIGHT: i32 = 22;
 const FOOTER_BUTTON_WIDTH: i32 = 28;
 const MIN_FOOTER_BUTTON_WIDTH: i32 = 12;
 const MIN_CONTENT_WIDTH: i32 = 240;
 const MAX_CONTENT_WIDTH: i32 = 640;
-const MAX_VISIBLE_CANDIDATES: usize = 32;
+const MIN_CELL_WIDTH: i32 = 48;
+const MAX_CELL_WIDTH: i32 = 240;
 
 /// 与平台无关的屏幕或客户区坐标点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +91,9 @@ impl PopupSize {
 pub struct CandidatePopupLayout {
     /// 弹窗客户区尺寸，已限制在传入边界内。
     pub size: PopupSize,
-    /// 顶部拼音预编辑区域。
+    /// 兼容保留的预编辑区域，始终为零面积，不参与绘制或命中。
     pub preedit: PopupRect,
-    /// 当前页每个可见候选行的区域。
+    /// 当前页候选按从左到右、从上到下顺序排列的单元格。
     pub candidates: Vec<PopupRect>,
     /// 页脚区域；无候选页时为 `None`。
     pub footer: Option<PopupRect>,
@@ -108,65 +108,80 @@ pub struct CandidatePopupLayout {
 impl CandidatePopupLayout {
     /// 根据快照、DPI 和可用最大尺寸计算布局。
     ///
-    /// `bounds` 的左上角按客户区原点处理。若空间不足，会减少可见候选行并
-    /// 隐藏放不下的 footer；窗口宽高不会超过边界。
+    /// `bounds` 的左上角按客户区原点处理。单元格限宽，长文字由绘制层省略。
+    /// 最小可读单元格或全部行与页脚的总高度放不下时，整体隐藏候选及页脚，
+    /// 不截断当前页；键盘选择和引擎分页不受影响。窗口尺寸始终限制在边界内。
     pub fn new(snapshot: &CandidatePopupSnapshot, dpi: u32, bounds: PopupSize) -> Self {
         let dpi = effective_dpi(dpi);
         let width_limit = bounds.width.max(1);
         let height_limit = bounds.height.max(1);
         let padding = scaled(PADDING, dpi);
-        let header_height = scaled(HEADER_HEIGHT, dpi);
         let candidate_height = scaled(CANDIDATE_HEIGHT, dpi).max(1);
         let footer_height = scaled(FOOTER_HEIGHT, dpi);
-
-        let mut widest = snapshot.preedit.chars().count().max(20);
-        for candidate in &snapshot.candidates {
-            let units = candidate.text.chars().count() + candidate.comment.chars().count() + 6;
-            widest = widest.max(units);
-        }
-        let content_width = (widest.min(48) as i32)
-            .saturating_mul(14)
-            .clamp(MIN_CONTENT_WIDTH, MAX_CONTENT_WIDTH);
-        let natural_width = scaled(content_width.saturating_add(PADDING * 2), dpi);
-        let width = natural_width.min(width_limit).max(1);
-
-        let desired_rows = snapshot.candidates.len().min(MAX_VISIBLE_CANDIDATES);
-        let has_page_count = snapshot.page_count > 0;
-        let fixed_height = padding.saturating_mul(2).saturating_add(header_height);
-        let natural_height = fixed_height
-            .saturating_add(candidate_height.saturating_mul(desired_rows as i32))
-            .saturating_add(if has_page_count { footer_height } else { 0 });
-        let height = natural_height.min(height_limit).max(1);
-        let footer_visible = has_page_count && height >= fixed_height.saturating_add(footer_height);
-        let row_budget = height
-            .saturating_sub(fixed_height)
-            .saturating_sub(if footer_visible { footer_height } else { 0 })
-            .max(0);
-        let visible_rows = desired_rows.min((row_budget / candidate_height) as usize);
-        let footer_top = height.saturating_sub(padding).saturating_sub(footer_height);
-        let body_bottom = if footer_visible {
-            footer_top
-        } else {
-            height.saturating_sub(padding)
-        };
-        let candidates_top = padding.saturating_add(header_height);
-        let candidates = (0..visible_rows)
-            .map(|index| {
-                let top =
-                    candidates_top.saturating_add(candidate_height.saturating_mul(index as i32));
-                PopupRect::new(
-                    padding / 2,
-                    top,
-                    width.saturating_sub(padding / 2),
-                    top.saturating_add(candidate_height).min(body_bottom),
+        // Only displayed text contributes to geometry. Bound work on very long
+        // candidates as each cell is ellipsized at MAX_CELL_WIDTH anyway.
+        let cell_widths: Vec<i32> = snapshot
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let label_width = ((index + 1).to_string().len() as i32 + 2) * 9;
+                let text_width = candidate
+                    .text
+                    .chars()
+                    .take(MAX_CELL_WIDTH as usize)
+                    .fold(0i32, |width, character| {
+                        width + if character.is_ascii() { 9 } else { 18 }
+                    });
+                scaled(
+                    (label_width + text_width + PADDING * 2).clamp(MIN_CELL_WIDTH, MAX_CELL_WIDTH),
+                    dpi,
                 )
+                .max(1)
             })
             .collect();
-
-        let footer = footer_visible.then(|| {
+        let content_width = cell_widths
+            .iter()
+            .fold(0i32, |sum, width| sum.saturating_add(*width))
+            .clamp(
+                scaled(MIN_CONTENT_WIDTH, dpi),
+                scaled(MAX_CONTENT_WIDTH, dpi),
+            );
+        let natural_width = content_width.saturating_add(padding.saturating_mul(2));
+        let width = natural_width.min(width_limit).max(1);
+        let inner_width = width.saturating_sub(padding.saturating_mul(2)).max(0);
+        let mut candidates = Vec::with_capacity(cell_widths.len());
+        let mut x = padding;
+        let mut y = padding;
+        for cell_width in cell_widths {
+            let cell_width = cell_width.min(inner_width);
+            if x > padding && x.saturating_add(cell_width) > width.saturating_sub(padding) {
+                x = padding;
+                y = y.saturating_add(candidate_height);
+            }
+            candidates.push(PopupRect::new(
+                x,
+                y,
+                x.saturating_add(cell_width),
+                y.saturating_add(candidate_height),
+            ));
+            x = x.saturating_add(cell_width);
+        }
+        let has_page_count = snapshot.page_count > 0 && !candidates.is_empty();
+        let body_bottom = candidates.last().map_or(padding, |cell| cell.bottom);
+        let natural_height = body_bottom
+            .saturating_add(padding)
+            .saturating_add(if has_page_count { footer_height } else { 0 });
+        let height = natural_height.min(height_limit).max(1);
+        let fits =
+            inner_width >= scaled(MIN_CELL_WIDTH, dpi).max(1) && natural_height <= height_limit;
+        if !fits {
+            candidates.clear();
+        }
+        let footer = (fits && has_page_count).then(|| {
             PopupRect::new(
                 padding,
-                footer_top,
+                body_bottom,
                 width.saturating_sub(padding),
                 height.saturating_sub(padding),
             )
@@ -220,12 +235,7 @@ impl CandidatePopupLayout {
 
         Self {
             size: PopupSize::new(width, height),
-            preedit: PopupRect::new(
-                padding,
-                padding,
-                width.saturating_sub(padding),
-                padding.saturating_add(header_height),
-            ),
+            preedit: PopupRect::new(0, 0, 0, 0),
             candidates,
             footer,
             previous_page,

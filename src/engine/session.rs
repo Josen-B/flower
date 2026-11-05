@@ -163,14 +163,14 @@ impl PinyinSession {
                 update.cancelled = true;
                 Ok(update)
             }
-            Key::PageDown => {
+            Key::PageDown | Key::Char('+' | '=') => {
                 if !self.is_composing() {
                     return Ok(self.snapshot(false));
                 }
                 self.change_page(1);
                 Ok(self.snapshot(true))
             }
-            Key::PageUp => {
+            Key::PageUp | Key::Char('-') => {
                 if !self.is_composing() {
                     return Ok(self.snapshot(false));
                 }

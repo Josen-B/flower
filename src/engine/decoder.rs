@@ -114,6 +114,12 @@ pub(crate) fn decode(lexicon: &Lexicon, raw: &str) -> Vec<Choice> {
         .iter()
         .map(|c| (c.candidate.text.clone(), c.consumed))
         .collect();
+    output.extend(
+        lexicon
+            .initial_choices(raw)
+            .into_iter()
+            .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
+    );
     for path in &graph[raw.len()] {
         if path.words > 1 && seen.insert((path.text.clone(), raw.len())) {
             output.push(Choice {
@@ -124,12 +130,6 @@ pub(crate) fn decode(lexicon: &Lexicon, raw: &str) -> Vec<Choice> {
             });
         }
     }
-    output.extend(
-        lexicon
-            .initial_choices(raw)
-            .into_iter()
-            .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
-    );
     let mut partial: Vec<_> = lexicon
         .prefix_choices(raw)
         .into_iter()

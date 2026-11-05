@@ -18,18 +18,36 @@ from scripts.test_package import PackageFixture, flower_package, make_pe
 class InstallerSourceTests(unittest.TestCase):
     """Static integration guards, not a substitute for executing the wizard."""
 
+    def test_non_elevated_copy_and_handle_only_rollback_contract(self):
+        source = (installer.REPO / "src/platform/install_path.rs").read_text(encoding="utf-8-sig")
+        copy = source.split("pub fn install_user_files", 1)[1].split("#[cfg(test)]", 1)[0]
+        self.assertLess(copy.index("require_non_elevated()?"), copy.index("user_path_guards(path, true)"))
+        self.assertIn("elevation.TokenIsElevated != 0", source)
+        self.assertIn(".create_new(true)", copy)
+        self.assertIn(".share_mode(0)", copy)
+        self.assertIn("SetFileInformationByHandle", copy)
+        self.assertNotIn("remove_file", copy)
+        self.assertNotIn("remove_dir_all", copy)
+        self.assertNotIn("fs::copy", copy)
+        self.assertIn("user_directory_guard(directory)", source)
+
     def test_directory_selection_and_pre_copy_path_gate(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
-        self.assertIn("DisableDirPage=no", source)
+        self.assertIn("DisableDirPage=yes", source)
+        self.assertIn(r"DefaultDirName={commonpf64}\Flower", source)
+        self.assertIn(r"UninstallFilesDir={commonpf64}\Flower", source)
+        self.assertNotIn("{app}", source)
+        self.assertIn("CreateInputDirPage", source)
         self.assertIn("AllowUNCPath=no", source)
         self.assertIn("Flags: dontcopy", source)
         prepare = source.split("function PrepareToInstall", 1)[1].split("procedure CurStepChanged", 1)[0]
-        self.assertIn("SafeInstallPath(ExpandConstant('{app}'))", prepare)
+        self.assertIn(r"SafeInstallPath(ExpandConstant('{commonpf64}\Flower'))", prepare)
         checker = source.split("function SafeInstallPath", 1)[1].split("function NextButtonClick", 1)[0]
         self.assertLess(checker.index("GetSHA256OfFile"), checker.index("if Exec("))
         self.assertIn("check-install-path --path", checker)
         page = source.split("function NextButtonClick", 1)[1].split("function PrepareInstallPath", 1)[0]
-        self.assertIn("SafeInstallPath(WizardDirValue)", page)
+        self.assertIn("check-user-install-path --path", page)
+        self.assertNotIn("SafeInstallPath(WizardDirValue)", page)
         self.assertNotIn("prepare-install-path", page)
         self.assertNotIn("PrepareInstallPath(", page)
         for gate in ["HasFlowerRegistration", "DirExists(PayloadDir)", "HasNativeRuntime"]:
@@ -44,6 +62,11 @@ class InstallerSourceTests(unittest.TestCase):
         post = source.split("procedure CurStepChanged", 1)[1].split("procedure CurPageChanged", 1)[0]
         self.assertLess(post.index("SafeInstallPath"), post.index("if Exec(PayloadDir"))
         self.assertNotIn("PrepareInstallPath(", post)
+        self.assertIn("ExecAsOriginalUser", post)
+        self.assertIn("install-user-files --path", post)
+        self.assertLess(post.index("TrustedPayload"), post.index("ExecAsOriginalUser"))
+        self.assertIn("UserFilesFailed := ExitCode <> 0", post)
+        self.assertIn("if UserFilesFailed then Result := 16", source)
         uninstall = source.split("function InitializeUninstall", 1)[1]
         self.assertLess(uninstall.index("FileCopy("), uninstall.index("SafeInstallPath"))
         self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PayloadDir"))
@@ -82,6 +105,8 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(len(include.splitlines()), len(list(payload.rglob("*"))) -
                          len([p for p in payload.rglob("*") if p.is_dir()]))
         self.assertNotIn("recursesubdirs", include)
+        self.assertIn(r'DestDir: "{commonpf64}\Flower\versions\{#BuildId}', include)
+        self.assertNotIn("{app}", include)
         self.assertEqual(
             options["ExpectedDllHash"],
             hashlib.sha256((payload / "flower.dll").read_bytes()).hexdigest(),

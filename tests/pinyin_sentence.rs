@@ -206,7 +206,7 @@ fn initials_use_first_ascii_letter_and_require_canonical_word_boundaries() {
 }
 
 #[test]
-fn full_matches_and_combinations_precede_initials_then_partial_choices() {
+fn full_matches_precede_initials_then_combinations_then_partial_choices() {
     let mut s = PinyinSession::from_lexicon_tsv(
         "an\t全拼\t1\na\t啊\t1\nn\t嗯\t1\nai'ni\t爱你\t10000\nan\t爱你\t1",
         9,
@@ -228,7 +228,7 @@ fn full_matches_and_combinations_precede_initials_then_partial_choices() {
             .iter()
             .map(|c| c.text.as_str())
             .collect::<Vec<_>>(),
-        ["啊嗯", "爱你", "啊"]
+        ["爱你", "啊嗯", "啊"]
     );
 }
 

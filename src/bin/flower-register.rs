@@ -9,6 +9,8 @@ const USAGE: &str = "\
 Flower 注册工具（Windows x64）
 
 用法：
+  flower-register check-user-install-path --path <目录>  只读检查用户副本目录
+  flower-register install-user-files --path <目录>  非提升部署固定用户文件（不覆盖）
   flower-register check-install-path --path <目录>  只读检查机器安装目录安全性
   flower-register prepare-install-path --path <目录>  安全创建缺失安装目录（管理员）
   flower-register register [--dll <path>]  注册机器级 COM/TSF 组件（管理员终端）
@@ -55,6 +57,14 @@ fn run_command(command: CliCommand) -> Result<(), String> {
     use flower::registration::OperationOutcome;
 
     match command {
+        CliCommand::CheckUserInstallPath { path } => {
+            flower::platform::install_path::check_user_install_path(&PathBuf::from(path))?;
+            println!("用户文件路径预检通过；未写入，实际普通用户权限将在部署时检查。");
+        }
+        CliCommand::InstallUserFiles { path } => {
+            flower::platform::install_path::install_user_files(&PathBuf::from(path))?;
+            println!("用户文件副本已部署；系统组件仍位于 Program Files。");
+        }
         CliCommand::CheckInstallPath { path } => {
             flower::platform::install_path::check_install_path(&PathBuf::from(path))?;
             println!("安装目录安全检查通过；未创建目录或修改权限。");

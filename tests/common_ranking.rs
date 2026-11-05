@@ -25,6 +25,10 @@ fn frequent_primary_readings_precede_rare_and_secondary_readings() {
         ("beijing", "北京"),
         ("xuexi", "学习"),
         ("yinyue", "音乐"),
+        ("nihao", "你好"),
+        ("women", "我们"),
+        ("shenme", "什么"),
+        ("keyi", "可以"),
     ] {
         assert_eq!(lexicon.lookup(pinyin)[0].text, expected, "{pinyin}");
     }
@@ -34,6 +38,9 @@ fn frequent_primary_readings_precede_rare_and_secondary_readings() {
 fn common_words_are_reachable_with_initials_in_real_session() {
     for (raw, expected, canonical) in [
         ("nh", "你好", "ni'hao"),
+        ("wm", "我们", "wo'men"),
+        ("sm", "什么", "shen'me"),
+        ("ky", "可以", "ke'yi"),
         ("zg", "中国", "zhong'guo"),
         ("xx", "学习", "xue'xi"),
     ] {
@@ -43,6 +50,13 @@ fn common_words_are_reachable_with_initials_in_real_session() {
                 .process_key(KeyEvent::plain(Key::Char(letter)))
                 .unwrap();
         }
+        assert!(
+            session
+                .candidates_on_current_page()
+                .iter()
+                .any(|candidate| candidate.text == expected && candidate.comment == canonical),
+            "{raw}: {expected} must be on the first nine-candidate page"
+        );
         let mut selected = None;
         for _ in 0..session.page_count() {
             if let Some(index) = session

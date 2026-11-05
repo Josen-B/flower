@@ -34,9 +34,10 @@ VersionInfoVersion={#FileVersion}
 VersionInfoTextVersion={#AppVersion}
 VersionInfoProductName=Flower
 VersionInfoDescription=Flower 测试版安装器
-DefaultDirName={autopf}\Flower
+DefaultDirName={commonpf64}\Flower
 DefaultGroupName=Flower
-DisableDirPage=no
+DisableDirPage=yes
+UninstallFilesDir={commonpf64}\Flower
 AllowUNCPath=no
 DisableProgramGroupPage=yes
 UsePreviousAppDir=no
@@ -47,7 +48,7 @@ MinVersion=10.0
 OutputDir={#OutputDir}
 OutputBaseFilename=flower-{#AppVersion}-windows-x64-setup
 SetupIconFile=..\assets\flower.ico
-UninstallDisplayIcon={app}\versions\{#BuildId}\flower-settings.exe
+UninstallDisplayIcon={commonpf64}\Flower\versions\{#BuildId}\flower-settings.exe
 LicenseFile={#PackageDir}\LICENSE-MIT
 InfoBeforeFile=notice.zh-CN.txt
 Compression=lzma2
@@ -67,14 +68,14 @@ Name: "zh"; MessagesFile: "compiler:Default.isl,zh-CN.isl"
 [Files]
 Source: "{#PackageDir}\flower-register.exe"; DestName: "flower-path-check.exe"; Flags: dontcopy
 #include FilesInclude
-Source: "notice.zh-CN.txt"; DestDir: "{app}\versions\{#BuildId}"; DestName: "INSTALLER-README.txt"; Flags: ignoreversion
-Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion
+Source: "notice.zh-CN.txt"; DestDir: "{commonpf64}\Flower\versions\{#BuildId}"; DestName: "INSTALLER-README.txt"; Flags: ignoreversion
+Source: "{#EngineLicense}"; DestDir: "{commonpf64}\Flower\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{commonprograms}\Flower\启用 Flower（当前用户）"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
-Name: "{commonprograms}\Flower\停用 Flower（当前用户）"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "disable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
-Name: "{commonprograms}\Flower\Flower 设置"; Filename: "{app}\versions\{#BuildId}\flower-settings.exe"
-Name: "{commonprograms}\Flower\Flower 安装说明"; Filename: "{app}\versions\{#BuildId}\INSTALLER-README.txt"
+Name: "{commonprograms}\Flower\启用 Flower（当前用户）"; Filename: "{commonpf64}\Flower\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{commonpf64}\Flower\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\停用 Flower（当前用户）"; Filename: "{commonpf64}\Flower\versions\{#BuildId}\flower-register.exe"; Parameters: "disable"; IconFilename: "{commonpf64}\Flower\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\Flower 设置"; Filename: "{commonpf64}\Flower\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\Flower 安装说明"; Filename: "{commonpf64}\Flower\versions\{#BuildId}\INSTALLER-README.txt"
 
 [Code]
 const
@@ -86,6 +87,25 @@ const
 var
   RegistrationFailed: Boolean;
   PathCheckerReady: Boolean;
+  UserFilesFailed: Boolean;
+  UserFilesPage: TInputDirWizardPage;
+
+function SystemRoot: String;
+begin
+  Result := ExpandConstant('{commonpf64}\Flower');
+end;
+
+procedure InitializeWizard;
+begin
+  UserFilesPage := CreateInputDirPage(wpSelectDir, '用户文件目录',
+    '系统组件与用户副本分开部署',
+    '机器 DLL、注册工具和卸载器固定安装到 ' + SystemRoot +
+    '。下方仅存放设置程序、说明和许可副本，不是 DLL 安装位置。' +
+    '默认值来自安装进程的 LOCALAPPDATA；若使用另一管理员账户提升，请改选原始用户目录。',
+    False, '');
+  UserFilesPage.Add('用户文件副本目录：');
+  UserFilesPage.Values[0] := GetEnv('LOCALAPPDATA') + '\Flower\UserFiles';
+end;
 
 function CreateFileW(Name: String; Access, Share: LongWord; Security: LongWord;
   Creation, Attributes: LongWord; Template: THandle): THandle;
@@ -101,7 +121,7 @@ function CompareStringOrdinal(Left: String; LeftLength: Integer;
 
 function PayloadDir: String;
 begin
-  Result := ExpandConstant('{app}\versions\{#BuildId}');
+  Result := ExpandConstant('{commonpf64}\Flower\versions\{#BuildId}');
 end;
 
 function PathChecker: String;
@@ -122,16 +142,22 @@ begin
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  ExitCode: Integer;
 begin
   Result := True;
-  if CurPageID <> wpSelectDir then Exit;
+  if CurPageID <> UserFilesPage.ID then Exit;
   if not PathCheckerReady then begin
     ExtractTemporaryFile('flower-path-check.exe');
     PathCheckerReady := True;
   end;
-  Result := SafeInstallPath(WizardDirValue);
+  Result := False;
+  if CompareText(GetSHA256OfFile(PathChecker), '{#ExpectedToolHash}') <> 0 then Exit;
+  if Exec(PathChecker, 'check-user-install-path --path "' + UserFilesPage.Values[0] + '"',
+    ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    Result := ExitCode = 0;
   if not Result then
-    MsgBox('路径祖先可能允许普通用户替换目录，或已有目标允许普通用户写入。请选择安全的本地固定盘路径；不能使用网络或链接。缺失的新目录由安装器保护，已有目录权限不会更改。', mbError, MB_OK);
+    MsgBox('用户文件目录无效、含链接或固定目标文件已存在。请选择本地固定盘正常目录，例如 D:\software\Flower。不会更改已有权限；普通用户写入权限在部署时检查。', mbError, MB_OK);
 end;
 
 function PrepareInstallPath(Name: String): Boolean;
@@ -259,16 +285,18 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if HasFlowerRegistration or RegKeyExists(HKLM64, InstallerKey) then
+  if CompareText(WizardDirValue, SystemRoot) <> 0 then
+    Result := '系统组件位置固定为 Program Files\Flower，不接受 /DIR 覆盖；请重新运行安装器。'
+  else if HasFlowerRegistration or RegKeyExists(HKLM64, InstallerKey) then
     Result := '已发现 Flower 注册或安装记录。请先由各用户停用 Flower、退出旧宿主，再使用旧安装工具注销或卸载；本安装器不会覆盖旧安装。'
   else if DirExists(PayloadDir) then
     Result := '目标版本目录已存在。为保护未知或未完成的安装，拒绝覆盖。'
   else if not HasNativeRuntime then
     Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。'
-  else if not PrepareInstallPath(ExpandConstant('{app}')) then
+  else if not PrepareInstallPath(ExpandConstant('{commonpf64}\Flower')) then
     Result := '安全准备目录失败：祖先或已有目标不安全，或创建时发生竞争。已有权限未更改；本次创建的空安全目录可能保留。'
-  else if not SafeInstallPath(ExpandConstant('{app}')) then
-    Result := '安装目录安全检查失败。请返回目录页选择受保护的本地目录。';
+  else if not SafeInstallPath(ExpandConstant('{commonpf64}\Flower')) then
+    Result := '系统组件目录安全检查失败。已有目录权限不会更改，请由管理员检查 Program Files\Flower。';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -277,7 +305,7 @@ var
 begin
   if CurStep <> ssPostInstall then Exit;
   RegistrationFailed := True;
-  if SafeInstallPath(ExpandConstant('{app}')) and TrustedPayload then begin
+  if SafeInstallPath(ExpandConstant('{commonpf64}\Flower')) and TrustedPayload then begin
     if Exec(PayloadDir + '\flower-register.exe',
       'register --dll "' + PayloadDir + '\flower.dll"', PayloadDir,
       SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
@@ -285,10 +313,25 @@ begin
       RegistrationFailed := (ExitCode <> 0) or (not OwnedRegistrationComplete);
     end;
   end;
+  if not RegistrationFailed then begin
+    UserFilesFailed := True;
+    if SafeInstallPath(SystemRoot) and TrustedPayload then begin
+      if ExecAsOriginalUser(PayloadDir + '\flower-register.exe',
+        'install-user-files --path "' + UserFilesPage.Values[0] + '"', PayloadDir,
+        SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
+        Log('Flower user files exit code: ' + IntToStr(ExitCode));
+        UserFilesFailed := ExitCode <> 0;
+      end;
+    end;
+  end;
   if RegistrationFailed then begin
     Log('Flower registration failed; keeping installed files for repair.');
     WizardForm.FinishedLabel.Caption :=
       'Flower 注册失败。文件和卸载入口已保留，不能将本次安装视为成功。请查看安装日志并修复或卸载后重试。';
+    SuppressibleMsgBox(WizardForm.FinishedLabel.Caption, mbError, MB_OK, IDOK);
+  end else if UserFilesFailed then begin
+    WizardForm.FinishedLabel.Caption :=
+      '用户文件部署失败，本次安装未完整成功。未回退管理员写入；系统组件及卸载入口已保留，请检查普通用户目录权限、已有文件和日志后卸载重试。';
     SuppressibleMsgBox(WizardForm.FinishedLabel.Caption, mbError, MB_OK, IDOK);
   end else
     WizardForm.FinishedLabel.Caption :=
@@ -297,6 +340,9 @@ end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if (CurPageID = wpFinished) and UserFilesFailed then
+    WizardForm.FinishedLabel.Caption :=
+      '用户文件部署失败，本次安装未完整成功。系统组件和卸载入口已保留，未使用管理员权限写入自选目录。请查看日志并卸载后重试。';
   if (CurPageID = wpFinished) and RegistrationFailed then
     WizardForm.FinishedLabel.Caption :=
       'Flower 注册失败。文件和卸载入口已保留，不能将本次安装视为成功。请查看安装日志并修复或卸载后重试。';
@@ -306,6 +352,7 @@ function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if RegistrationFailed then Result := 15;
+  if UserFilesFailed then Result := 16;
 end;
 
 function InitializeUninstall: Boolean;
@@ -319,7 +366,7 @@ begin
     Exit;
   end;
   if SuppressibleMsgBox(
-    '请确认每个用户已停用 Flower，并保存工作、退出所有使用过 Flower 的应用。卸载不会替其他账户停用，也不会删除用户设置。是否继续？',
+    '请确认每个用户已停用 Flower，并保存工作、退出所有使用过 Flower 的应用。卸载不会替其他账户停用；自选目录副本、词典和用户设置均保留，可由用户自行删除。是否继续？',
     mbConfirmation, MB_YESNO, IDNO) <> IDYES then Exit;
   { Never execute a helper directly out of a tree whose ACL may have changed.
     Copy to Inno's private temporary directory, verify the copy, then inspect. }
@@ -328,7 +375,7 @@ begin
     Exit;
   end;
   PathCheckerReady := True;
-  if not SafeInstallPath(ExpandConstant('{app}')) then begin
+  if not SafeInstallPath(ExpandConstant('{commonpf64}\Flower')) then begin
     MsgBox('安装目录权限已改变或文件校验失败，已停止卸载并保留文件。请先由管理员检查目录安全性。', mbError, MB_OK);
     Exit;
   end;

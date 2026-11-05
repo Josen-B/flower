@@ -4,6 +4,9 @@ use windows::core::{Result, HRESULT};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Stage {
+    LayoutTextExt,
+    AnchorGui,
+    AnchorView,
     Activate,
     PopupCreate,
     PopupTheme,

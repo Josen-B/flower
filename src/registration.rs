@@ -30,6 +30,8 @@ pub const ILOT_UNINSTALL: u32 = 0x0000_0001;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
+    CheckUserInstallPath { path: OsString },
+    InstallUserFiles { path: OsString },
     CheckInstallPath { path: OsString },
     PrepareInstallPath { path: OsString },
     Register { dll: Option<OsString> },
@@ -73,14 +75,21 @@ pub fn parse_arguments(arguments: Vec<OsString>) -> Result<CliCommand, CliError>
     if command == OsStr::new("register") {
         return parse_register_arguments(&arguments[1..]);
     }
-    if command == OsStr::new("check-install-path") || command == OsStr::new("prepare-install-path")
+    if command == OsStr::new("check-install-path")
+        || command == OsStr::new("prepare-install-path")
+        || command == OsStr::new("check-user-install-path")
+        || command == OsStr::new("install-user-files")
     {
         return if arguments.len() == 3
             && arguments[1] == OsStr::new("--path")
             && !arguments[2].is_empty()
         {
             let path = arguments[2].clone();
-            Ok(if command == OsStr::new("prepare-install-path") {
+            Ok(if command == OsStr::new("check-user-install-path") {
+                CliCommand::CheckUserInstallPath { path }
+            } else if command == OsStr::new("install-user-files") {
+                CliCommand::InstallUserFiles { path }
+            } else if command == OsStr::new("prepare-install-path") {
                 CliCommand::PrepareInstallPath { path }
             } else {
                 CliCommand::CheckInstallPath { path }

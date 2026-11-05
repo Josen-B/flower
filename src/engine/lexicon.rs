@@ -9,11 +9,35 @@ const BUILTIN_LEXICON: &str = concat!(
     include_str!("../../data/pinyin/phrases/phrase_lexicon.tsv"),
 );
 
+// Project-maintained everyday vocabulary, NOT corpus frequency or new readings.
+// Only existing canonical, multi-syllable entries are classified at builtin load.
+const EVERYDAY_WORDS: &str = "\
+你好 您好 谢谢 再见 我们 你们 他们 什么 怎么 为什么 可以 需要 知道 喜欢 \
+今天 明天 现在 时间 工作 学习 电脑 手机 输入法 中国 大家 自己 一个 这个 那个 \
+这些 那些 这里 那里 这样 那样 多少 时候 已经 还是 因为 所以 如果 但是 而且 \
+一起 一直 一定 可能 应该 没有 不是 不要 不能 不好 非常 真的 觉得 希望 \
+朋友 家人 孩子 老师 学生 学校 公司 生活 世界 北京 上海 早上 晚上 下午 上午 \
+中午 昨天 以后 以前 开始 结束 继续 等待 帮助 问题 事情 方法 结果 消息 电话 \
+地址 名字 号码 邮件 文件 软件 系统 网络 网站 密码 设置 打开 关闭 保存 选择 \
+使用 安装 更新 语言 中文 拼音 文字 音乐 电影 游戏 天气 快乐 高兴 开心 健康 \
+安全 吃饭 喝水 回家 出门 上班 下班 休息 睡觉 购买 价格 生日 欢迎 对不起 \
+没关系 不客气 请问";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LexiconEntry {
     text: String,
     weight: u32,
     reading: String,
+    everyday: bool,
+}
+
+fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering {
+    right
+        .everyday
+        .cmp(&left.everyday)
+        .then_with(|| right.weight.cmp(&left.weight))
+        .then_with(|| left.text.cmp(&right.text))
+        .then_with(|| left.reading.cmp(&right.reading))
 }
 
 /// A deterministic, exact-match Pinyin lexicon.
@@ -33,7 +57,23 @@ impl Lexicon {
     /// Loads the shared single-character base and core phrases embedded at build time.
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
-            .get_or_init(|| Self::from_tsv(BUILTIN_LEXICON))
+            .get_or_init(|| {
+                let mut lexicon = Self::from_tsv(BUILTIN_LEXICON)?;
+                let words: std::collections::HashSet<_> =
+                    EVERYDAY_WORDS.split_whitespace().collect();
+                let entries = Arc::make_mut(&mut lexicon.entries);
+                for candidates in entries.values_mut() {
+                    for entry in candidates.iter_mut() {
+                        let syllables = entry.reading.split('\'').count();
+                        entry.everyday = syllables >= 2
+                            && syllables == entry.text.chars().count()
+                            && words.contains(entry.text.as_str());
+                    }
+                    candidates.sort_by(rank_entries);
+                }
+                lexicon.initials = Arc::new(Self::build_initials(entries));
+                Ok(lexicon)
+            })
             .clone()
     }
 
@@ -113,6 +153,7 @@ impl Lexicon {
                     text: text.to_owned(),
                     weight,
                     reading: key.to_owned(),
+                    everyday: false,
                 });
         }
 
@@ -131,12 +172,7 @@ impl Lexicon {
             });
             candidates
                 .dedup_by(|left, right| left.text == right.text && left.reading == right.reading);
-            candidates.sort_by(|left, right| {
-                right
-                    .weight
-                    .cmp(&left.weight)
-                    .then_with(|| left.text.cmp(&right.text))
-            });
+            candidates.sort_by(rank_entries);
         }
 
         Ok(Self {
@@ -158,12 +194,7 @@ impl Lexicon {
             initials.entry(key).or_default().push(entry.clone());
         }
         for words in initials.values_mut() {
-            words.sort_by(|a, b| {
-                b.weight
-                    .cmp(&a.weight)
-                    .then_with(|| a.text.cmp(&b.text))
-                    .then_with(|| a.reading.cmp(&b.reading))
-            });
+            words.sort_by(rank_entries);
         }
         initials
     }
@@ -222,12 +253,7 @@ impl Lexicon {
                     entries.push(addition.clone());
                 }
             }
-            entries.sort_by(|a, b| {
-                b.weight
-                    .cmp(&a.weight)
-                    .then_with(|| a.text.cmp(&b.text))
-                    .then_with(|| a.reading.cmp(&b.reading))
-            });
+            entries.sort_by(rank_entries);
         }
         result.initials = Arc::new(Self::build_initials(table));
         Ok(result)
@@ -250,7 +276,7 @@ impl Lexicon {
                         .weight
                         .saturating_add(count.saturating_mul(512).min(8192));
                 }
-                entries.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+                entries.sort_by(rank_entries);
             }
         }
         result.initials = Arc::new(Self::build_initials(table));
@@ -319,6 +345,74 @@ impl Lexicon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn everyday_layer_only_classifies_existing_builtin_words_without_changing_weights() {
+        let raw = Lexicon::from_tsv(BUILTIN_LEXICON).unwrap();
+        let builtin = Lexicon::builtin().unwrap();
+        assert_eq!(raw.len(), builtin.len());
+        let mut classified = std::collections::HashSet::new();
+        for (key, entries) in raw.entries.iter() {
+            let ranked = &builtin.entries[key];
+            assert_eq!(entries.len(), ranked.len());
+            for entry in entries {
+                let actual = ranked
+                    .iter()
+                    .find(|e| e.text == entry.text && e.reading == entry.reading)
+                    .unwrap();
+                assert_eq!(actual.weight, entry.weight);
+                assert!(!entry.everyday, "custom TSV must remain unclassified");
+                if actual.everyday {
+                    assert!(actual.reading.contains('\''));
+                    assert_eq!(
+                        actual.reading.split('\'').count(),
+                        actual.text.chars().count()
+                    );
+                    classified.insert(actual.text.clone());
+                }
+            }
+            assert!(ranked
+                .windows(2)
+                .all(|w| !rank_entries(&w[0], &w[1]).is_gt()));
+        }
+        assert!(
+            (80..=150).contains(&classified.len()),
+            "{}",
+            classified.len()
+        );
+        for words in builtin.initials.values() {
+            assert!(words
+                .windows(2)
+                .all(|w| !rank_entries(&w[0], &w[1]).is_gt()));
+        }
+    }
+
+    #[test]
+    fn builtin_snapshots_keep_classes_and_user_weights_separate() {
+        let base = Lexicon::builtin().unwrap();
+        let before = base.lookup("nihao");
+        let overlay = base
+            .with_overlay("ni'hao\t你好\t4294967295\nni'hao\t私词\t4294967295")
+            .unwrap();
+        let entries = &overlay.entries["nihao"];
+        let hello = entries.iter().find(|e| e.text == "你好").unwrap();
+        let private = entries.iter().find(|e| e.text == "私词").unwrap();
+        assert!(hello.everyday);
+        assert!(!private.everyday);
+        assert_eq!(hello.weight, u32::MAX);
+        assert_eq!(private.weight, u32::MAX);
+        assert_eq!(overlay.lookup("nihao")[0].text, "你好");
+        let learned = overlay.with_learning(&[(
+            super::super::LearningEvent {
+                pinyin: "ni'hao".into(),
+                text: "私词".into(),
+            },
+            u32::MAX,
+        )]);
+        assert_eq!(learned.entries["nihao"], overlay.entries["nihao"]);
+        assert_eq!(base.lookup("nihao"), before);
+        assert_eq!(Lexicon::builtin().unwrap().lookup("nihao"), before);
+    }
 
     #[test]
     fn builtin_and_clones_share_the_read_only_table() {

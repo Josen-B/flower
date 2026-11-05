@@ -5,7 +5,7 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 
 # Flower 词库数据流程
 
-先读 `design/lexicon-and-input.md`、`docs/plans/2026-11-04-lexicon-and-input.md` 及当前 `data/pinyin/sources/manifest.json`。以实际阶段和共享行为契约为准，不因数据量扩大就宣称整句输入或用户学习已实现。
+先读当前 `design/input-and-installation.md`、`docs/distribution.md` 及 `data/pinyin/sources/manifest.json`。历史设计若已不存在，不依据旧摘要恢复。以实际阶段和共享行为契约为准，不因数据量扩大就宣称整句输入或用户学习已实现。
 
 ## 来源与许可
 
@@ -44,7 +44,8 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 - 当前契约见 `design/input-and-installation.md`。单字使用固定 jieba 快照的精确文字频率，并在优先读音/其他基线读音/扩展读音三档内压缩排序；不要直接让文字总频率跨读音档，否则 `yi` 的“也”等次读音可能压过“一”。来源与许可损坏须失败关闭，coverage 和包校验同步；完整读音及分页候选不截断。
 - 内置表不再叠加 MVP 演示权重，MVP 仅供小 fixture 和审计。已声明无解的测试输入可能因简拼获得真实候选（例如 `xyz`），用明确小词典测试无解契约，不删除候选或放宽断言。
 - 简拼仅规范分音词条的每音节首个 ASCII 字母，至少两音节且每字一音节；预建共享索引，overlay/learning 后同步，按键不扫描全表。不猜连写演示词、不默认混拼或缩写组句。实际消耗用缩写 raw 长度，显示/学习保留 canonical reading。
-- 真实词频可能让 `nh` 的“你好”不是首项；验证它可翻页选择并正确提交，不用手工硬编码示例权重冒充统计质量。完整全拼/组合在简拼之前，简拼在部分前缀之前。
+- 0.4.1 增加用户已选择的项目日常词优先层，只分类真实既有规范词条，明确不是统计频率，不改 weight 也不造读音。分类、overlay、learning、initial 索引排序须同步；自定义 from_tsv fixture 仍按权重。优先层会影响高权重私词与日常词之间的顺序，更新测试时须保留私词可达、weight不变和快照隔离断言，不简单删除旧断言。
+- 0.4.1 候选顺序为完整全拼→整词简拼→完整组合→部分前缀，防组合字串挤在真实简拼词之前。`nh/wm/sm/ky/zg/xx` 可用真实内置表检验常用词首屏，不给不存在的词补造读音。优先层与实际词频证据应分开报告，不冒充无偏质量基准。
 - `tests/common_ranking.rs` 覆盖真实内置排序和简拼，`tests/pinyin_sentence.rs`、`tests/lexicon_quality.rs` 覆盖状态与快照一致性；原生 Context 回归可验证 NH 到“你好”的编辑路径，仍不证明实机激活。
 
 ## 最小充分验证

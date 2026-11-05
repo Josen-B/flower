@@ -5,7 +5,7 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 # Flower Windows 验证
 
-先读 `docs/distribution.md`、`docs/windows-validation.md` 和 `design/windows-diagnostics.md`，以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
+先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
 
 ## 环境与构建
 
@@ -54,6 +54,14 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 当前目录策略契约见 `design/input-and-installation.md`。不要把缺失目标的最近已有祖先当作安装根严格检查；允许无关兄弟创建/属性写入，但拒绝普通目录删除、子项删除及改 DACL/owner。已验证的本地固定卷根不可像普通目录删除，非严格祖先检查仅可忽略根本身 DELETE，不忽略 FILE_DELETE_CHILD 或权限接管；不把此例外应用到子目录。
 - `check-install-path` 始终只读；`prepare-install-path` 是显式管理员写操作。后者仅对缺失组件用创建时的受保护 SDDL，新建即可信 owner/管理员SYSTEM全控/Users RX，保留禁止删除共享句柄后复查；不先创建可写目录再收紧，不修复已有对象，不自动改 D 盘根或父目录 ACL。同名竞争失败，不递归清理未知内容。
 - 安装器必须在旧注册/目录冲突及运行库门禁后、复制前 prepare/check。只读新路径检查通过不代表管理员创建/向导安装成功；完整许可和源ZIP核验也不等于运行期安装验收。新制品仍不得自动运行。
+
+## 0.4.1 分组件安装与候选窗
+
+- 深层用户目录与机器 DLL 分离：系统载荷、公共入口及卸载器固定 commonpf64 Flower；自选目录仅固定用户文件副本。不得把关闭祖先 ACL 门禁或改已有父 owner 当作深路径支持。向导明确两种位置，ExecAsOriginalUser 从已核对安全载荷运行 helper，helper 查询 token 失败/提升均拒绝，不回退提升复制。
+- install_user_files 的非提升检查、严格 source 检查、目标 guard 不能被 private copy helper 抽取绕过。固定文件 create_new、独占句柄、sync，失败仅通过本次持有句柄标记删除。源/目标 guard 覆盖复制及回滚，卸载不递归清理可替换用户树。
+- `isolated_user_copy_` 五项测试默认忽略，必须使用本 Thread 的 `FLOWER_INSTALL_PATH_TEST_SCRATCH` 显式运行 `cargo test --lib isolated_user_copy_ -- --ignored`。只操作独占新建 fixture；提升进程在 I/O 前应明确失败，不以空 return 假通过。假 EXE 只当数据，不执行，不需要真实安装。
+- GetTextExt 无布局、clipped 和无效 RECT 是不同情况；有效 caret 可零宽但须正高度。编辑会话内优先文字位置，其次关联 view HWND 的 GUI caret，最后可用有效 viewport 边缘作粗锚，不能称精确 caret。焦点/token/revision 门禁不放宽；popup 普通 Z 序提升且 NOACTIVATE，非 TOPMOST。
+- 横向候选布局与绘制/命中同源，不画拼音头部或 comment；页大小可达99，不能沿用32项截断。极小区域整页退化无鼠标区域，保留键盘语义。截图/隔离几何测试均不替代 Edge 实机证据。
 
 ## 用户词典发布前进程终止回归
 

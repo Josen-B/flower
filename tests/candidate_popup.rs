@@ -361,7 +361,7 @@ fn dpi_scales_layout_and_narrow_bounds_clip_visible_area() {
 
     let narrow = CandidatePopupLayout::new(snapshot, 192, PopupSize::new(80, 90));
     assert_eq!(narrow.size, PopupSize::new(80, 90));
-    assert!(narrow.candidates.len() <= snapshot.candidates.len());
+    assert!(narrow.candidates.is_empty());
     assert_eq!(narrow.footer, None);
 }
 
@@ -434,6 +434,171 @@ fn candidate_rows_without_footer_remain_fully_visible_and_hittable() {
             revision: snapshot.revision,
             page: snapshot.page,
             index: 1,
+        })
+    );
+}
+
+fn assert_all_cells_hittable(
+    snapshot: &flower::platform::CandidatePopupSnapshot,
+    layout: &CandidatePopupLayout,
+) {
+    assert_eq!(layout.preedit, PopupRect::new(0, 0, 0, 0));
+    assert_eq!(layout.candidates.len(), snapshot.candidates.len());
+    for (index, cell) in layout.candidates.iter().enumerate() {
+        assert!(cell.is_visible());
+        assert!(cell.left >= 0 && cell.top >= 0);
+        assert!(cell.right <= layout.size.width && cell.bottom <= layout.size.height);
+        for point in [
+            PopupPoint {
+                x: cell.left,
+                y: cell.top,
+            },
+            PopupPoint {
+                x: cell.right - 1,
+                y: cell.bottom - 1,
+            },
+        ] {
+            assert_eq!(
+                layout.hit_test(snapshot, point),
+                Some(CandidatePopupAction::Select {
+                    revision: snapshot.revision,
+                    page: snapshot.page,
+                    index,
+                })
+            );
+        }
+        for other in &layout.candidates[..index] {
+            assert!(
+                cell.right <= other.left
+                    || other.right <= cell.left
+                    || cell.bottom <= other.top
+                    || other.bottom <= cell.top
+            );
+        }
+        if let Some(footer) = layout.footer {
+            assert!(cell.bottom <= footer.top);
+        }
+    }
+}
+
+#[test]
+fn horizontal_order_wrap_and_every_supported_page_size_remain_hittable() {
+    for count in 1..=99 {
+        let candidates = vec![("词", "ci"); count];
+        let mut model = CandidatePopupModel::new();
+        model.apply_update(&popup_update("ci", &candidates, Some(count - 1), 1, 3));
+        let snapshot = model.snapshot().expect("page snapshot");
+        let layout = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
+        assert_all_cells_hittable(snapshot, &layout);
+        for cells in layout.candidates.windows(2) {
+            if cells[0].top == cells[1].top {
+                assert_eq!(cells[0].right, cells[1].left);
+            } else {
+                assert_eq!(cells[0].bottom, cells[1].top);
+                assert_eq!(cells[1].left, layout.candidates[0].left);
+            }
+        }
+        if count == 99 {
+            assert!(layout.candidates.last().unwrap().top > layout.candidates[0].top);
+            let doubled = CandidatePopupLayout::new(snapshot, 192, PopupSize::new(1600, 1200));
+            assert_all_cells_hittable(snapshot, &doubled);
+            assert_eq!(doubled.size.width, layout.size.width * 2);
+            assert_eq!(doubled.size.height, layout.size.height * 2);
+            for (normal, high_dpi) in layout.candidates.iter().zip(&doubled.candidates) {
+                assert_eq!(
+                    *high_dpi,
+                    PopupRect::new(
+                        normal.left * 2,
+                        normal.top * 2,
+                        normal.right * 2,
+                        normal.bottom * 2,
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn preedit_and_canonical_comments_do_not_affect_geometry_or_snapshot_data() {
+    let model = display_model();
+    let original = model.snapshot().unwrap();
+    let mut changed = original.clone();
+    changed.preedit = "raw'pinyin".repeat(100);
+    for candidate in &mut changed.candidates {
+        candidate.comment = "canonical'pronunciation".repeat(100);
+    }
+    let before = changed.clone();
+    for dpi in [96, 144, 192] {
+        let bounds = PopupSize::new(800, 600);
+        let layout = CandidatePopupLayout::new(&changed, dpi, bounds);
+        assert_eq!(layout, CandidatePopupLayout::new(original, dpi, bounds));
+        assert_all_cells_hittable(&changed, &layout);
+    }
+    assert_eq!(changed, before);
+}
+
+#[test]
+fn long_cells_are_bounded_and_wrap_without_losing_candidates() {
+    let mut model = CandidatePopupModel::new();
+    model.apply_update(&popup_update(
+        "long",
+        &[("长词", ""), ("short", ""), ("很长的候选词组", "")],
+        Some(2),
+        1,
+        3,
+    ));
+    let mut snapshot = model.snapshot().unwrap().clone();
+    snapshot.candidates[0].text = "长".repeat(1000);
+    let layout = CandidatePopupLayout::new(&snapshot, 96, PopupSize::new(340, 600));
+    assert_all_cells_hittable(&snapshot, &layout);
+    assert_eq!(layout.candidates[0].width(), 240);
+    assert!(layout.candidates[1].top > layout.candidates[0].top);
+
+    for dpi in [96, 144, 192] {
+        let narrow = CandidatePopupLayout::new(&snapshot, dpi, PopupSize::new(160, 600));
+        assert_all_cells_hittable(&snapshot, &narrow);
+        assert!(narrow.candidates.iter().all(|cell| cell.width() < 160));
+    }
+}
+
+#[test]
+fn insufficient_width_or_total_height_hides_the_whole_page_and_footer() {
+    let model = page_model(1, 3);
+    let snapshot = model.snapshot().unwrap();
+    let normal = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
+    for bounds in [
+        PopupSize::new(1, 1),
+        PopupSize::new(30, 600),
+        PopupSize::new(800, normal.size.height - 1),
+        PopupSize::new(70, 97),
+    ] {
+        let layout = CandidatePopupLayout::new(snapshot, 96, bounds);
+        assert!(layout.size.width <= bounds.width && layout.size.height <= bounds.height);
+        assert_eq!(layout.preedit, PopupRect::new(0, 0, 0, 0));
+        assert!(layout.candidates.is_empty());
+        assert_eq!(layout.footer, None);
+        assert_eq!(layout.previous_page, None);
+        assert_eq!(layout.next_page, None);
+        assert_eq!(layout.page_label, None);
+        for x in 0..layout.size.width {
+            for y in 0..layout.size.height {
+                assert_eq!(layout.hit_test(snapshot, PopupPoint { x, y }), None);
+            }
+        }
+    }
+    let exact = CandidatePopupLayout::new(snapshot, 96, normal.size);
+    assert_all_cells_hittable(snapshot, &exact);
+    assert_eq!(exact, normal);
+    assert_eq!(
+        model.accept_action(&CandidatePopupAction::Select {
+            revision: snapshot.revision,
+            page: snapshot.page,
+            index: 1,
+        }),
+        Ok(AcceptedCandidateAction::Select {
+            page: snapshot.page,
+            index: 1
         })
     );
 }

@@ -46,8 +46,9 @@ mod windows_exports {
     use windows::core::{implement, AsImpl, Error, IUnknown, Interface, Result, GUID, HRESULT};
     use windows::Win32::Foundation::{
         BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER,
-        E_UNEXPECTED, FALSE, LPARAM, RECT, S_FALSE, S_OK, TRUE, WPARAM,
+        E_UNEXPECTED, FALSE, LPARAM, POINT, RECT, S_FALSE, S_OK, TRUE, WPARAM,
     };
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -59,6 +60,9 @@ mod windows_exports {
         ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_AE_NONE, TF_ANCHOR_END,
         TF_ES_ASYNC, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
         TF_SELECTIONSTYLE,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, IsChild, GUITHREADINFO,
     };
     use windows_core::{ComObjectInterface, IUnknownImpl};
 
@@ -814,23 +818,147 @@ mod windows_exports {
         composition: &ITfComposition,
         edit_cookie: u32,
     ) -> Option<RECT> {
-        // SAFETY: The context, composition, and queried range are live TSF
-        // objects owned by the current edit session. `GetTextExt` only reads
-        // layout information, and `rect`/`clipped` are valid output storage
-        // for the duration of the call.
+        // All TSF range and view queries stay inside the current edit session.
+        // A layout miss must not suppress otherwise valid candidates forever.
         unsafe {
-            let range = composition.GetRange().ok()?;
-            let collapsed = collapsed_range_end(&range, edit_cookie)?;
             let view: ITfContextView = context.GetActiveView().ok()?;
-            let mut rect = RECT::default();
-            let mut clipped = BOOL::default();
-            view.GetTextExt(edit_cookie, &collapsed, &mut rect, &mut clipped)
-                .ok()?;
-            if clipped.as_bool() {
-                return None;
+            if let Some(collapsed) = composition
+                .GetRange()
+                .ok()
+                .and_then(|range| collapsed_range_end(&range, edit_cookie))
+            {
+                let mut rect = RECT::default();
+                let mut clipped = BOOL::default();
+                let result = view.GetTextExt(edit_cookie, &collapsed, &mut rect, &mut clipped);
+                record_result(Stage::LayoutTextExt, &result);
+                if result.is_ok() {
+                    if clipped.as_bool() {
+                        return None;
+                    }
+                    if valid_caret_rect(rect) {
+                        return Some(rect);
+                    }
+                }
             }
-            Some(rect)
+            let viewport = view
+                .GetScreenExt()
+                .ok()
+                .filter(|r| r.right > r.left && r.bottom > r.top)?;
+            if let Some(rect) = gui_caret_for_view(&view, viewport) {
+                record(Stage::AnchorGui, S_OK);
+                return Some(rect);
+            }
+            record(Stage::AnchorView, S_OK);
+            viewport_edge_anchor(viewport)
         }
+    }
+
+    fn valid_caret_rect(rect: RECT) -> bool {
+        rect.right >= rect.left && rect.bottom > rect.top
+    }
+
+    fn viewport_edge_anchor(rect: RECT) -> Option<RECT> {
+        (rect.right > rect.left && rect.bottom > rect.top).then(|| RECT {
+            left: rect.left,
+            right: rect.left,
+            top: rect.bottom.saturating_sub(1),
+            bottom: rect.bottom,
+        })
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn caret_geometry_accepts_zero_width_but_never_empty_or_inverted_viewports() {
+        assert!(valid_caret_rect(RECT {
+            left: -20,
+            top: 10,
+            right: -20,
+            bottom: 26
+        }));
+        for rect in [
+            RECT::default(),
+            RECT {
+                left: 20,
+                top: 10,
+                right: 19,
+                bottom: 26,
+            },
+            RECT {
+                left: 20,
+                top: 10,
+                right: 22,
+                bottom: 10,
+            },
+        ] {
+            assert!(!valid_caret_rect(rect));
+        }
+        assert!(viewport_edge_anchor(RECT::default()).is_none());
+        assert!(viewport_edge_anchor(RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 200
+        })
+        .is_none());
+        let anchor = viewport_edge_anchor(RECT {
+            left: -1920,
+            top: -200,
+            right: -1000,
+            bottom: 600,
+        })
+        .unwrap();
+        assert_eq!(
+            (anchor.left, anchor.right, anchor.top, anchor.bottom),
+            (-1920, -1920, 599, 600)
+        );
+    }
+
+    unsafe fn gui_caret_for_view(view: &ITfContextView, viewport: RECT) -> Option<RECT> {
+        let window = view.GetWnd().ok()?;
+        if window.0.is_null() {
+            return None;
+        }
+        let thread = GetWindowThreadProcessId(window, None);
+        if thread == 0 {
+            return None;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        GetGUIThreadInfo(thread, &mut info).ok()?;
+        let caret_window = info.hwndCaret;
+        if caret_window.0.is_null()
+            || !(caret_window == window || IsChild(window, caret_window).as_bool())
+            || !(info.hwndFocus == window || IsChild(window, info.hwndFocus).as_bool())
+        {
+            return None;
+        }
+        let mut top_left = POINT {
+            x: info.rcCaret.left,
+            y: info.rcCaret.top,
+        };
+        let mut bottom_right = POINT {
+            x: info.rcCaret.right,
+            y: info.rcCaret.bottom,
+        };
+        if !ClientToScreen(caret_window, &mut top_left).as_bool()
+            || !ClientToScreen(caret_window, &mut bottom_right).as_bool()
+        {
+            return None;
+        }
+        let rect = RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        };
+        (valid_caret_rect(rect)
+            && rect.left >= viewport.left
+            && rect.right <= viewport.right
+            && rect.top >= viewport.top
+            && rect.bottom <= viewport.bottom)
+            .then_some(rect)
     }
 
     /// Clones a range and collapses it to its end for caret positioning.

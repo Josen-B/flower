@@ -56,6 +56,29 @@ fn initial_candidates(lexicon: Lexicon, raw: &str) -> Vec<flower::Candidate> {
 }
 
 #[test]
+fn builtin_daily_words_precede_non_daily_initial_collisions_without_dropping_them() {
+    let builtin = Lexicon::builtin().unwrap();
+    let before = initial_candidates(builtin.clone(), "nh");
+    let overlay = builtin
+        .with_overlay("ni'hao\t私词\t4294967295\nni'hao\t你好\t1")
+        .unwrap();
+    let candidates = initial_candidates(overlay, "nh");
+    let hello = candidates.iter().position(|c| c.text == "你好").unwrap();
+    let private = candidates.iter().position(|c| c.text == "私词").unwrap();
+    assert!(hello < 9);
+    assert!(hello < private);
+    assert_eq!(candidates[hello].comment, "ni'hao");
+    assert_eq!(candidates[private].comment, "ni'hao");
+    for original in &before {
+        assert!(candidates.contains(original), "lost {original:?}");
+    }
+    assert_eq!(
+        initial_candidates(Lexicon::builtin().unwrap(), "nh"),
+        before
+    );
+}
+
+#[test]
 fn initials_rank_same_reading_words_and_refresh_each_immutable_snapshot() {
     let base = Lexicon::from_tsv("ni'hao\t你好\t1000\nni'hao\t拟好\t900").unwrap();
     let base_candidates = initial_candidates(base.clone(), "nh");
@@ -93,7 +116,13 @@ fn embedded_initials_include_hello_and_overlay_does_not_pollute_builtin() {
         .iter()
         .any(|c| c.text == "你好" && c.comment == "ni'hao"));
     let overlay = builtin.with_overlay("ni'hao\t私词\t4294967295").unwrap();
-    assert_eq!(initial_candidates(overlay, "nh")[0].text, "私词");
+    let candidates = initial_candidates(overlay, "nh");
+    let hello = candidates.iter().position(|c| c.text == "你好").unwrap();
+    let private = candidates.iter().position(|c| c.text == "私词").unwrap();
+    assert!(hello < private);
+    assert_eq!(candidates[private].comment, "ni'hao");
+    assert!(!before.iter().any(|c| c.text == "私词"));
+    assert_eq!(initial_candidates(builtin, "nh"), before);
     assert_eq!(
         initial_candidates(Lexicon::builtin().unwrap(), "nh"),
         before

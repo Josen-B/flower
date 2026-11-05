@@ -1,4 +1,81 @@
-# Flower 0.4.0 验证记录
+# Flower Windows 验证记录
+
+## 0.4.1：深层目录、横排候选与输入兼容改进
+
+用户确认 0.4.0 可在 `D:\Flower` 安装，但已有 `D:\software` 下拒绝；记事本显示
+候选，Edge/其他软件未显示。此轮只递增补丁版本 0.4.1；以后无明确要求不升级大版本。
+基线 `d6839a76b3d48b3bb07b56c739e955b8bad5d6a7`，未执行 Git 写操作。
+
+### 改动与决策
+
+- 深层路径不是层数限制：已有父目录可能由普通用户拥有，并允许删除/替换。
+  用户将推荐方案交由根选择，采用分组件布局。DLL、注册工具、卸载器及公共入口
+  固定在 Program Files 的安全位置；用户文件目录可选正常本地盘深层路径。
+  用户副本由 `ExecAsOriginalUser` 调用经核对的系统 helper 部署，提升令牌拒绝，
+  无管理员写入用户可替换目录的兜底，不修改已有父 ACL/owner。
+- `+`/`=`/小键盘加号下一页，`-`/小键盘减号上一页；Shift+- 不吞下划线，
+  Ctrl/Alt/Win 和非组词直通。保留既有 PageUp/PageDown 和候选导航。
+- 候选按行从左至右排列、空间不足换行；不绘制拼音头部及读音注释，文档预编辑仍在。
+  移除 32 项静默截断，覆盖页大小 1–99；极小空间整页退化，键盘操作继续有效。
+- 布局查询失败/无效时尝试与 view 关联的 GUI caret，再以有效 viewport 边缘作粗锚；
+  clipped 与无效视图仍隐藏。仅在编辑会话查询，保留焦点、激活、revision 门禁。
+  显示提升普通 Z 序，不设永久置顶、不抢焦点。这是已知缺口修正，未复现用户 Edge 现场。
+- 用户选择日常词整体优化：135 个项目维护词中 132 个匹配已有真实词条，使用独立
+  日常优先层，不改数据 weight、不造读音。全拼、整词简拼、组合、部分前缀依次显示；
+  真实内置 `nh/wm/sm/ky/zg/xx` 的目标词均在默认九项首屏并可正确提交。
+  该层不是语料频率，不是无偏准确率基准；同层仍按原词频稳定排序。
+
+### 自动验证
+
+- 集中 Rust 150 项通过：库54（含几何、SDDL及原生TSF编辑），CLI3、候选22、
+  常用排序2、router5、质量5、翻页2、句子15、拼音17、注册25。
+- 后续将固定用户文件复制抽为私有函数，真实入口仍保留非提升、可信源与目标 guard。
+  显式运行默认忽略的五项隔离 I/O 检查：深层创建及内容一致、拒绝覆盖、后续源缺失
+  回滚、文件竞争、目录竞争，5 passed（0.35 s）；重解析属性纯内存检查另1项通过。
+  仅操作当前 Thread scratch 下自有 fixture，假 EXE 不执行，提升进程会在 I/O 前失败。
+- 严格全目标 Clippy、格式检查通过。Python installer 21 项通过；未改数据转换或
+  package 逻辑，不重复执行无关全套。旧 LNK4104 PRIVATE 导出链接告警仍在。
+- 横排/翻页/定位独立静态审查通过；分组件初版审查与最终私有复制增量补审通过。
+  旧冻结批准没有外推为新版本补验通过。
+
+主要入口：
+
+```powershell
+cargo test --locked --lib --bin flower-register --bin flower-settings --test candidate_popup --test common_ranking --test engine_router --test lexicon_quality --test pinyin_sentence --test pinyin_session --test paging_keys --test registration
+# FLOWER_INSTALL_PATH_TEST_SCRATCH 须指向当前 Thread 的 scratch
+cargo test --locked --lib isolated_user_copy_ -- --ignored
+cargo test --locked --lib user_directory_reparse_attributes_are_rejected_without_creating_links
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --all -- --check
+python -m unittest scripts.test_installer -v
+```
+
+### 0.4.1 制品核验
+
+真实 MSVC、Inno Setup 6.7.3 构建成功，版本资源 0.4.1，仍为 NotSigned。
+
+| 文件 | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `flower-0.4.1-windows-x64.zip` | 3,176,172 | `e787702afcb771eb46af576c2a0f9c387b43097e265d696510779c0bd1523209` |
+| `flower-0.4.1-windows-x64-setup.exe` | 3,355,568 | `f380a62c4624a1913c4b8125284337f29dfd92b9cb13a58eefb7ed1a77287b42` |
+
+85 个 payload（含 SHA256SUMS）、内外哈希、源ZIP关联、许可、README快照、
+DLL内嵌本次base/core且不嵌optional、两个help、Unicode输出与非法标量拒绝、
+三个PE共27张图标均核验。旧0.3.0、0.4.0 ZIP/EXE哈希保持不变。
+
+真实新包的 `check-user-install-path` 接受
+`D:\software\Flower-0.4.1-readonly-check\deep\more`，检查前后目标均不存在。
+机器路径检查仍正确拒绝卷根、UNC和Windows系统树。
+未运行安装器、prepare、register或真实用户词典命令。
+
+### 尚未覆盖
+
+另一台机器的完整安装/卸载、另一账户提升的原始用户部署、实际 Edge 和其他宿主的候选
+显示、字体/主题/DPI、真实 scope/学习与远端 CI 均未验收；分组件方案的系统DLL实际位于
+Program Files，不能将深层用户副本目录描述为DLL安装位置。没有关闭用户应用、注销、
+改默认输入法、已有ACL、注册或真实用户数据。保留后续实机反馈门槛，不宣称正式发行通过。
+
+## 以下为 0.4.0 历史记录
 
 ## 用户反馈与本轮范围
 
