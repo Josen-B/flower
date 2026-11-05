@@ -379,6 +379,24 @@ impl PinyinSession {
         self.commit_literal()
     }
 
+    /// Commit the complete original spelling, including selected but uncommitted segments.
+    /// Explicit literal conversion never creates learning or ranking events.
+    pub fn commit_raw(&mut self) -> CompositionUpdate {
+        if !self.is_composing() {
+            return self.snapshot(false);
+        }
+        let text = self
+            .confirmed
+            .iter()
+            .map(|segment| segment.raw.as_str())
+            .collect::<String>()
+            + &self.raw;
+        self.clear_composition();
+        let mut update = self.snapshot(true);
+        update.commit = Some(text);
+        update
+    }
+
     fn commit_literal(&mut self) -> Result<CompositionUpdate, EngineError> {
         let text = self
             .confirmed

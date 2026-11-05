@@ -29,6 +29,7 @@ ROOT_FILES = frozenset({
     "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "Cargo.lock",
     "manifest.json", "SHA256SUMS", "data/pinyin/mvp_lexicon.tsv",
     "data/pinyin/base_lexicon.tsv", "data/pinyin/coverage.json",
+    "data/pinyin/everyday_phrases.tsv", "data/pinyin/everyday_phrases.md",
     "data/pinyin/sources/manifest.json", "data/pinyin/sources/kMandarin_8105.txt",
     "data/pinyin/phrases/phrase_lexicon.tsv", "data/pinyin/phrases/proper_lexicon.tsv",
     "data/pinyin/phrases/coverage.json", "data/pinyin/phrases/manifest.json",

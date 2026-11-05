@@ -1,5 +1,123 @@
 use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 
+const EVERYDAY: &str = include_str!("../data/pinyin/everyday_phrases.tsv");
+
+fn phrase_rows() -> Vec<(&'static str, &'static str)> {
+    EVERYDAY
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].split('\'').count(), fields[1].chars().count());
+            assert_eq!(fields[2], "100");
+            (fields[0], fields[1])
+        })
+        .collect()
+}
+
+fn session_for(raw: &str) -> PinyinSession {
+    let mut session = PinyinSession::from_lexicon(Lexicon::builtin().unwrap(), 9).unwrap();
+    for letter in raw.chars() {
+        session
+            .process_key(KeyEvent::plain(Key::Char(letter)))
+            .unwrap();
+    }
+    session
+}
+
+fn select_phrase(mut session: PinyinSession, word: &str, reading: &str) {
+    for _ in 0..session.page_count() {
+        if let Some(index) = session
+            .candidates_on_current_page()
+            .iter()
+            .position(|c| c.text == word && c.comment == reading)
+        {
+            assert_eq!(
+                session.select_candidate(index).unwrap().commit.as_deref(),
+                Some(word)
+            );
+            return;
+        }
+        session.next_page().unwrap();
+    }
+    panic!("missing phrase {word} ({reading})");
+}
+
+#[test]
+fn every_project_phrase_has_exact_and_initial_candidates_with_canonical_reading() {
+    let lexicon = Lexicon::builtin().unwrap();
+    let rows = phrase_rows();
+    assert_eq!(rows.len(), 155);
+    let mut pairs = std::collections::HashSet::new();
+    for (reading, word) in rows {
+        assert!(pairs.insert((reading, word)));
+        let full = reading.replace('\'', "");
+        let exact = lexicon.lookup(&full);
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|c| c.text == word && c.comment == reading)
+                .count(),
+            1,
+            "{reading}: {word}"
+        );
+        let initials: String = reading
+            .split('\'')
+            .map(|s| s.chars().next().unwrap())
+            .collect();
+        select_phrase(session_for(&initials), word, reading);
+    }
+}
+
+#[test]
+fn representative_project_phrases_commit_full_and_initial_with_real_pagination() {
+    for (reading, word) in [
+        ("wo'ai'ni", "我爱你"),
+        ("bu'zhi'dao", "不知道"),
+        ("wan'shang'hao", "晚上好"),
+        ("qing'zai'shuo'yi'bian", "请再说一遍"),
+        ("ke'yi'shua'ka'ma", "可以刷卡吗"),
+    ] {
+        select_phrase(session_for(&reading.replace('\'', "")), word, reading);
+        let initials: String = reading
+            .split('\'')
+            .map(|s| s.chars().next().unwrap())
+            .collect();
+        select_phrase(session_for(&initials), word, reading);
+    }
+    let session = session_for("wan");
+    assert!(session
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "晚"));
+    assert!(session
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "万"));
+    assert!(!session
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "我爱你"));
+    select_phrase(session, "我爱你", "wo'ai'ni");
+}
+
+#[test]
+fn custom_fixture_and_overlay_do_not_pollute_builtin_project_phrases() {
+    let fixture = Lexicon::from_tsv("wo'ai'ni\t私词\t1000\n").unwrap();
+    assert!(!fixture.lookup("woaini").iter().any(|c| c.text == "我爱你"));
+    let original = Lexicon::builtin().unwrap();
+    let snapshot = original.with_overlay("wo'ai'ni\t私词\t1000\n").unwrap();
+    assert!(snapshot.lookup("woaini").iter().any(|c| c.text == "私词"));
+    assert!(!original.lookup("woaini").iter().any(|c| c.text == "私词"));
+    assert_eq!(snapshot.lookup("woaini")[0].text, "我爱你");
+    assert!(Lexicon::builtin()
+        .unwrap()
+        .lookup("woaini")
+        .iter()
+        .any(|c| c.text == "我爱你"));
+}
+
 #[test]
 fn builtin_mixed_sentence_is_on_the_first_page_without_a_sentence_entry() {
     let lexicon = Lexicon::builtin().unwrap();

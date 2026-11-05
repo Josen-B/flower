@@ -64,14 +64,14 @@ mod windows_impl {
     use windows::core::{Error as WindowsError, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
         COLORREF, ERROR_CLASS_ALREADY_EXISTS, ERROR_CLASS_DOES_NOT_EXIST, E_UNEXPECTED, HINSTANCE,
-        HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+        HMODULE, HWND, LPARAM, LRESULT, RECT, SIZE, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        GetMonitorInfoW, GetSysColor, InvalidateRect, MonitorFromRect, MonitorFromWindow,
-        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-        COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET,
-        DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W, InvalidateRect, MonitorFromRect,
+        MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
         OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
     };
@@ -1187,51 +1187,87 @@ mod windows_impl {
             .enumerate()
         {
             let mut row_rect = windows_rect(*row);
+            let line = format!("{}. {}", index + 1, candidate.text);
+            let (line, width) = fitted_candidate_text(hdc, &line, row.width());
             let highlighted = snapshot.highlighted == Some(index);
             if highlighted {
-                fill_rect(hdc, &row_rect, COLORREF(palette.highlight));
+                let highlight = candidate_highlight_rect(*row, width);
+                fill_rect(hdc, &highlight, COLORREF(palette.highlight));
                 set_text_color(hdc, COLORREF(palette.highlight_text));
             } else {
                 set_text_color(hdc, COLORREF(palette.text));
             }
 
-            let line = format!("{}. {}", index + 1, candidate.text);
             draw_text(
                 hdc,
                 &line,
                 &mut row_rect,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
-        }
-
-        set_text_color(hdc, COLORREF(palette.text));
-        for (button, label) in [(layout.previous_page, "-"), (layout.next_page, "+")] {
-            if let Some(button) = button {
-                let mut rect = windows_rect(button);
-                draw_text(
-                    hdc,
-                    label,
-                    &mut rect,
-                    DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-                );
-            }
-        }
-        if let Some(page_label_rect) = layout.page_label {
-            let mut page_label_rect = windows_rect(page_label_rect);
-            let page_label = format!(
-                "{}/{}",
-                snapshot.page.saturating_add(1),
-                snapshot.page_count
-            );
-            draw_text(
-                hdc,
-                &page_label,
-                &mut page_label_rect,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
             );
         }
 
         drop(font);
+    }
+
+    // Uses the currently selected paint font, not the engine's paging estimate.
+    fn measured_width(hdc: HDC, text: &str) -> Option<i32> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        if wide.is_empty() {
+            return Some(0);
+        }
+        let mut size = SIZE::default();
+        // SAFETY: The live DC and UTF-16 slice remain valid for this call.
+        (unsafe { GetTextExtentPoint32W(hdc, &wide, &mut size) }.as_bool() && size.cx >= 0)
+            .then_some(size.cx)
+    }
+
+    fn fitted_candidate_text(hdc: HDC, text: &str, available: i32) -> (String, i32) {
+        fit_candidate_text(text, available, |text| measured_width(hdc, text))
+    }
+
+    fn candidate_highlight_rect(cell: PopupRect, measured_width: i32) -> RECT {
+        RECT {
+            right: cell
+                .left
+                .saturating_add(measured_width.max(0))
+                .min(cell.right),
+            ..windows_rect(cell)
+        }
+    }
+
+    fn fit_candidate_text(
+        text: &str,
+        available: i32,
+        measure: impl Fn(&str) -> Option<i32>,
+    ) -> (String, i32) {
+        let available = available.max(0);
+        let Some(width) = measure(text).filter(|width| *width >= 0) else {
+            return (String::new(), 0);
+        };
+        if width <= available {
+            return (text.to_owned(), width);
+        }
+        // Only truncate display text, at Unicode scalar boundaries (never UTF-16 halves).
+        // Measure each final string, including its ellipsis, with the same font.
+        let mut ends: Vec<usize> = text.char_indices().map(|(offset, _)| offset).collect();
+        ends.push(text.len());
+        let mut low = 0;
+        let mut high = ends.len();
+        let mut best = (String::new(), 0);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let display = format!("{}...", &text[..ends[middle]]);
+            let Some(width) = measure(&display).filter(|width| *width >= 0) else {
+                return (String::new(), 0);
+            };
+            if width <= available {
+                best = (display, width);
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        best
     }
 
     fn system_popup_palette() -> PopupPalette {
@@ -1370,6 +1406,71 @@ mod windows_impl {
     fn scaled(value: i32, dpi: u32) -> i32 {
         let dpi = if dpi == 0 { BASE_DPI } else { dpi.min(480) };
         ((i64::from(value) * i64::from(dpi) + i64::from(BASE_DPI / 2)) / i64::from(BASE_DPI)) as i32
+    }
+    #[cfg(test)]
+    mod candidate_paint_tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+
+        #[test]
+        fn candidate_gdi_selected_font_fits_actual_display_including_ellipsis() {
+            // A memory DC only: no desktop input, window activation or user document.
+            let hdc = unsafe { CreateCompatibleDC(None) };
+            assert!(!hdc.is_invalid());
+            for dpi in [96, 144, 192, 480] {
+                let font = PaintFont::new(hdc, dpi).expect("selected production font");
+                let text = "1. 很长的候选文字😀";
+                let original = text.to_owned();
+                let full = measured_width(hdc, text).unwrap();
+                assert!(full > 0);
+                let roomy = full + scaled(30, dpi);
+                assert_eq!(
+                    fitted_candidate_text(hdc, text, roomy),
+                    (text.to_owned(), full)
+                );
+                for available in [0, 1, full / 2, full - 1, full, roomy] {
+                    let (display, width) = fitted_candidate_text(hdc, text, available);
+                    assert!(width >= 0 && width <= available);
+                    assert_eq!(measured_width(hdc, &display), Some(width));
+                    let cell = PopupRect::new(17, 8, 17 + available, 38);
+                    let highlight = candidate_highlight_rect(cell, width);
+                    assert_eq!(highlight.left, cell.left);
+                    assert_eq!(highlight.top, cell.top);
+                    assert_eq!(highlight.bottom, cell.bottom);
+                    assert_eq!(highlight.right, cell.left + width);
+                    assert!(highlight.right <= cell.right);
+                    if available == roomy {
+                        assert!(highlight.right < cell.right);
+                    }
+                    if !display.is_empty() && available < full {
+                        assert!(display.ends_with("..."));
+                        assert!(text.starts_with(display.trim_end_matches('.')));
+                    }
+                }
+                assert_eq!(text, original);
+                drop(font);
+            }
+            assert!(unsafe { DeleteDC(hdc) }.as_bool());
+        }
+
+        #[test]
+        fn candidate_measurement_failure_is_conservative() {
+            assert_eq!(
+                fit_candidate_text("1. 是", 50, |_| None),
+                (String::new(), 0)
+            );
+            assert_eq!(
+                fit_candidate_text("1. 是", 50, |_| Some(-1)),
+                (String::new(), 0)
+            );
+            assert_eq!(
+                fit_candidate_text("1. 是", 50, |text| (text == "1. 是").then_some(100)),
+                (String::new(), 0)
+            );
+            let cell = PopupRect::new(10, 8, 20, 38);
+            assert_eq!(candidate_highlight_rect(cell, i32::MAX).right, 20);
+            assert_eq!(candidate_highlight_rect(cell, -1).right, 10);
+        }
     }
 }
 

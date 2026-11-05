@@ -42,6 +42,11 @@ impl EngineRouter {
         self.session.process_key(event)
     }
 
+    /// Explicitly commit the original spelling without learning.
+    pub fn commit_raw(&mut self) -> CompositionUpdate {
+        self.session.commit_raw()
+    }
+
     /// Selects and commits a zero-based candidate from the current page.
     pub fn select_candidate(&mut self, index: usize) -> Result<CompositionUpdate, EngineError> {
         self.session.select_candidate(index)

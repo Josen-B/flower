@@ -213,7 +213,7 @@ fn matching_selection_and_paging_actions_are_accepted_without_mutating() {
 }
 
 #[test]
-fn layout_hit_test_covers_candidates_footer_and_rejects_non_actions() {
+fn layout_hit_test_preserves_cells_without_ghost_footer() {
     let model = page_model(1, 3);
     let snapshot = model.snapshot().expect("visible popup snapshot");
     let layout = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(800, 600));
@@ -250,71 +250,29 @@ fn layout_hit_test_covers_candidates_footer_and_rejects_non_actions() {
         })
     );
 
-    let previous = layout.previous_page.expect("middle page has previous");
-    assert_eq!(
-        layout.hit_test(
-            snapshot,
-            PopupPoint {
-                x: previous.left,
-                y: previous.top,
-            },
-        ),
-        Some(CandidatePopupAction::PreviousPage {
-            revision: snapshot.revision,
-            page: snapshot.page,
-        })
-    );
-    let next = layout.next_page.expect("middle page has next");
-    assert_eq!(
-        layout.hit_test(
-            snapshot,
-            PopupPoint {
-                x: next.left,
-                y: next.top,
-            },
-        ),
-        Some(CandidatePopupAction::NextPage {
-            revision: snapshot.revision,
-            page: snapshot.page,
-        })
-    );
-
-    let label = layout.page_label.expect("middle page has label");
-    assert_eq!(
-        layout.hit_test(
-            snapshot,
-            PopupPoint {
-                x: label.left,
-                y: label.top,
-            },
-        ),
-        None
-    );
+    assert_eq!(layout.footer, None);
+    assert_eq!(layout.previous_page, None);
+    assert_eq!(layout.next_page, None);
+    assert_eq!(layout.page_label, None);
+    assert_eq!(layout.size.height, 46);
+    for x in 0..layout.size.width {
+        for y in first_row.bottom..layout.size.height + 22 {
+            assert_eq!(layout.hit_test(snapshot, PopupPoint { x, y }), None);
+        }
+    }
 }
-
 #[test]
-fn boundary_pages_hide_unavailable_footer_actions() {
+fn boundary_pages_have_no_footer_but_keep_paging_validation() {
     let first = page_model(0, 2);
     let first_snapshot = first.snapshot().expect("first page");
     let first_layout = CandidatePopupLayout::new(first_snapshot, 96, PopupSize::new(800, 600));
     assert_eq!(first_layout.previous_page, None);
-    assert!(first_layout.next_page.is_some());
-    let first_footer = first_layout.footer.expect("first page has footer");
-    assert_eq!(
-        first_layout.hit_test(
-            first_snapshot,
-            PopupPoint {
-                x: first_footer.left,
-                y: first_footer.top,
-            },
-        ),
-        None
-    );
+    assert_eq!(first_layout.next_page, None);
 
     let last = page_model(1, 2);
     let last_snapshot = last.snapshot().expect("last page");
     let last_layout = CandidatePopupLayout::new(last_snapshot, 96, PopupSize::new(800, 600));
-    assert!(last_layout.previous_page.is_some());
+    assert_eq!(last_layout.previous_page, None);
     assert_eq!(last_layout.next_page, None);
 
     assert_eq!(
@@ -334,6 +292,29 @@ fn boundary_pages_hide_unavailable_footer_actions() {
             page_count: 2,
         })
     );
+}
+
+#[test]
+fn compact_height_and_no_footer_hold_on_every_page_and_dpi() {
+    for (dpi, height) in [(96, 46), (144, 69), (192, 92), (480, 230)] {
+        for page in 0..3 {
+            let model = page_model(page, 3);
+            let snapshot = model.snapshot().unwrap();
+            let layout = CandidatePopupLayout::new(snapshot, dpi, PopupSize::new(160, height));
+            assert_eq!(layout.size.height, height);
+            assert_all_cells_hittable(snapshot, &layout);
+            assert_eq!(layout.footer, None);
+            assert_eq!(layout.previous_page, None);
+            assert_eq!(layout.next_page, None);
+            assert_eq!(layout.page_label, None);
+            let body_bottom = layout.candidates[0].bottom;
+            for x in 0..layout.size.width {
+                for y in body_bottom..height + 22 {
+                    assert_eq!(layout.hit_test(snapshot, PopupPoint { x, y }), None);
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -359,51 +340,10 @@ fn dpi_scales_layout_and_narrow_bounds_clip_visible_area() {
     assert!(high_dpi.size.width > normal.size.width);
     assert!(high_dpi.size.height > normal.size.height);
 
-    let narrow = CandidatePopupLayout::new(snapshot, 192, PopupSize::new(80, 90));
-    assert_eq!(narrow.size, PopupSize::new(80, 90));
+    let narrow = CandidatePopupLayout::new(snapshot, 192, PopupSize::new(80, 91));
+    assert_eq!(narrow.size, PopupSize::new(80, 91));
     assert!(narrow.candidates.is_empty());
     assert_eq!(narrow.footer, None);
-}
-
-#[test]
-fn narrow_footer_buttons_do_not_overlap_and_both_remain_hittable() {
-    let model = page_model(1, 3);
-    let snapshot = model.snapshot().expect("visible popup snapshot");
-    let layout = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(70, 600));
-    let previous = layout.previous_page.expect("previous button fits");
-    let next = layout.next_page.expect("next button fits");
-
-    assert!(previous.right <= next.left);
-    assert_eq!(
-        layout.hit_test(
-            snapshot,
-            PopupPoint {
-                x: previous.left,
-                y: previous.top,
-            },
-        ),
-        Some(CandidatePopupAction::PreviousPage {
-            revision: snapshot.revision,
-            page: snapshot.page,
-        })
-    );
-    assert_eq!(
-        layout.hit_test(
-            snapshot,
-            PopupPoint {
-                x: next.right - 1,
-                y: next.top,
-            },
-        ),
-        Some(CandidatePopupAction::NextPage {
-            revision: snapshot.revision,
-            page: snapshot.page,
-        })
-    );
-
-    let tiny = CandidatePopupLayout::new(snapshot, 96, PopupSize::new(30, 600));
-    assert_eq!(tiny.previous_page, None);
-    assert_eq!(tiny.next_page, None);
 }
 
 #[test]

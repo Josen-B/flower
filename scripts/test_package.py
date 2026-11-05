@@ -262,6 +262,9 @@ class PackageFixture:
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(REPO_ROOT / "data/pinyin/phrases" / name, destination)
         shutil.copyfile(REPO_ROOT / "LICENSE-APACHE", self.repo / "LICENSE-APACHE")
+        for name in ("everyday_phrases.tsv", "everyday_phrases.md"):
+            shutil.copyfile(REPO_ROOT / "data/pinyin" / name,
+                            self.repo / "data/pinyin" / name)
         (self.repo / "Cargo.lock").write_text("# test lock\n", encoding="utf-8")
 
         self.target_dir = base / "custom target dir"
@@ -442,6 +445,38 @@ class PackageTests(unittest.TestCase):
                 flower_package._dictionary_bundle(self.fixture.repo)
             path.write_bytes(original)
 
+    def test_everyday_bundle_rejects_missing_invalid_count_hash_and_notice(self):
+        path = self.fixture.repo / "data/pinyin/everyday_phrases.tsv"
+        original = path.read_bytes()
+        cases = [
+            b"bad\tbad\t0\n",
+            b"\n".join(original.splitlines()[:-1]) + b"\n",
+            original + b"wo'ai'ni\tduplicate\t100\n",
+            original.replace(b"\t100", b"\t101", 1),
+            original.replace("我爱你".encode(), "我想你".encode(), 1),
+        ]
+        for data in cases:
+            with self.subTest(data=data[:60]):
+                path.write_bytes(data)
+                with self.assertRaises(flower_package.PackagingError):
+                    flower_package._everyday_bundle(self.fixture.repo)
+        path.write_bytes(original)
+        payload, record = flower_package._everyday_bundle(self.fixture.repo)
+        self.assertEqual(record["pairs"], 155)
+        self.assertEqual(record["sha256"], hashlib.sha256(original).hexdigest())
+        self.assertIn(record["notice_path"], payload)
+        path.unlink()
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._everyday_bundle(self.fixture.repo)
+        path.write_bytes(original)
+        notice = self.fixture.repo / "data/pinyin/everyday_phrases.md"
+        notice.write_text("missing attribution", encoding="utf-8")
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._everyday_bundle(self.fixture.repo)
+        notice.unlink()
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._everyday_bundle(self.fixture.repo)
+
     def test_phrase_bundle_rejects_changed_core_or_missing_sharealike_license(self):
         path = self.fixture.repo / "data/pinyin/phrases/phrase_lexicon.tsv"
         original = path.read_bytes()
@@ -562,6 +597,8 @@ class PackageTests(unittest.TestCase):
                 "manifest.json",
                 "SHA256SUMS",
                 "data/pinyin/mvp_lexicon.tsv",
+                "data/pinyin/everyday_phrases.tsv",
+                "data/pinyin/everyday_phrases.md",
                 "data/pinyin/base_lexicon.tsv",
                 "data/pinyin/coverage.json",
                 "data/pinyin/sources/manifest.json",
@@ -592,6 +629,12 @@ class PackageTests(unittest.TestCase):
             )
             manifest = json.loads(manifest_bytes)
             self.assertEqual(manifest["package"], "flower")
+            everyday = manifest["everyday_phrases"]
+            data = archive.read(result.zip_path.stem + "/" + everyday["path"])
+            self.assertEqual(everyday["pairs"], flower_package.EVERYDAY_COUNT)
+            self.assertEqual(everyday["sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(everyday["license"], "MIT")
+            self.assertIn("manual", everyday["weight_kind"])
             self.assertEqual(manifest["version"], "0.1.0")
             self.assertEqual(manifest["target"], "x86_64-pc-windows-msvc")
             self.assertFalse(manifest["distribution"]["authenticode_signed"])

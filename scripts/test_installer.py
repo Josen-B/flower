@@ -80,7 +80,8 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn('[arg] if arg == "--start-input-method"', cli)
         start = cli.split("fn start_input_method()", 1)[1].split("fn execute(", 1)[0]
         self.assertLess(start.index("require_non_elevated()?"), start.index("registration::enable()"))
-        self.assertLess(start.index("registration::enable()"), start.index("run_settings_app()"))
+        self.assertIn("registration::enable()", start)
+        self.assertNotIn("run_settings_app", start)
         self.assertIn("TokenIsElevated != 0", cli)
         self.assertIn('command(&["--start-input-method", "extra"]).is_err()', cli)
         self.assertIn('cfg(not(target_os = "windows"))', start)
@@ -178,6 +179,8 @@ class InstallerTests(unittest.TestCase):
     def test_valid_package_and_build_hashes_manifest_and_cleanup(self):
         verified = installer.verify_package(self.archive)
         self.assertEqual(verified.version, "0.1.0")
+        self.assertIn("data/pinyin/everyday_phrases.tsv", verified.payload)
+        self.assertIn("data/pinyin/everyday_phrases.md", verified.payload)
         result = self.build()
         self.assertEqual(self.calls, 1)
         digest = hashlib.sha256(result.executable.read_bytes()).hexdigest()

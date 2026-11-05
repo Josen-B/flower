@@ -62,6 +62,13 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 - 混输遍历每起点一次收集所有 prefix 终端；一次 decode 共用最多16384状态展开，单查询最多4096，不可对每 prefix 重置预算。整词 mixed 复用起点0结果，输出收集也有界；exact/initial 不因 mixed 预算耗尽被截断。用实际计数测试跨起点预算，不只断言返回向量长度。
 - release 固定 `lexicon_probe` 包含长密集输入，预算有界不等于时延可忽略。优化前后在未改负载下测量；图区只取少量边时不要先构建整批 Choice 再 take。延迟物化或有界取边必须保持原排名与完整整词候选，不以减少合法匹配隐瞒回退。
 
+## 项目人工常用短语
+
+- `data/pinyin/everyday_phrases.tsv` 是独立项目人工表，MIT、人工权重，不冒称上游语料统计或扩大CC-CEDICT core/proper数字。当前155条，与core重合20净增135，新增规范词对归日常层；重合项保留最高权重不累加。
+- 修改人工表须同步说明、打包固定数量/hash及manifest record，TSV以 `.gitattributes -text` 锁定字节。所有上游base/core/proper保持不可变；builtin、initial、mixed索引一致，自定义fixture不污染。
+- 包新增文件必须同步 `scripts/installer.py` 固定白名单与必需项，不只更新package生成器；不放宽任意路径。来源、MIT正文路径、独立数量/hash、SHA256SUMS和实际DLL嵌入均核验。
+- 全部条目exact lookup和initial session翻页提交与代表项full-session提交是不同证据，不扩大表述。缩写与合法全拼碰撞如wan，保留全拼层并验证后续页的我爱你，不把可达冒称首屏。
+
 ## 最小充分验证
 
 - 数据/转换：`python -m unittest scripts.test_lexicon -v`，`python scripts/build_lexicon.py --check`。

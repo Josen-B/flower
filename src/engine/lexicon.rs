@@ -7,10 +7,14 @@ const BUILTIN_LEXICON: &str = concat!(
     include_str!("../../data/pinyin/base_lexicon.tsv"),
     "\n",
     include_str!("../../data/pinyin/phrases/phrase_lexicon.tsv"),
+    "\n",
+    include_str!("../../data/pinyin/everyday_phrases.tsv"),
 );
 
+const EVERYDAY_PHRASES: &str = include_str!("../../data/pinyin/everyday_phrases.tsv");
+
 // Project-maintained everyday vocabulary, NOT corpus frequency or new readings.
-// Only existing canonical, multi-syllable entries are classified at builtin load.
+// Canonical multi-syllable entries are classified only at builtin load.
 const EVERYDAY_WORDS: &str = "\
 你好 您好 谢谢 再见 我们 你们 他们 什么 意思 怎么 为什么 可以 需要 知道 喜欢 \
 今天 明天 现在 时间 工作 学习 电脑 手机 输入法 中国 大家 自己 一个 这个 那个 \
@@ -112,20 +116,30 @@ impl SyllableTrie {
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
 
 impl Lexicon {
-    /// Loads the shared single-character base and core phrases embedded at build time.
+    /// Loads the shared base, core phrases and project-authored everyday phrases.
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
             .get_or_init(|| {
                 let mut lexicon = Self::from_tsv(BUILTIN_LEXICON)?;
                 let words: std::collections::HashSet<_> =
                     EVERYDAY_WORDS.split_whitespace().collect();
+                let phrases: std::collections::HashSet<_> = EVERYDAY_PHRASES
+                    .lines()
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .filter_map(|line| {
+                        let mut fields = line.split('\t');
+                        Some((fields.next()?, fields.next()?))
+                    })
+                    .collect();
                 let entries = Arc::make_mut(&mut lexicon.entries);
                 for candidates in entries.values_mut() {
                     for entry in candidates.iter_mut() {
                         let syllables = entry.reading.split('\'').count();
                         entry.everyday = syllables >= 2
                             && syllables == entry.text.chars().count()
-                            && words.contains(entry.text.as_str());
+                            && (words.contains(entry.text.as_str())
+                                || phrases
+                                    .contains(&(entry.reading.as_str(), entry.text.as_str())));
                     }
                     candidates.sort_by(rank_entries);
                 }
@@ -573,10 +587,28 @@ mod tests {
                 .windows(2)
                 .all(|w| !rank_entries(&w[0], &w[1]).is_gt()));
         }
-        assert!(
-            (80..=150).contains(&classified.len()),
-            "{}",
-            classified.len()
+        let expected: std::collections::HashSet<_> = EVERYDAY_WORDS
+            .split_whitespace()
+            .chain(
+                EVERYDAY_PHRASES
+                    .lines()
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| line.split('\t').nth(1).unwrap()),
+            )
+            .filter(|text| {
+                raw.entries.values().flatten().any(|entry| {
+                    entry.text == *text
+                        && entry.reading.contains('\'')
+                        && entry.reading.split('\'').count() == entry.text.chars().count()
+                })
+            })
+            .collect();
+        assert_eq!(
+            classified
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>(),
+            expected
         );
         for words in builtin.initials.values() {
             assert!(words

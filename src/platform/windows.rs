@@ -51,7 +51,7 @@ mod windows_exports {
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        GetKeyState, GetKeyboardState, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
     };
     use windows::Win32::UI::TextServices::{
         ITfComposition, ITfCompositionSink, ITfCompositionSink_Impl, ITfContext,
@@ -323,6 +323,10 @@ mod windows_exports {
         /// True while a key callback owns the synchronous edit session.
         /// Recursive key callbacks pass through instead of starting another.
         processing: bool,
+        english: bool,
+        shift: ShiftGesture,
+        context_generation: Rc<Cell<u64>>,
+        _thread_events: Option<ThreadEvents>,
         /// Immutable settings captured when this activation started.
         settings: Settings,
         lexicon: Lexicon,
@@ -335,8 +339,178 @@ mod windows_exports {
 
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
 
+    /// Tracks only a standalone physical Shift gesture; test callbacks never mutate it.
+    #[derive(Default)]
+    struct ShiftGesture {
+        pressed: Option<(u32, ContextKey, u64)>,
+        context_generation: u64,
+    }
+
+    fn shift_identity(key: usize, lparam: LPARAM) -> Option<u32> {
+        match key {
+            0xA0 => Some(0x2A),
+            0xA1 => Some(0x36),
+            0x10 => Some(((lparam.0 as usize >> 16) & 0xFF) as u32),
+            _ => None,
+        }
+    }
+
+    fn command_modifiers_down() -> bool {
+        [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(virtual_key_is_down)
+    }
+
+    fn keyboard_has_other_down(state: &[u8; 256]) -> bool {
+        state[0xA0] & state[0xA1] & 0x80 != 0
+            || state.iter().enumerate().any(|(key, value)| {
+                key >= 8 && !matches!(key, 0x10 | 0xA0 | 0xA1) && value & 0x80 != 0
+            })
+    }
+
+    fn other_keys_down() -> bool {
+        let mut state = [0; 256];
+        // Failure is not evidence of a standalone gesture.
+        unsafe { GetKeyboardState(&mut state) }.is_err() || keyboard_has_other_down(&state)
+    }
+
+    #[implement(windows::Win32::UI::TextServices::ITfThreadMgrEventSink)]
+    struct FocusInvalidator {
+        generation: Rc<Cell<u64>>,
+        owner_thread: ThreadId,
+        _registration: ObjectRegistration,
+    }
+
+    impl FocusInvalidator {
+        fn invalidate(&self) -> Result<()> {
+            if std::thread::current().id() != self.owner_thread {
+                return Err(E_UNEXPECTED.into());
+            }
+            self.generation.set(self.generation.get().wrapping_add(1));
+            Ok(())
+        }
+    }
+
+    impl windows::Win32::UI::TextServices::ITfThreadMgrEventSink_Impl for FocusInvalidator_Impl {
+        fn OnInitDocumentMgr(
+            &self,
+            _: Option<&windows::Win32::UI::TextServices::ITfDocumentMgr>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn OnUninitDocumentMgr(
+            &self,
+            _: Option<&windows::Win32::UI::TextServices::ITfDocumentMgr>,
+        ) -> Result<()> {
+            self.get_impl().invalidate()
+        }
+        fn OnSetFocus(
+            &self,
+            _: Option<&windows::Win32::UI::TextServices::ITfDocumentMgr>,
+            _: Option<&windows::Win32::UI::TextServices::ITfDocumentMgr>,
+        ) -> Result<()> {
+            self.get_impl().invalidate()
+        }
+        fn OnPushContext(&self, _: Option<&ITfContext>) -> Result<()> {
+            self.get_impl().invalidate()
+        }
+        fn OnPopContext(&self, _: Option<&ITfContext>) -> Result<()> {
+            self.get_impl().invalidate()
+        }
+    }
+
+    struct ThreadEvents {
+        source: windows::Win32::UI::TextServices::ITfSource,
+        cookie: u32,
+    }
+
+    impl ThreadEvents {
+        fn subscribe(manager: &ITfThreadMgr, generation: Rc<Cell<u64>>) -> Result<Self> {
+            use windows::Win32::UI::TextServices::ITfThreadMgrEventSink;
+            let source: windows::Win32::UI::TextServices::ITfSource = manager.cast()?;
+            let sink: ITfThreadMgrEventSink = FocusInvalidator {
+                generation,
+                owner_thread: std::thread::current().id(),
+                _registration: ObjectRegistration::new(),
+            }
+            .into();
+            let cookie = unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &sink) }?;
+            Ok(Self { source, cookie })
+        }
+    }
+
+    impl Drop for ThreadEvents {
+        fn drop(&mut self) {
+            let _ = unsafe { self.source.UnadviseSink(self.cookie) };
+        }
+    }
+
+    impl ShiftGesture {
+        fn down(
+            &mut self,
+            shift: Option<u32>,
+            repeat: bool,
+            command: bool,
+            context: ContextKey,
+            epoch: u64,
+        ) {
+            if repeat && shift.is_some() {
+                if command {
+                    self.pressed = None;
+                }
+                return;
+            }
+            self.pressed = match (shift, self.pressed, command) {
+                (Some(key), None, false) => Some((key, context, epoch)),
+                _ => None,
+            };
+        }
+
+        fn matches(&self, key: u32, context: ContextKey, epoch: u64, command: bool) -> bool {
+            !command && self.pressed == Some((key, context, epoch))
+        }
+    }
+
     fn claim_promotion(claim: &Cell<bool>, allowed: bool) -> bool {
         allowed && !claim.replace(true)
+    }
+
+    #[test]
+    fn shift_gesture_rejects_chords_repeat_rearming_and_stale_focus() {
+        let mut shift = ShiftGesture::default();
+        shift.down(Some(42), false, false, 1, 2);
+        assert!(shift.matches(42, 1, 2, false));
+        assert!(!shift.matches(54, 1, 2, false));
+        assert!(!shift.matches(42, 2, 2, false));
+        assert!(!shift.matches(42, 1, 3, false));
+        assert!(!shift.matches(42, 1, 2, true));
+        shift.down(Some(42), true, false, 1, 2);
+        assert!(shift.matches(42, 1, 2, false));
+        shift.down(None, false, false, 1, 2); // Shift+letter cancels.
+        shift.down(Some(42), true, false, 1, 2); // Auto-repeat cannot re-arm.
+        assert!(shift.pressed.is_none());
+        shift.down(Some(42), false, true, 1, 2);
+        assert!(shift.pressed.is_none());
+        shift.down(Some(42), false, false, 1, 2);
+        shift.down(Some(54), false, false, 1, 2); // Both Shift keys are a chord.
+        assert!(shift.pressed.is_none());
+    }
+
+    #[test]
+    fn shift_keyboard_snapshot_rejects_preheld_letters_and_both_shifts() {
+        let mut keys = [0u8; 256];
+        keys[0xA0] = 0x80;
+        assert!(!keyboard_has_other_down(&keys));
+        keys[b'A' as usize] = 0x80;
+        assert!(keyboard_has_other_down(&keys));
+        keys[b'A' as usize] = 0;
+        keys[0xA1] = 0x80;
+        assert!(keyboard_has_other_down(&keys));
+        keys[0xA1] = 0;
+        keys[0x14] = 1; // Caps Lock toggle alone is not a held key.
+        assert!(!keyboard_has_other_down(&keys));
+        keys[VK_CONTROL.0 as usize] = 0x80;
+        assert!(keyboard_has_other_down(&keys));
     }
 
     #[cfg(test)]
@@ -664,6 +838,8 @@ mod windows_exports {
 
     #[derive(Clone)]
     struct EditTarget {
+        context_generation: Option<u64>,
+        switch_to_english: bool,
         promotion_claim: Rc<Cell<bool>>,
         activation: SharedActivation,
         thread_manager: ITfThreadMgr,
@@ -671,6 +847,25 @@ mod windows_exports {
         owner_thread: ThreadId,
         key: ContextKey,
         focus_epoch: u64,
+    }
+
+    impl EditTarget {
+        fn is_current(&self) -> bool {
+            if std::thread::current().id() != self.owner_thread
+                || focused_context_key(&self.thread_manager) != Some(self.key)
+            {
+                return false;
+            }
+            self.activation.try_borrow().ok().is_some_and(|state| {
+                state.as_ref().is_some_and(|active| {
+                    self.context_generation.map_or(true, |generation| {
+                        generation == active.context_generation.get()
+                    }) && active.token == self.token
+                        && active.focus_epoch == self.focus_epoch
+                        && active.foreground
+                })
+            })
+        }
     }
 
     /// 异步鼠标编辑完成后发布状态所需的数据。
@@ -695,6 +890,7 @@ mod windows_exports {
 
     #[implement(ITfEditSession)]
     struct EditSession {
+        key_preflight: Option<EditTarget>,
         context: ITfContext,
         update: CompositionUpdate,
         state: Mutex<EditSessionState>,
@@ -711,6 +907,7 @@ mod windows_exports {
             controller: CompositionController,
         ) -> Self {
             Self {
+                key_preflight: None,
                 context,
                 update,
                 state: Mutex::new(EditSessionState {
@@ -732,6 +929,7 @@ mod windows_exports {
             completion: PopupActionCompletion,
         ) -> Self {
             Self {
+                key_preflight: None,
                 context,
                 update,
                 state: Mutex::new(EditSessionState {
@@ -769,6 +967,13 @@ mod windows_exports {
         fn DoEditSession(&self, edit_cookie: u32) -> Result<()> {
             record(Stage::DoEditSession, S_OK);
             let this = self.get_impl();
+            if this
+                .key_preflight
+                .as_ref()
+                .is_some_and(|target| !target.is_current())
+            {
+                return Err(E_UNEXPECTED.into());
+            }
             let completion = this.take_completion();
             if this.requires_preflight && completion.is_none() {
                 return Err(E_UNEXPECTED.into());
@@ -1017,15 +1222,17 @@ mod windows_exports {
     /// TSF `SetText` 与 `EndComposition` 不是单一事务：即使调用返回错误，
     /// 宿主文档也可能已经被部分修改。调用方只能恢复引擎侧快照，不能把
     /// `None` 解释为“文档保证未变”或执行自动回滚。
-    fn request_key_edit_session(
+    fn request_checked_key_edit_session(
         context: &ITfContext,
         client_id: u32,
         update: CompositionUpdate,
         composition: Option<ActiveComposition>,
         controller: CompositionController,
+        target: Option<EditTarget>,
     ) -> Option<EditSessionOutcome> {
-        let session: ITfEditSession =
-            EditSession::new(context.clone(), update, composition, controller).into();
+        let mut edit = EditSession::new(context.clone(), update, composition, controller);
+        edit.key_preflight = target;
+        let session: ITfEditSession = edit.into();
 
         // SAFETY: The context is live and `session` remains alive until the
         // synchronous request returns.
@@ -1162,6 +1369,8 @@ mod windows_exports {
         let composition = entry.composition.take();
         let controller = entry.controller;
         let target = EditTarget {
+            context_generation: None,
+            switch_to_english: false,
             promotion_claim: Rc::new(Cell::new(false)),
             activation: Rc::clone(shared),
             thread_manager,
@@ -1483,7 +1692,13 @@ mod windows_exports {
                 keep_popup = true;
                 let still_focused = active.foreground
                     && active.focus_epoch == target.focus_epoch
-                    && focus_context_matches;
+                    && focus_context_matches
+                    && target.context_generation.map_or(true, |generation| {
+                        generation == active.context_generation.get()
+                    });
+                if target.switch_to_english && still_focused {
+                    active.english = true;
+                }
                 if !events.is_empty()
                     && claim_promotion(
                         &target.promotion_claim,
@@ -1722,6 +1937,9 @@ mod windows_exports {
                 }
             }
 
+            let context_generation = Rc::new(Cell::new(0));
+            let thread_events =
+                ThreadEvents::subscribe(thread_manager, Rc::clone(&context_generation))?;
             let popup = CandidatePopupWindow::new();
             if let Err(error) = &popup {
                 record(Stage::PopupCreate, popup_activation_hresult(error));
@@ -1769,6 +1987,10 @@ mod windows_exports {
                         foreground: true,
                         shown_context: None,
                         processing: false,
+                        english: false,
+                        shift: ShiftGesture::default(),
+                        context_generation: Rc::clone(&context_generation),
+                        _thread_events: Some(thread_events),
                         settings,
                         lexicon,
                         rankings,
@@ -1881,6 +2103,155 @@ mod windows_exports {
         }
     }
 
+    impl TextService_Impl {
+        fn key_mode(&self, context: &ITfContext) -> Option<(u64, bool)> {
+            let (manager, epoch, english) = {
+                let state = self.get_impl().activation.try_borrow().ok()?;
+                let active = state.as_ref().filter(|a| a.foreground && !a.processing)?;
+                (
+                    active.thread_manager.clone(),
+                    active.focus_epoch,
+                    active.english,
+                )
+            };
+            (focused_context_key(&manager) == Some(context_key(context)))
+                .then_some((epoch, english))
+        }
+
+        fn apply_engine_key(&self, context: &ITfContext, event: Option<KeyEvent>) -> Result<BOOL> {
+            let key = context_key(context);
+
+            let (
+                entry,
+                client_id,
+                token,
+                owner_thread,
+                focus_epoch,
+                thread_manager,
+                settings,
+                lexicon,
+                context_generation,
+            ) = {
+                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+                    return Ok(FALSE);
+                };
+                let Some(active) = activation.as_mut() else {
+                    return Ok(FALSE);
+                };
+                if active.processing {
+                    return Ok(FALSE);
+                }
+                let entry = active.contexts.remove(&key);
+                let client_id = active.client_id;
+                let token = active.token;
+                let owner_thread = active.owner_thread;
+                let focus_epoch = active.focus_epoch;
+                let thread_manager = active.thread_manager.clone();
+                let settings = active.settings.clone();
+                active.processing = true;
+                (
+                    entry,
+                    client_id,
+                    token,
+                    owner_thread,
+                    focus_epoch,
+                    thread_manager,
+                    settings,
+                    active.lexicon.clone(),
+                    active.context_generation.get(),
+                )
+            };
+            let _guard = ProcessingGuard {
+                activation: Rc::clone(&self.get_impl().activation),
+                token,
+                owner_thread,
+            };
+
+            let was_existing = entry.is_some();
+            let mut old_entry = entry.clone();
+            let mut entry = match entry {
+                Some(entry) => entry,
+                None => match ContextEntry::new(context, &settings, &lexicon) {
+                    Some(entry) => entry,
+                    None => return Ok(FALSE),
+                },
+            };
+            if entry.composition_terminated() {
+                clear_invalid_popup_action(&self.get_impl().activation, token, owner_thread, key);
+                let Ok(router) =
+                    EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size)
+                else {
+                    return Ok(FALSE);
+                };
+                entry.router = router;
+                entry
+                    .router
+                    .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
+                entry.composition = None;
+                entry.controller = CompositionController::new();
+                entry.popup_model.hide();
+                old_entry = Some(entry.clone());
+            }
+
+            sync_idle_rankings(&self.get_impl().activation, token, &mut entry.router);
+            let update = match match event {
+                Some(event) => entry.router.process_key(event),
+                None => Ok(entry.router.commit_raw()),
+            } {
+                Ok(update) => update,
+                Err(_) => {
+                    if let Some(old_entry) = old_entry {
+                        self.get_impl().restore_context(token, key, old_entry);
+                    }
+                    return Ok(FALSE);
+                }
+            };
+
+            if !update.handled {
+                if was_existing {
+                    self.get_impl().restore_context(token, key, entry);
+                }
+                return Ok(FALSE);
+            }
+
+            let target = EditTarget {
+                context_generation: event.is_none().then_some(context_generation),
+                switch_to_english: event.is_none(),
+                promotion_claim: Rc::new(Cell::new(false)),
+                activation: Rc::clone(&self.get_impl().activation),
+                thread_manager,
+                token,
+                owner_thread,
+                key,
+                focus_epoch,
+            };
+            let update_for_popup = update.clone();
+            let outcome = request_checked_key_edit_session(
+                &entry.context,
+                client_id,
+                update,
+                entry.composition.take(),
+                entry.controller,
+                event.is_none().then(|| target.clone()),
+            );
+
+            let Some(outcome) = outcome else {
+                // The edit session did not report success. Restore the engine
+                // and popup snapshots, but do not claim the TSF document is
+                // unchanged: SetText may already have partially applied before
+                // a later EndComposition failure.
+                if let Some(old_entry) = old_entry {
+                    self.get_impl().restore_context(token, key, old_entry);
+                }
+                return Ok(FALSE);
+            };
+
+            publish_successful_edit(&target, entry, &update_for_popup, outcome);
+
+            Ok(TRUE)
+        }
+    }
+
     impl ITfKeyEventSink_Impl for TextService_Impl {
         fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
             if !self.get_impl().owns_current_thread() {
@@ -1896,6 +2267,7 @@ mod windows_exports {
                 activation.as_mut().and_then(|active| {
                     active.focus_epoch = active.focus_epoch.wrapping_add(1);
                     active.foreground = foreground.as_bool();
+                    active.shift.pressed = None;
                     if foreground.as_bool() {
                         None
                     } else {
@@ -1936,7 +2308,7 @@ mod windows_exports {
             &self,
             context: Option<&ITfContext>,
             wparam: WPARAM,
-            _lparam: LPARAM,
+            lparam: LPARAM,
         ) -> Result<BOOL> {
             record(Stage::TestKeyDown, S_OK);
             if !self.get_impl().owns_current_thread() {
@@ -1945,6 +2317,27 @@ mod windows_exports {
             let Some(context) = context else {
                 return Ok(FALSE);
             };
+            let Some((_, english)) = self.key_mode(context) else {
+                return Ok(FALSE);
+            };
+            // Route real chord keys through OnKeyDown so they can disarm Shift
+            // even when they ultimately pass through in English mode.
+            let pending = self
+                .get_impl()
+                .activation
+                .try_borrow()
+                .ok()
+                .is_some_and(|state| {
+                    state
+                        .as_ref()
+                        .is_some_and(|active| active.shift.pressed.is_some())
+                });
+            if shift_identity(wparam.0, lparam).is_some() || pending {
+                return Ok(TRUE);
+            }
+            if english {
+                return Ok(FALSE);
+            }
             let Some(event) = map_key_event(wparam) else {
                 return Ok(FALSE);
             };
@@ -1995,21 +2388,34 @@ mod windows_exports {
 
         fn OnTestKeyUp(
             &self,
-            _context: Option<&ITfContext>,
-            _wparam: WPARAM,
-            _lparam: LPARAM,
+            context: Option<&ITfContext>,
+            wparam: WPARAM,
+            lparam: LPARAM,
         ) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
-            Ok(FALSE)
+            let (Some(context), Some(_shift)) = (context, shift_identity(wparam.0, lparam)) else {
+                return Ok(FALSE);
+            };
+            if self.key_mode(context).is_none() {
+                return Ok(FALSE);
+            }
+            let Ok(state) = self.get_impl().activation.try_borrow() else {
+                return Ok(FALSE);
+            };
+            Ok(BOOL::from(state.as_ref().is_some_and(|active| {
+                // Even a cancelled chord release must reach the real callback
+                // to clear its pending gesture; only OnKeyUp decides to eat it.
+                active.shift.pressed.is_some()
+            })))
         }
 
         fn OnKeyDown(
             &self,
             context: Option<&ITfContext>,
             wparam: WPARAM,
-            _lparam: LPARAM,
+            lparam: LPARAM,
         ) -> Result<BOOL> {
             record(Stage::KeyDown, S_OK);
             if !self.get_impl().owns_current_thread() {
@@ -2018,143 +2424,88 @@ mod windows_exports {
             let Some(context) = context else {
                 return Ok(FALSE);
             };
-            let Some(event) = map_key_event(wparam) else {
+            let shift = shift_identity(wparam.0, lparam);
+            let Some((epoch, english)) = self.key_mode(context) else {
                 return Ok(FALSE);
             };
-            let key = context_key(context);
-
-            let (
-                entry,
-                client_id,
-                token,
-                owner_thread,
-                focus_epoch,
-                thread_manager,
-                settings,
-                lexicon,
-            ) = {
-                let Ok(mut activation) = self.get_impl().activation.try_borrow_mut() else {
+            {
+                let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
                     return Ok(FALSE);
                 };
-                let Some(active) = activation.as_mut() else {
-                    return Ok(FALSE);
-                };
-                if active.processing {
-                    return Ok(FALSE);
-                }
-                let entry = active.contexts.remove(&key);
-                let client_id = active.client_id;
-                let token = active.token;
-                let owner_thread = active.owner_thread;
-                let focus_epoch = active.focus_epoch;
-                let thread_manager = active.thread_manager.clone();
-                let settings = active.settings.clone();
-                active.processing = true;
-                (
-                    entry,
-                    client_id,
-                    token,
-                    owner_thread,
-                    focus_epoch,
-                    thread_manager,
-                    settings,
-                    active.lexicon.clone(),
-                )
-            };
-            let _guard = ProcessingGuard {
-                activation: Rc::clone(&self.get_impl().activation),
-                token,
-                owner_thread,
-            };
-
-            let was_existing = entry.is_some();
-            let mut old_entry = entry.clone();
-            let mut entry = match entry {
-                Some(entry) => entry,
-                None => match ContextEntry::new(context, &settings, &lexicon) {
-                    Some(entry) => entry,
-                    None => return Ok(FALSE),
-                },
-            };
-            if entry.composition_terminated() {
-                clear_invalid_popup_action(&self.get_impl().activation, token, owner_thread, key);
-                let Ok(router) =
-                    EngineRouter::from_lexicon(lexicon.clone(), settings.candidate_page_size)
+                let Some(active) = state
+                    .as_mut()
+                    .filter(|a| !a.processing && a.focus_epoch == epoch)
                 else {
                     return Ok(FALSE);
                 };
-                entry.router = router;
-                entry
-                    .router
-                    .set_candidate_width(Some(crate::engine::paging::DEFAULT_CANDIDATE_WIDTH));
-                entry.composition = None;
-                entry.controller = CompositionController::new();
-                entry.popup_model.hide();
-                old_entry = Some(entry.clone());
+                let was_pressed = active.shift.pressed.is_some();
+                active.shift.down(
+                    shift,
+                    lparam.0 as usize & (1 << 30) != 0,
+                    command_modifiers_down() || other_keys_down(),
+                    context_key(context),
+                    epoch,
+                );
+                if !was_pressed && active.shift.pressed.is_some() {
+                    active.shift.context_generation = active.context_generation.get();
+                }
             }
-
-            sync_idle_rankings(&self.get_impl().activation, token, &mut entry.router);
-            let update = match entry.router.process_key(event) {
-                Ok(update) => update,
-                Err(_) => {
-                    if let Some(old_entry) = old_entry {
-                        self.get_impl().restore_context(token, key, old_entry);
-                    }
-                    return Ok(FALSE);
-                }
-            };
-
-            if !update.handled {
-                if was_existing {
-                    self.get_impl().restore_context(token, key, entry);
-                }
+            // Let native Shift reach the host so normal Shift shortcuts keep working.
+            if shift.is_some() || english {
                 return Ok(FALSE);
             }
-
-            let update_for_popup = update.clone();
-            let outcome = request_key_edit_session(
-                &entry.context,
-                client_id,
-                update,
-                entry.composition.take(),
-                entry.controller,
-            );
-
-            let Some(outcome) = outcome else {
-                // The edit session did not report success. Restore the engine
-                // and popup snapshots, but do not claim the TSF document is
-                // unchanged: SetText may already have partially applied before
-                // a later EndComposition failure.
-                if let Some(old_entry) = old_entry {
-                    self.get_impl().restore_context(token, key, old_entry);
-                }
+            let Some(event) = map_key_event(wparam) else {
                 return Ok(FALSE);
             };
-
-            let target = EditTarget {
-                promotion_claim: Rc::new(Cell::new(false)),
-                activation: Rc::clone(&self.get_impl().activation),
-                thread_manager,
-                token,
-                owner_thread,
-                key,
-                focus_epoch,
-            };
-            publish_successful_edit(&target, entry, &update_for_popup, outcome);
-
-            Ok(TRUE)
+            self.apply_engine_key(context, Some(event))
         }
 
         fn OnKeyUp(
             &self,
-            _context: Option<&ITfContext>,
-            _wparam: WPARAM,
-            _lparam: LPARAM,
+            context: Option<&ITfContext>,
+            wparam: WPARAM,
+            lparam: LPARAM,
         ) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
             }
-            Ok(FALSE)
+            let Some(shift) = shift_identity(wparam.0, lparam) else {
+                return Ok(FALSE);
+            };
+            let mode = context.and_then(|context| self.key_mode(context));
+            let Ok(mut state) = self.get_impl().activation.try_borrow_mut() else {
+                return Ok(FALSE);
+            };
+            let Some(active) = state.as_mut() else {
+                return Ok(FALSE);
+            };
+            let valid = context.zip(mode).is_some_and(|(context, (epoch, _))| {
+                active.foreground
+                    && !active.processing
+                    && active.focus_epoch == epoch
+                    && active.shift.context_generation == active.context_generation.get()
+                    && active.shift.matches(
+                        shift,
+                        context_key(context),
+                        epoch,
+                        command_modifiers_down() || other_keys_down(),
+                    )
+            });
+            active.shift.pressed = None;
+            if !valid {
+                return Ok(FALSE);
+            }
+            let context = context.unwrap();
+            let composing = active
+                .contexts
+                .get(&context_key(context))
+                .is_some_and(|entry| entry.router.is_composing());
+            if active.english || !composing {
+                active.english = !active.english;
+                return Ok(TRUE);
+            }
+            drop(state);
+            self.apply_engine_key(context, None)
         }
 
         fn OnPreservedKey(
@@ -2164,6 +2515,11 @@ mod windows_exports {
         ) -> Result<BOOL> {
             if !self.get_impl().owns_current_thread() {
                 return Err(E_UNEXPECTED.into());
+            }
+            if let Ok(mut state) = self.get_impl().activation.try_borrow_mut() {
+                if let Some(active) = state.as_mut() {
+                    active.shift.pressed = None;
+                }
             }
             Ok(FALSE)
         }
@@ -2444,6 +2800,10 @@ mod windows_exports {
                     foreground: true,
                     shown_context: None,
                     processing: false,
+                    english: false,
+                    shift: ShiftGesture::default(),
+                    context_generation: Rc::new(Cell::new(0)),
+                    _thread_events: None,
                     settings: Settings::default(),
                     lexicon: Lexicon::from_tsv("ying'she\t影射\t200\nying'she\t映射\t100").unwrap(),
                     rankings: Arc::new(Vec::new()),
@@ -2655,6 +3015,239 @@ mod windows_exports {
         }
 
         #[test]
+        fn native_shift_commits_original_spelling_and_switches_only_after_success() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let host = NativeDocument::new().unwrap();
+            let service: ITfTextInputProcessor = TextService::new().into();
+            let implementation =
+                unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
+            *implementation.activation.borrow_mut() = Some(Activation {
+                thread_manager: host.manager.clone(),
+                keystroke_manager: host.manager.cast().unwrap(),
+                client_id: host.client,
+                contexts: HashMap::new(),
+                token: next_activation_token(),
+                owner_thread: std::thread::current().id(),
+                focus_epoch: 0,
+                foreground: true,
+                shown_context: None,
+                processing: false,
+                english: false,
+                shift: ShiftGesture::default(),
+                context_generation: Rc::new(Cell::new(0)),
+                _thread_events: None,
+                settings: Settings::default(),
+                lexicon: Lexicon::from_tsv("ni\t你\t100\nhao\t好\t100\nni'hao\t你好\t200").unwrap(),
+                rankings: Arc::new(Vec::new()),
+                adaptive_ranking_enabled: true,
+                learning: None,
+                _learning_registration: None,
+                local_data_error: false,
+            });
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            let down = |key| {
+                unsafe { sink.OnKeyDown(&host.context, WPARAM(key), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            };
+            let test_down = |key| {
+                unsafe { sink.OnTestKeyDown(&host.context, WPARAM(key), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            };
+            let test_up = || {
+                unsafe { sink.OnTestKeyUp(&host.context, WPARAM(0xA0), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            };
+            let up = || {
+                unsafe { sink.OnKeyUp(&host.context, WPARAM(0xA0), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            };
+            let generation = Rc::clone(
+                &implementation
+                    .activation
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .context_generation,
+            );
+            let events = ThreadEvents::subscribe(&host.manager, Rc::clone(&generation)).unwrap();
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                ._thread_events = Some(events);
+            for key in b"NIHAO" {
+                send_key(&sink, &host.context, *key);
+            }
+            let partial = implementation
+                .activation
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .contexts
+                .get(&context_key(&host.context))
+                .unwrap()
+                .router
+                .session()
+                .candidates_on_current_page()
+                .iter()
+                .position(|c| c.text == "你")
+                .unwrap();
+            send_key(&sink, &host.context, b'1' + partial as u8);
+            assert_eq!(read_document(&host, None), "你hao");
+            assert!(test_down(0xA0));
+            assert!(test_down(0xA0)); // Prediction does not arm or toggle.
+            assert!(!test_up());
+            assert!(!down(0xA0));
+            assert!(test_up());
+            assert!(test_up()); // Prediction does not commit.
+            assert_eq!(read_document(&host, None), "你hao");
+            assert!(!implementation.activation.borrow().as_ref().unwrap().english);
+            assert!(up());
+            assert_eq!(read_document(&host, None), "nihao");
+            {
+                let state = implementation.activation.borrow();
+                let active = state.as_ref().unwrap();
+                assert!(active.english);
+                assert!(active.rankings.is_empty());
+                let router = &active
+                    .contexts
+                    .get(&context_key(&host.context))
+                    .unwrap()
+                    .router;
+                assert!(router.pending_learning().is_empty());
+                assert!(router.pending_promotions().is_empty());
+            }
+            assert!(!test_down(b'N' as usize));
+            assert!(!down(b'N' as usize)); // Host handles English; test never injects keys.
+            assert_eq!(read_document(&host, None), "nihao");
+            assert!(!down(0xA0));
+            assert!(test_down(b'A' as usize)); // Route chord solely to disarm.
+            assert!(!down(b'A' as usize));
+            assert!(!up());
+            assert!(implementation.activation.borrow().as_ref().unwrap().english);
+            assert!(!down(0xA0));
+            assert!(up());
+            assert!(!implementation.activation.borrow().as_ref().unwrap().english);
+
+            // A context can leave and return without key-sink OnSetFocus.
+            // The real ThreadMgr event subscription must still invalidate Shift.
+            assert!(!down(0xA0));
+            let before = generation.get();
+            let mut extra = None;
+            let mut cookie = 0;
+            unsafe {
+                host.document
+                    .CreateContext(host.client, 0, None, &mut extra, &mut cookie)
+                    .unwrap();
+                host.document.Push(extra.as_ref().unwrap()).unwrap();
+                host.document.Pop(0).unwrap();
+            }
+            assert!(generation.get() > before);
+            assert_eq!(
+                focused_context_key(&host.manager),
+                Some(context_key(&host.context))
+            );
+            assert!(
+                !unsafe { sink.OnKeyDown(&host.context, WPARAM(0xA0), LPARAM(1 << 30)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(!up());
+            assert!(!implementation.activation.borrow().as_ref().unwrap().english);
+
+            // Invalid edit client fails before committing; mode and engine are restored.
+            for key in b"NIHAO" {
+                send_key(&sink, &host.context, *key);
+            }
+            for stale_generation in [false, true] {
+                let (mut entry, target) = {
+                    let state = implementation.activation.borrow();
+                    let active = state.as_ref().unwrap();
+                    (
+                        active
+                            .contexts
+                            .get(&context_key(&host.context))
+                            .unwrap()
+                            .clone(),
+                        EditTarget {
+                            context_generation: Some(
+                                generation.get() + u64::from(stale_generation),
+                            ),
+                            switch_to_english: true,
+                            promotion_claim: Rc::new(Cell::new(false)),
+                            activation: Rc::clone(&implementation.activation),
+                            thread_manager: host.manager.clone(),
+                            token: active.token,
+                            owner_thread: active.owner_thread,
+                            key: context_key(&host.context),
+                            focus_epoch: active.focus_epoch + u64::from(!stale_generation),
+                        },
+                    )
+                };
+                let update = entry.router.commit_raw();
+                assert!(request_checked_key_edit_session(
+                    &host.context,
+                    host.client,
+                    update,
+                    entry.composition.take(),
+                    entry.controller,
+                    Some(target),
+                )
+                .is_none());
+                assert_eq!(read_document(&host, None), "nihaonihao");
+                assert!(!implementation.activation.borrow().as_ref().unwrap().english);
+            }
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .client_id = u32::MAX;
+            assert!(!down(0xA0));
+            assert!(!up());
+            assert_eq!(read_document(&host, None), "nihaonihao");
+            {
+                let state = implementation.activation.borrow();
+                let active = state.as_ref().unwrap();
+                assert!(!active.english);
+                assert_eq!(
+                    active
+                        .contexts
+                        .get(&context_key(&host.context))
+                        .unwrap()
+                        .router
+                        .preedit(),
+                    "nihao"
+                );
+            }
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .client_id = host.client;
+            assert!(!down(0xA0));
+            unsafe { sink.OnSetFocus(FALSE) }.unwrap();
+            assert!(!test_up());
+            assert!(!up());
+            assert!(!implementation.activation.borrow().as_ref().unwrap().english);
+            unsafe { sink.OnSetFocus(TRUE) }.unwrap();
+            assert!(!down(0xA0));
+            assert!(up());
+            assert!(implementation.activation.borrow().as_ref().unwrap().english);
+            assert_eq!(read_document(&host, None), "nihaonihao");
+            implementation.activation.borrow_mut().take();
+        }
+
+        #[test]
         fn native_context_accepts_pinyin_in_write_edit_session() {
             // Only a new, TSF-owned empty document is used. This never reads a
             // user document, injects global keys, or changes profile selection.
@@ -2678,6 +3271,10 @@ mod windows_exports {
                 foreground: true,
                 shown_context: None,
                 processing: false,
+                english: false,
+                shift: ShiftGesture::default(),
+                context_generation: Rc::new(Cell::new(0)),
+                _thread_events: None,
                 settings: Settings::default(),
                 lexicon: Lexicon::builtin().unwrap(),
                 rankings: Arc::new(Vec::new()),

@@ -6,9 +6,6 @@ use thiserror::Error;
 const BASE_DPI: u32 = 96;
 const PADDING: i32 = 8;
 const CANDIDATE_HEIGHT: i32 = 30;
-const FOOTER_HEIGHT: i32 = 22;
-const FOOTER_BUTTON_WIDTH: i32 = 28;
-const MIN_FOOTER_BUTTON_WIDTH: i32 = 12;
 const MIN_CONTENT_WIDTH: i32 = 240;
 const MAX_CONTENT_WIDTH: i32 = 544;
 
@@ -93,13 +90,13 @@ pub struct CandidatePopupLayout {
     pub preedit: PopupRect,
     /// 当前页候选按从左到右单行排列的单元格。
     pub candidates: Vec<PopupRect>,
-    /// 页脚区域；无候选页时为 `None`。
+    /// 兼容保留的页脚区域，始终为 `None`。
     pub footer: Option<PopupRect>,
-    /// “上一页”按钮区域；位于首页时为 `None`。
+    /// 兼容保留的上一页区域，始终为 `None`。
     pub previous_page: Option<PopupRect>,
-    /// “下一页”按钮区域；位于末页时为 `None`。
+    /// 兼容保留的下一页区域，始终为 `None`。
     pub next_page: Option<PopupRect>,
-    /// 页脚中间的页码区域。
+    /// 兼容保留的页码区域，始终为 `None`。
     pub page_label: Option<PopupRect>,
 }
 
@@ -107,8 +104,8 @@ impl CandidatePopupLayout {
     /// 根据快照、DPI 和可用最大尺寸计算布局。
     ///
     /// `bounds` 的左上角按客户区原点处理。单元格限宽，长文字由绘制层省略。
-    /// 空间变窄时按比例压缩整页；每项一物理像素或单行与页脚高度放不下时，
-    /// 整体隐藏候选及页脚，
+    /// 空间变窄时按比例压缩整页；每项一物理像素或单行高度放不下时，
+    /// 整体隐藏候选，
     /// 不截断当前页；键盘选择和引擎分页不受影响。窗口尺寸始终限制在边界内。
     pub fn new(snapshot: &CandidatePopupSnapshot, dpi: u32, bounds: PopupSize) -> Self {
         let dpi = effective_dpi(dpi);
@@ -116,7 +113,6 @@ impl CandidatePopupLayout {
         let height_limit = bounds.height.max(1);
         let padding = scaled(PADDING, dpi);
         let candidate_height = scaled(CANDIDATE_HEIGHT, dpi).max(1);
-        let footer_height = scaled(FOOTER_HEIGHT, dpi);
         // Share the engine's page estimator; comments and preedit never affect geometry.
         let cell_widths: Vec<i32> = snapshot
             .candidates
@@ -169,86 +165,26 @@ impl CandidatePopupLayout {
                 x = right;
             }
         }
-        let has_page_count = snapshot.page_count > 0 && !candidates.is_empty();
         let body_bottom = candidates.last().map_or(padding, |cell| cell.bottom);
-        let natural_height = body_bottom
-            .saturating_add(padding)
-            .saturating_add(if has_page_count { footer_height } else { 0 });
+        let natural_height = body_bottom.saturating_add(padding);
         let height = natural_height.min(height_limit).max(1);
-        let fits = cells_fit && natural_height <= height_limit;
-        if !fits {
+        if !cells_fit || natural_height > height_limit {
             candidates.clear();
         }
-        let footer = (fits && has_page_count).then(|| {
-            PopupRect::new(
-                padding,
-                body_bottom,
-                width.saturating_sub(padding),
-                height.saturating_sub(padding),
-            )
-        });
-        let wants_previous = snapshot.page > 0;
-        let wants_next = snapshot.page.saturating_add(1) < snapshot.page_count;
-        let footer_inner_width = width.saturating_sub(padding.saturating_mul(2));
-        let minimum_button_width = scaled(MIN_FOOTER_BUTTON_WIDTH, dpi).max(1);
-        let footer_button_width = if wants_previous && wants_next {
-            let available = footer_inner_width / 2;
-            if available < minimum_button_width {
-                0
-            } else {
-                scaled(FOOTER_BUTTON_WIDTH, dpi).min(available)
-            }
-        } else if wants_previous || wants_next {
-            if footer_inner_width < minimum_button_width {
-                0
-            } else {
-                scaled(FOOTER_BUTTON_WIDTH, dpi).min(footer_inner_width)
-            }
-        } else {
-            0
-        };
-        let previous_page = footer.and_then(|footer| {
-            (wants_previous && footer_button_width > 0).then(|| {
-                PopupRect::new(
-                    footer.left,
-                    footer.top,
-                    footer.left.saturating_add(footer_button_width),
-                    footer.bottom,
-                )
-            })
-        });
-        let next_page = footer.and_then(|footer| {
-            (wants_next && footer_button_width > 0).then(|| {
-                PopupRect::new(
-                    footer.right.saturating_sub(footer_button_width),
-                    footer.top,
-                    footer.right,
-                    footer.bottom,
-                )
-            })
-        });
-        let label_left = previous_page.map_or(padding, |button| button.right);
-        let label_right = next_page.map_or(width.saturating_sub(padding), |button| button.left);
-        let page_label = footer.and_then(|footer| {
-            (label_left < label_right)
-                .then(|| PopupRect::new(label_left, footer.top, label_right, footer.bottom))
-        });
-
         Self {
             size: PopupSize::new(width, height),
             preedit: PopupRect::new(0, 0, 0, 0),
             candidates,
-            footer,
-            previous_page,
-            next_page,
-            page_label,
+            footer: None,
+            previous_page: None,
+            next_page: None,
+            page_label: None,
         }
     }
 
     /// 将客户区坐标映射为携带快照 revision 的候选动作。
     ///
-    /// header、页脚页码、窗口外和空候选区域都返回 `None`。首页的上一页和
-    /// 末页的下一页没有命中区域，因此不会产生不可用动作。
+    /// 留白、窗口外和空候选区域都返回 `None`。兼容页脚字段不参与命中。
     pub fn hit_test(
         &self,
         snapshot: &CandidatePopupSnapshot,
@@ -267,22 +203,6 @@ impl CandidatePopupLayout {
                     index,
                 });
             }
-        }
-
-        if self
-            .previous_page
-            .is_some_and(|button| button.contains(point))
-        {
-            return Some(CandidatePopupAction::PreviousPage {
-                revision: snapshot.revision,
-                page: snapshot.page,
-            });
-        }
-        if self.next_page.is_some_and(|button| button.contains(point)) {
-            return Some(CandidatePopupAction::NextPage {
-                revision: snapshot.revision,
-                page: snapshot.page,
-            });
         }
 
         None

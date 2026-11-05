@@ -1277,6 +1277,43 @@ def _phrase_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
                      "coverage": coverage, "notice_path": "licenses/phrases/NOTICE.md"}
 
 
+EVERYDAY_COUNT = 155
+EVERYDAY_SHA256 = "86aed552183db1964ca9f0c9f4a1978bd87b11b87202f60a29dea9d997312f2d"
+
+
+def _everyday_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
+    path = "data/pinyin/everyday_phrases.tsv"
+    notice = "data/pinyin/everyday_phrases.md"
+    payload = {name: _read_bytes(repo_root / name, "项目人工短语")
+               for name in (path, notice)}
+    try:
+        pairs = set()
+        for line in payload[path].decode("utf-8").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            key, word, weight = line.split("\t")
+            if (not re.fullmatch("[a-z]+(?:'[a-z]+)+", key)
+                    or len(key.split("'")) != len(word)
+                    or any(ord(c) < 32 for c in word)
+                    or int(weight) != 100 or (key, word) in pairs):
+                raise ValueError("无效或重复人工短语")
+            pairs.add((key, word))
+        if len(pairs) != EVERYDAY_COUNT or _sha256(payload[path]) != EVERYDAY_SHA256:
+            raise ValueError("人工短语数量或哈希不一致")
+        text = payload[notice].decode("utf-8")
+        if ("MIT" not in text or "人工" not in text or "不是统计频率" not in text
+                or EVERYDAY_SHA256 not in text or str(EVERYDAY_COUNT) not in text):
+            raise ValueError("人工短语来源许可说明不一致")
+    except (UnicodeError, ValueError) as error:
+        raise PackagingError(f"项目人工短语校验失败：{error}") from error
+    return payload, {
+        "path": path, "pairs": len(pairs), "sha256": _sha256(payload[path]),
+        "origin": "Flower contributors; project-authored",
+        "license": "MIT", "license_path": "LICENSE-MIT", "notice_path": notice,
+        "weight_kind": "manual, not corpus frequency",
+    }
+
+
 def _build_payloads(
     repo_root: Path,
     version: str,
@@ -1294,6 +1331,7 @@ def _build_payloads(
     )
     dictionary_payload, dictionary_record = _dictionary_bundle(repo_root)
     phrase_payload, phrase_record = _phrase_bundle(repo_root)
+    everyday_payload, everyday_record = _everyday_bundle(repo_root)
     cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
     root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
     root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
@@ -1323,7 +1361,8 @@ def _build_payloads(
         "data/pinyin/mvp_lexicon.tsv": lexicon,
         "Cargo.lock": cargo_lock,
     }
-    for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload):
+    for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload,
+                   everyday_payload):
         for relative, data in source.items():
             if relative in payload:
                 raise PackagingError(f"分发文件路径重复：{relative}")
@@ -1352,6 +1391,7 @@ def _build_payloads(
         "rust_standard_library": rust_std,
         "dictionaries": dictionary_record,
         "phrases": phrase_record,
+        "everyday_phrases": everyday_record,
         "distribution": {
             "format": "zip",
             "authenticode_signed": False,

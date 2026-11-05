@@ -159,7 +159,7 @@ fn start_input_method() -> Result<(), String> {
         require_non_elevated()?;
         flower::platform::registration::enable().map_err(|e| e.to_string())?;
         println!("已为当前用户启用 Flower，请按 Win+Space 手动切换；尚未切换当前焦点的输入法。");
-        flower::platform::settings_ui::run_settings_app()
+        Ok(())
     }
     #[cfg(not(target_os = "windows"))]
     Err("启动 Flower 输入法仅支持 Windows 10/11 x64。".to_owned())

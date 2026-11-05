@@ -1,5 +1,6 @@
 # Pinned data and generated reports are byte-hashed; never rewrite line endings.
 data/pinyin/sources/* -text
 data/pinyin/base_lexicon.tsv -text
+data/pinyin/everyday_phrases.tsv -text
 data/pinyin/coverage.json -text
 data/pinyin/phrases/** -text

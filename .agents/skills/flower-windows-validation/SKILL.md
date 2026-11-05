@@ -55,7 +55,15 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - `check-install-path` 始终只读；`prepare-install-path` 是显式管理员写操作。后者仅对缺失组件用创建时的受保护 SDDL，新建即可信 owner/管理员SYSTEM全控/Users RX，保留禁止删除共享句柄后复查；不先创建可写目录再收紧，不修复已有对象，不自动改 D 盘根或父目录 ACL。同名竞争失败，不递归清理未知内容。
 - 安装器必须在旧注册/目录冲突及运行库门禁后、复制前 prepare/check。只读新路径检查通过不代表管理员创建/向导安装成功；完整许可和源ZIP核验也不等于运行期安装验收。新制品仍不得自动运行。
 
-## 0.4.3 固定安装、启动与真实学习链路
+## 0.4.4 紧凑候选和 Shift 手势
+
+- 当前契约 `design/compact-candidates-and-shift.md`：移除整个页脚及幽灵点击区，不移除引擎分页/键盘翻页。候选高亮使用当前选入字体的真实 GDI 字宽，与实际省略文本共用结果；背景紧贴词尾而整 cell 点击不变。纯估算不能代替选字体后的度量，离屏测试不等于实际宿主外观验收。
+- 单独 Shift 在真实 down/up 识别；OnTest 纯预测。英文 pending 手势时可预测 TRUE 以接收组合键真实 OnKeyDown，再取消手势并返回 FALSE直通。检查线程键盘快照中的预按普通键/双 Shift/控制键，查询失败拒绝，不只看 Shift 后收到的字母。repeat 不重新建立或刷新手势身份。
+- ThreadMgr 文档焦点与 context push/pop 独立 generation 能防切走再回误切；订阅 sink 不持服务，保留线程/卸载计数，guard解除。generation只在新手势建立时保存，不能被repeat刷新。真实 Push/Pop 后插入repeat再release是必要回归；仅比较当前context会漏掉往返。
+- 原拼音转换恢复 confirmed.raw+remaining raw，不学习；同步编辑成功且token/epoch/context/generation有效才发布英文模式。无效client、写前stale校验、失焦及纯试探需单独证明，不承诺TSF部分写后失败能回滚宿主文档。
+- 安装完成默认启动现在只普通用户 enable 后退出，不再打开设置，取代下方0.4.3启动GUI约定。无参设置入口保持；包核验禁止运行有效启动命令。
+
+## 0.4.3 固定安装、启动与真实学习链路（启动GUI为历史）
 
 - 最新用户决定取消自选目录，EXE 固定 `{commonpf64}\Flower`、隐藏目录页、拒绝 `/DIR` 异根。下文自选目录章节仅为历史/helper能力，不是当前安装器承诺。不修改已有父目录权限或 owner，不把普通应用的 HKCU 安装方案当成已证实的 per-user TSF 注册。
 - 完成页默认启动用 `postinstall nowait skipifsilent runasoriginaluser`，不加 `unchecked`；先检查安装/注册成功、安全树和设置程序哈希。启动入口严格解析，提升 token 或查询失败均拒绝；普通用户 enable 后打开设置，不改默认输入法、不声称焦点已切换。nowait GUI 错误必须有固定 MessageBox，不能只有 stderr。包验收不能运行该入口，因为会修改用户启用状态。
