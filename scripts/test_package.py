@@ -256,6 +256,7 @@ class PackageFixture:
         for name in (
             "phrase_lexicon.tsv", "proper_lexicon.tsv", "coverage.json", "manifest.json",
             "quality-cases.json", "NOTICE.md", "sources/CC-BY-SA-4.0.txt", "sources/LICENSE-jieba.txt",
+            "sources/dict.txt",
         ):
             destination = self.repo / "data/pinyin/phrases" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +424,23 @@ class PackageTests(unittest.TestCase):
         path.write_text(json.dumps(report), encoding="utf-8")
         with self.assertRaisesRegex(flower_package.PackagingError, "实际覆盖"):
             flower_package._dictionary_bundle(self.fixture.repo)
+
+    def test_dictionary_bundle_rejects_forged_ranking_metadata(self):
+        path = self.fixture.repo / "data/pinyin/coverage.json"
+        report = json.loads(path.read_text(encoding="utf-8"))
+        report["ranking"]["revision"] = "0" * 40
+        path.write_text(json.dumps(report), encoding="utf-8")
+        with self.assertRaisesRegex(flower_package.PackagingError, "排序来源"):
+            flower_package._dictionary_bundle(self.fixture.repo)
+
+    def test_dictionary_bundle_rejects_changed_ranking_snapshot_or_license(self):
+        for name in ("dict.txt", "LICENSE-jieba.txt"):
+            path = self.fixture.repo / "data/pinyin/phrases/sources" / name
+            original = path.read_bytes()
+            path.write_bytes(b"broken")
+            with self.assertRaisesRegex(flower_package.PackagingError, "排序来源"):
+                flower_package._dictionary_bundle(self.fixture.repo)
+            path.write_bytes(original)
 
     def test_phrase_bundle_rejects_changed_core_or_missing_sharealike_license(self):
         path = self.fixture.repo / "data/pinyin/phrases/phrase_lexicon.tsv"

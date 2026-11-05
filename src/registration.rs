@@ -31,6 +31,7 @@ pub const ILOT_UNINSTALL: u32 = 0x0000_0001;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
     CheckInstallPath { path: OsString },
+    PrepareInstallPath { path: OsString },
     Register { dll: Option<OsString> },
     Unregister,
     Enable,
@@ -72,17 +73,21 @@ pub fn parse_arguments(arguments: Vec<OsString>) -> Result<CliCommand, CliError>
     if command == OsStr::new("register") {
         return parse_register_arguments(&arguments[1..]);
     }
-    if command == OsStr::new("check-install-path") {
+    if command == OsStr::new("check-install-path") || command == OsStr::new("prepare-install-path")
+    {
         return if arguments.len() == 3
             && arguments[1] == OsStr::new("--path")
             && !arguments[2].is_empty()
         {
-            Ok(CliCommand::CheckInstallPath {
-                path: arguments[2].clone(),
+            let path = arguments[2].clone();
+            Ok(if command == OsStr::new("prepare-install-path") {
+                CliCommand::PrepareInstallPath { path }
+            } else {
+                CliCommand::CheckInstallPath { path }
             })
         } else {
             Err(CliError {
-                message: "check-install-path 只接受必填的 --path <目录>。",
+                message: "目录命令只接受必填的 --path <目录>。",
             })
         };
     }

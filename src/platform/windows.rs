@@ -2291,6 +2291,21 @@ mod windows_exports {
             assert_eq!(read_document(&host, None), "你好你好shi你𠀀你hao");
             send_key(&sink, &host.context, b' ');
             assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好");
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .contexts
+                .get_mut(&context_key(&host.context))
+                .unwrap()
+                .router = EngineRouter::from_lexicon_tsv("ni'hao\t你好\t1000", 9).unwrap();
+            for key in b"NH" {
+                send_key(&sink, &host.context, *key);
+            }
+            assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好nh");
+            send_key(&sink, &host.context, b' ');
+            assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好你好");
             implementation.activation.borrow_mut().take();
         }
     }

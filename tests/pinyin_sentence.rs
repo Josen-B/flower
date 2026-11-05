@@ -158,3 +158,100 @@ fn an_extreme_external_candidate_index_is_an_error_not_an_overflow() {
     ));
     assert_eq!(s.preedit(), "ni");
 }
+
+#[test]
+fn whole_word_initials_commit_with_canonical_learning() {
+    for (raw, text, canonical) in [("nh", "你好", "ni'hao"), ("zg", "中国", "zhong'guo")] {
+        let mut s = session();
+        type_text(&mut s, raw);
+        assert_eq!(s.candidates_on_current_page()[0].comment, canonical);
+        assert_eq!(choose(&mut s, text).commit.as_deref(), Some(text));
+        assert_eq!(s.pending_input(), "");
+        assert_eq!(s.pending_learning().len(), 1);
+        assert_eq!(s.pending_learning()[0].pinyin, canonical);
+        assert_eq!(s.pending_learning()[0].text, text);
+    }
+}
+
+#[test]
+fn explicit_quotes_do_not_enable_initial_word_matching() {
+    for raw in ["n'h", "nh'"] {
+        let mut s = session();
+        type_text(&mut s, raw);
+        assert!(!s
+            .candidates_on_current_page()
+            .iter()
+            .any(|c| c.text == "你好"));
+    }
+}
+
+#[test]
+fn initials_use_first_ascii_letter_and_require_canonical_word_boundaries() {
+    let words = "zhong'guo\t中国\t100\nchang'sha\t长沙\t100\nshang'hai\t上海\t100\nnihao\t你好\t100\nni\t你\t100\nni'hao\t问\t100";
+    for (raw, expected) in [("zg", "中国"), ("cs", "长沙"), ("sh", "上海")] {
+        let mut s = PinyinSession::from_lexicon_tsv(words, 9).unwrap();
+        type_text(&mut s, raw);
+        assert_eq!(choose(&mut s, expected).commit.as_deref(), Some(expected));
+    }
+    for raw in ["n", "nh", "n'h", "zhg", "chs", "shh", "nih", "nhzg"] {
+        let mut s = PinyinSession::from_lexicon_tsv(words, 9).unwrap();
+        type_text(&mut s, raw);
+        assert!(
+            !s.candidates_on_current_page().iter().any(|c| {
+                ["中国", "长沙", "上海", "你好", "问"].contains(&c.text.as_str())
+            }),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn full_matches_and_combinations_precede_initials_then_partial_choices() {
+    let mut s = PinyinSession::from_lexicon_tsv(
+        "an\t全拼\t1\na\t啊\t1\nn\t嗯\t1\nai'ni\t爱你\t10000\nan\t爱你\t1",
+        9,
+    )
+    .unwrap();
+    type_text(&mut s, "an");
+    let candidates = s.candidates_on_current_page();
+    let position = |text| candidates.iter().position(|c| c.text == text).unwrap();
+    assert!(position("全拼") < position("啊嗯"));
+    assert!(position("啊嗯") < position("啊"));
+    assert_eq!(candidates.iter().filter(|c| c.text == "爱你").count(), 1);
+    assert_eq!(candidates[position("爱你")].comment, "an");
+
+    let mut s =
+        PinyinSession::from_lexicon_tsv("a\t啊\t1\nn\t嗯\t1\nai'ni\t爱你\t10000", 9).unwrap();
+    type_text(&mut s, "an");
+    assert_eq!(
+        s.candidates_on_current_page()
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>(),
+        ["啊嗯", "爱你", "啊"]
+    );
+}
+
+#[test]
+fn partial_undo_then_initial_commit_preserves_canonical_events() {
+    let mut s = session();
+    type_text(&mut s, "ninh");
+    assert!(!s
+        .candidates_on_current_page()
+        .iter()
+        .any(|c| c.text == "你你好"));
+    choose(&mut s, "你");
+    assert_eq!(s.pending_input(), "nh");
+    assert!(s.pending_learning().is_empty());
+    s.process_key(KeyEvent::plain(Key::Backspace)).unwrap();
+    s.process_key(KeyEvent::plain(Key::Backspace)).unwrap();
+    s.process_key(KeyEvent::plain(Key::Backspace)).unwrap();
+    assert_eq!(s.pending_input(), "ni");
+    type_text(&mut s, "nh");
+    choose(&mut s, "你");
+    assert_eq!(choose(&mut s, "你好").commit.as_deref(), Some("你你好"));
+    let events = s.pending_learning();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].pinyin, "ni");
+    assert_eq!(events[1].pinyin, "ni'hao");
+}

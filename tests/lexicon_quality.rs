@@ -1,4 +1,4 @@
-use flower::engine::{LearningEvent, Lexicon};
+use flower::engine::{Key, KeyEvent, LearningEvent, Lexicon, PinyinSession};
 
 #[test]
 fn actual_embedded_lexicon_keeps_all_fixed_phrase_cases_at_top_one() {
@@ -40,4 +40,62 @@ fn local_overlay_and_bounded_learning_do_not_mutate_the_shared_base() {
         u32::MAX,
     )]);
     assert_eq!(not_invented.lookup("shi"), base.lookup("shi"));
+}
+
+fn initial_candidates(lexicon: Lexicon, raw: &str) -> Vec<flower::Candidate> {
+    let mut session = PinyinSession::from_lexicon(lexicon, 9).unwrap();
+    for c in raw.chars() {
+        session.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+    }
+    let mut candidates = Vec::new();
+    for _ in 0..session.page_count() {
+        candidates.extend_from_slice(session.candidates_on_current_page());
+        session.next_page().unwrap();
+    }
+    candidates
+}
+
+#[test]
+fn initials_rank_same_reading_words_and_refresh_each_immutable_snapshot() {
+    let base = Lexicon::from_tsv("ni'hao\t你好\t1000\nni'hao\t拟好\t900").unwrap();
+    let base_candidates = initial_candidates(base.clone(), "nh");
+    assert_eq!(base_candidates[0].text, "你好");
+    assert_eq!(base_candidates[1].text, "拟好");
+    let overlay = base
+        .with_overlay("ni'hao\t拟好\t2000\nnan'hai\t南海\t1500")
+        .unwrap();
+    let candidates = initial_candidates(overlay, "nh");
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>(),
+        ["拟好", "南海", "你好"]
+    );
+    let learned = base.with_learning(&[(
+        LearningEvent {
+            pinyin: "ni'hao".into(),
+            text: "拟好".into(),
+        },
+        2,
+    )]);
+    let candidates = initial_candidates(learned, "nh");
+    assert_eq!(candidates[0].text, "拟好");
+    assert_eq!(candidates[0].comment, "ni'hao");
+    assert_eq!(initial_candidates(base, "nh"), base_candidates);
+}
+
+#[test]
+fn embedded_initials_include_hello_and_overlay_does_not_pollute_builtin() {
+    let builtin = Lexicon::builtin().unwrap();
+    let before = initial_candidates(builtin.clone(), "nh");
+    assert!(before
+        .iter()
+        .any(|c| c.text == "你好" && c.comment == "ni'hao"));
+    let overlay = builtin.with_overlay("ni'hao\t私词\t4294967295").unwrap();
+    assert_eq!(initial_candidates(overlay, "nh")[0].text, "私词");
+    assert_eq!(
+        initial_candidates(Lexicon::builtin().unwrap(), "nh"),
+        before
+    );
 }

@@ -16,6 +16,44 @@ use flower::registration::{
 };
 
 #[test]
+fn prepare_install_path_requires_exact_os_path_arguments() {
+    let args = |v: &[&str]| v.iter().map(OsString::from).collect();
+    assert_eq!(
+        parse_arguments(args(&["prepare-install-path", "--path", r"D:\软件\Flower"])),
+        Ok(CliCommand::PrepareInstallPath {
+            path: OsString::from(r"D:\软件\Flower"),
+        })
+    );
+    for tail in [
+        vec![],
+        vec!["--path"],
+        vec!["--path", ""],
+        vec!["--dll", "x"],
+        vec!["--path", "x", "--path", "y"],
+        vec!["--path", "x", "extra"],
+        vec!["--help"],
+    ] {
+        let mut values = vec!["prepare-install-path"];
+        values.extend(tail);
+        assert!(parse_arguments(args(&values)).is_err());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn prepare_install_path_parser_preserves_non_unicode_os_path() {
+    let path = OsString::from_wide(&[b'D' as u16, 58, 92, 0xd800]);
+    assert_eq!(
+        parse_arguments(vec![
+            "prepare-install-path".into(),
+            "--path".into(),
+            path.clone(),
+        ]),
+        Ok(CliCommand::PrepareInstallPath { path })
+    );
+}
+
+#[test]
 fn install_path_command_requires_exactly_one_nonempty_path() {
     let args = |v: &[&str]| v.iter().map(OsString::from).collect();
     assert_eq!(

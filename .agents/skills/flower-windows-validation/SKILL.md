@@ -49,6 +49,12 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 自定义机器安装目录不能仅开放向导路径页。用 check-install-path 只读检查本地固定盘、重解析点、owner/DACL、祖先替换权限及实际 payload 树；不要通过增加 users-readexec ACE 假装移除了继承写权限，也不要擅自改 D 盘父目录 ACL。
 - 安装前后及卸载前的 helper 必须来自核对哈希的私有临时副本；在执行安装树内 helper 前完成 ACL 检查。原生 SDDL 内存描述符可验证 allow/deny、inherit-only、null DACL 和未知 ACE，不需修改系统 ACL。SDDL 的 DC 是目录服务权限，不是文件系统 FILE_DELETE_CHILD；后者应使用 0x40。
 
+## 新建自定义安装目录
+
+- 当前目录策略契约见 `design/input-and-installation.md`。不要把缺失目标的最近已有祖先当作安装根严格检查；允许无关兄弟创建/属性写入，但拒绝普通目录删除、子项删除及改 DACL/owner。已验证的本地固定卷根不可像普通目录删除，非严格祖先检查仅可忽略根本身 DELETE，不忽略 FILE_DELETE_CHILD 或权限接管；不把此例外应用到子目录。
+- `check-install-path` 始终只读；`prepare-install-path` 是显式管理员写操作。后者仅对缺失组件用创建时的受保护 SDDL，新建即可信 owner/管理员SYSTEM全控/Users RX，保留禁止删除共享句柄后复查；不先创建可写目录再收紧，不修复已有对象，不自动改 D 盘根或父目录 ACL。同名竞争失败，不递归清理未知内容。
+- 安装器必须在旧注册/目录冲突及运行库门禁后、复制前 prepare/check。只读新路径检查通过不代表管理员创建/向导安装成功；完整许可和源ZIP核验也不等于运行期安装验收。新制品仍不得自动运行。
+
 ## 用户词典发布前进程终止回归
 
 - 可用隔离 `DictionaryStore::new` 指向本 Thread scratch 下词典，父进程持有目标的无 delete-sharing 只读句柄，让真实生产写入停留在原子发布前；不得使用真实用户词典或填满工作磁盘。

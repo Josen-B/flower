@@ -124,6 +124,12 @@ pub(crate) fn decode(lexicon: &Lexicon, raw: &str) -> Vec<Choice> {
             });
         }
     }
+    output.extend(
+        lexicon
+            .initial_choices(raw)
+            .into_iter()
+            .filter(|c| seen.insert((c.candidate.text.clone(), c.consumed))),
+    );
     let mut partial: Vec<_> = lexicon
         .prefix_choices(raw)
         .into_iter()

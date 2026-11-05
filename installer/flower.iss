@@ -131,7 +131,19 @@ begin
   end;
   Result := SafeInstallPath(WizardDirValue);
   if not Result then
-    MsgBox('此目录不满足机器级 DLL 安全要求。请选择本地固定盘上的受保护目录（默认 Program Files），不能使用网络、链接或普通用户可写/可替换的目录。D 盘父目录须由管理员预先保护；安装器不会更改已有目录权限。', mbError, MB_OK);
+    MsgBox('路径祖先可能允许普通用户替换目录，或已有目标允许普通用户写入。请选择安全的本地固定盘路径；不能使用网络或链接。缺失的新目录由安装器保护，已有目录权限不会更改。', mbError, MB_OK);
+end;
+
+function PrepareInstallPath(Name: String): Boolean;
+var
+  ExitCode: Integer;
+begin
+  Result := False;
+  if not PathCheckerReady then Exit;
+  if CompareText(GetSHA256OfFile(PathChecker), '{#ExpectedToolHash}') <> 0 then Exit;
+  if Exec(PathChecker, 'prepare-install-path --path "' + Name + '"',
+    ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+    Result := ExitCode = 0;
 end;
 
 function HasSubkeys(Key: String): Boolean;
@@ -253,6 +265,8 @@ begin
     Result := '目标版本目录已存在。为保护未知或未完成的安装，拒绝覆盖。'
   else if not HasNativeRuntime then
     Result := '请先安装 Microsoft Visual C++ v14 x64 运行库。本离线安装器不会下载它。'
+  else if not PrepareInstallPath(ExpandConstant('{app}')) then
+    Result := '安全准备目录失败：祖先或已有目标不安全，或创建时发生竞争。已有权限未更改；本次创建的空安全目录可能保留。'
   else if not SafeInstallPath(ExpandConstant('{app}')) then
     Result := '安装目录安全检查失败。请返回目录页选择受保护的本地目录。';
 end;

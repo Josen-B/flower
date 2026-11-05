@@ -10,6 +10,7 @@ Flower 注册工具（Windows x64）
 
 用法：
   flower-register check-install-path --path <目录>  只读检查机器安装目录安全性
+  flower-register prepare-install-path --path <目录>  安全创建缺失安装目录（管理员）
   flower-register register [--dll <path>]  注册机器级 COM/TSF 组件（管理员终端）
   flower-register unregister               注销机器级 COM/TSF 组件（管理员终端）
   flower-register enable                   为当前用户添加 Flower 输入法
@@ -57,6 +58,10 @@ fn run_command(command: CliCommand) -> Result<(), String> {
         CliCommand::CheckInstallPath { path } => {
             flower::platform::install_path::check_install_path(&PathBuf::from(path))?;
             println!("安装目录安全检查通过；未创建目录或修改权限。");
+        }
+        CliCommand::PrepareInstallPath { path } => {
+            flower::platform::install_path::prepare_install_path(&PathBuf::from(path))?;
+            println!("安装目录已安全准备并复查；未更改已有目录权限或内容。");
         }
         CliCommand::Register { dll } => {
             let dll = resolve_dll_path(dll)?;

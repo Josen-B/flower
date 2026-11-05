@@ -19,6 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+try:
+    from scripts import build_lexicon
+except ModuleNotFoundError:
+    import build_lexicon
+
 
 TARGET = "x86_64-pc-windows-msvc"
 EXPECTED_ROOT_LICENSE = "MIT OR Apache-2.0"
@@ -1172,6 +1177,13 @@ def _dictionary_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
         coverage = json.loads(payload["data/pinyin/coverage.json"])
         sources = json.loads(payload["data/pinyin/sources/manifest.json"])
         base = payload["data/pinyin/base_lexicon.tsv"]
+        if coverage.get("ranking") != build_lexicon.RANKING:
+            raise ValueError("单字排序来源元数据不一致")
+        # Validate only the ranking snapshot, not dev-only Unihan or CC-CEDICT.
+        try:
+            build_lexicon.load_frequencies(repo_root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise ValueError(f"单字排序来源校验失败：{error}") from error
         if (coverage["schema_version"] != 1 or sources["schema_version"] != 1
                 or coverage["baseline_expected"] != 8105 or coverage["baseline_covered"] != 8105
                 or coverage["missing_characters"] != []

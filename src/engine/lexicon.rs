@@ -6,8 +6,6 @@ use super::{Candidate, EngineError};
 const BUILTIN_LEXICON: &str = concat!(
     include_str!("../../data/pinyin/base_lexicon.tsv"),
     "\n",
-    include_str!("../../data/pinyin/mvp_lexicon.tsv"),
-    "\n",
     include_str!("../../data/pinyin/phrases/phrase_lexicon.tsv"),
 );
 
@@ -26,12 +24,13 @@ struct LexiconEntry {
 #[derive(Debug, Clone)]
 pub struct Lexicon {
     entries: Arc<HashMap<String, Vec<LexiconEntry>>>,
+    initials: Arc<HashMap<String, Vec<LexiconEntry>>>,
 }
 
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
 
 impl Lexicon {
-    /// Loads the shared single-character base and demo phrases embedded at build time.
+    /// Loads the shared single-character base and core phrases embedded at build time.
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
             .get_or_init(|| Self::from_tsv(BUILTIN_LEXICON))
@@ -141,8 +140,50 @@ impl Lexicon {
         }
 
         Ok(Self {
+            initials: Arc::new(Self::build_initials(&entries)),
             entries: Arc::new(entries),
         })
+    }
+
+    fn build_initials(
+        entries: &HashMap<String, Vec<LexiconEntry>>,
+    ) -> HashMap<String, Vec<LexiconEntry>> {
+        let mut initials: HashMap<String, Vec<LexiconEntry>> = HashMap::new();
+        for entry in entries.values().flatten() {
+            let syllables: Vec<_> = entry.reading.split('\'').collect();
+            if syllables.len() < 2 || syllables.len() != entry.text.chars().count() {
+                continue;
+            }
+            let key: String = syllables.iter().map(|s| s.as_bytes()[0] as char).collect();
+            initials.entry(key).or_default().push(entry.clone());
+        }
+        for words in initials.values_mut() {
+            words.sort_by(|a, b| {
+                b.weight
+                    .cmp(&a.weight)
+                    .then_with(|| a.text.cmp(&b.text))
+                    .then_with(|| a.reading.cmp(&b.reading))
+            });
+        }
+        initials
+    }
+
+    pub(crate) fn initial_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        if raw.contains('\'') {
+            return Vec::new();
+        }
+        self.initials
+            .get(raw)
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                super::decoder::Choice::word(
+                    Candidate::new(&entry.text, &entry.reading),
+                    raw.len(),
+                    entry.weight,
+                )
+            })
+            .collect()
     }
 
     /// Parses a byte slice, reporting invalid UTF-8 as an engine error.
@@ -188,6 +229,7 @@ impl Lexicon {
                     .then_with(|| a.reading.cmp(&b.reading))
             });
         }
+        result.initials = Arc::new(Self::build_initials(table));
         Ok(result)
     }
 
@@ -211,6 +253,7 @@ impl Lexicon {
                 entries.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
             }
         }
+        result.initials = Arc::new(Self::build_initials(table));
         result
     }
 
@@ -284,6 +327,8 @@ mod tests {
         let snapshot = first.clone();
         assert!(Arc::ptr_eq(&first.entries, &second.entries));
         assert!(Arc::ptr_eq(&first.entries, &snapshot.entries));
+        assert!(Arc::ptr_eq(&first.initials, &second.initials));
+        assert!(Arc::ptr_eq(&first.initials, &snapshot.initials));
         let custom = Lexicon::from_tsv("ni\t你\t1").unwrap();
         assert!(!Arc::ptr_eq(&first.entries, &custom.entries));
     }

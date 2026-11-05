@@ -39,6 +39,14 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 - 不假定 share-delete 读取句柄一定允许目标被替换。合作读取与写入须协调；用受控短暂/永久占用、readonly 和原生 API 最小复现验证原子一致性。任何有限重试都保留旧文件，不删旧目标、不改权限、不换非原子兜底。
 - DLL 内工作线程须 stop/join，并在 join 后才释放独立 DLL 存活计数；不要只依赖文本服务字段的默认析构次序。
 
+## 字频与整词首字母
+
+- 当前契约见 `design/input-and-installation.md`。单字使用固定 jieba 快照的精确文字频率，并在优先读音/其他基线读音/扩展读音三档内压缩排序；不要直接让文字总频率跨读音档，否则 `yi` 的“也”等次读音可能压过“一”。来源与许可损坏须失败关闭，coverage 和包校验同步；完整读音及分页候选不截断。
+- 内置表不再叠加 MVP 演示权重，MVP 仅供小 fixture 和审计。已声明无解的测试输入可能因简拼获得真实候选（例如 `xyz`），用明确小词典测试无解契约，不删除候选或放宽断言。
+- 简拼仅规范分音词条的每音节首个 ASCII 字母，至少两音节且每字一音节；预建共享索引，overlay/learning 后同步，按键不扫描全表。不猜连写演示词、不默认混拼或缩写组句。实际消耗用缩写 raw 长度，显示/学习保留 canonical reading。
+- 真实词频可能让 `nh` 的“你好”不是首项；验证它可翻页选择并正确提交，不用手工硬编码示例权重冒充统计质量。完整全拼/组合在简拼之前，简拼在部分前缀之前。
+- `tests/common_ranking.rs` 覆盖真实内置排序和简拼，`tests/pinyin_sentence.rs`、`tests/lexicon_quality.rs` 覆盖状态与快照一致性；原生 Context 回归可验证 NH 到“你好”的编辑路径，仍不证明实机激活。
+
 ## 最小充分验证
 
 - 数据/转换：`python -m unittest scripts.test_lexicon -v`，`python scripts/build_lexicon.py --check`。

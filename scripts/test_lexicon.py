@@ -70,7 +70,46 @@ class LexiconSourceTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
         shutil.copytree(lex.ROOT / "data/pinyin/sources", root / "data/pinyin/sources")
+        prefix = root / "data/pinyin/phrases"
+        (prefix / "sources").mkdir(parents=True)
+        for name in ("manifest.json", "sources/dict.txt", "sources/LICENSE-jieba.txt"):
+            shutil.copyfile(lex.ROOT / "data/pinyin/phrases" / name, prefix / name)
         return root
+
+    def test_frequency_rank_is_integer_monotone_and_bounded(self):
+        ranks = [lex.frequency_rank(value) for value in range(100000)]
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertEqual(ranks[0], 0)
+        self.assertEqual(lex.frequency_rank(3), 12)
+        self.assertEqual(lex.frequency_rank(1 << 30), 179)
+        self.assertLess(1 + 98, 100)
+        self.assertLess(100 + 99, 220)
+
+    def test_frequency_snapshot_and_license_corruption_fail_closed(self):
+        for name in ("dict.txt", "LICENSE-jieba.txt"):
+            root = self.fixture()
+            (root / "data/pinyin/phrases/sources" / name).write_bytes(b"broken")
+            with self.assertRaisesRegex(lex.LexiconBuildError, "校验"):
+                lex.generate(root)
+
+    def test_frequency_preserves_all_readings_and_preferred_tiers(self):
+        outputs = lex.generate()
+        baseline = lex.parse_baseline(
+            (lex.ROOT / "data/pinyin/sources/kMandarin_8105.txt").read_text(encoding="utf-8"))
+        readings = lex.parse_unihan(
+            (lex.ROOT / "data/pinyin/sources/Unihan_Readings.txt").read_text(encoding="utf-8"))
+        expected = {(key, char) for char, keys in readings.items() for key in keys}
+        expected.update((key, char) for char, key in baseline.items())
+        rows = [line.split("\t") for line in outputs["data/pinyin/base_lexicon.tsv"].decode().splitlines()
+                if not line.startswith("#")]
+        self.assertEqual({(key, char) for key, char, _ in rows}, expected)
+        for key, char, weight in rows:
+            low, high = ((220, 399) if key == baseline.get(char) else
+                         (100, 199) if char in baseline else (1, 99))
+            self.assertTrue(low <= int(weight) <= high)
+        for key, preferred in (("yi", "一"), ("ni", "你")):
+            candidates = [(char, int(weight)) for reading, char, weight in rows if reading == key]
+            self.assertEqual(max(candidates, key=lambda row: row[1])[0], preferred)
 
     def test_source_hash_mismatch_is_rejected(self):
         root = self.fixture()

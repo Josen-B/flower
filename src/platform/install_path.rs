@@ -1,6 +1,6 @@
-//! Read-only, fail-closed checks for machine-wide executable installation paths.
+//! Fail-closed checks and explicit preparation of machine installation paths.
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
@@ -9,14 +9,16 @@ use std::path::{Path, PathBuf};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     GetAce, IsValidSid, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetFileInformationByHandle, QueryDosDeviceW, BY_HANDLE_FILE_INFORMATION,
+    CreateDirectoryW, GetDriveTypeW, GetFileInformationByHandle, QueryDosDeviceW,
+    BY_HANDLE_FILE_INFORMATION,
 };
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 
@@ -26,10 +28,11 @@ const INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-227
 const CREATOR_OWNER: &str = "S-1-3-0";
 const INHERIT_ONLY: u8 = 0x08;
 const REPARSE_POINT: u32 = 0x400;
-// DELETE, WRITE_DAC, WRITE_OWNER, generic write/all, MAXIMUM_ALLOWED,
-// WRITE_EA, WRITE_ATTRIBUTES and FILE_DELETE_CHILD.
-const ANCESTOR_MUTATION: u32 = 0x520d_0150;
-const TREE_MUTATION: u32 = ANCESTOR_MUTATION | 0x6; // write/add file, append/add subdirectory
+// DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, MAXIMUM_ALLOWED, FILE_DELETE_CHILD.
+const ANCESTOR_MUTATION: u32 = 0x120d_0040;
+const TREE_MUTATION: u32 = ANCESTOR_MUTATION | 0x4000_0116;
+const INSTALL_DIRECTORY_SDDL: &str =
+    "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)";
 
 fn trusted(sid: &str) -> bool {
     matches!(sid, SYSTEM | ADMINS | INSTALLER)
@@ -47,6 +50,18 @@ fn allow_is_safe(sid: &str, mask: u32, flags: u8, strict: bool) -> bool {
     } else {
         ANCESTOR_MUTATION
     } == 0
+}
+
+fn path_allow_is_safe(sid: &str, mask: u32, flags: u8, strict: bool, volume_root: bool) -> bool {
+    // A verified local volume root cannot itself be removed or renamed like a
+    // directory. DELETE on it does not grant FILE_DELETE_CHILD. Never ignore
+    // deletion on ordinary ancestors, or DACL/owner/child replacement rights.
+    let mask = if volume_root && !strict {
+        mask & !0x0001_0000
+    } else {
+        mask
+    };
+    allow_is_safe(sid, mask, flags, strict)
 }
 
 fn validate_spelling(text: &str) -> Result<(), String> {
@@ -107,7 +122,7 @@ unsafe fn sid_string(sid: PSID) -> Result<String, String> {
     result.to_string().map_err(|e| e.to_string())
 }
 
-fn inspect(path: &Path, strict: bool) -> Result<bool, String> {
+fn inspect(path: &Path, strict: bool) -> Result<(bool, File), String> {
     // Do not follow the final component; every ancestor is independently inspected.
     // Keep a no-delete-share handle open throughout the descriptor inspection.
     let file = OpenOptions::new()
@@ -119,6 +134,9 @@ fn inspect(path: &Path, strict: bool) -> Result<bool, String> {
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if metadata.file_attributes() & REPARSE_POINT != 0 {
         return Err("不允许重解析点、符号链接或目录联接".into());
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err("不允许未知文件类型".into());
     }
     unsafe {
         let handle = HANDLE(file.as_raw_handle());
@@ -142,13 +160,19 @@ fn inspect(path: &Path, strict: bool) -> Result<bool, String> {
         );
         let _memory = LocalAllocation(descriptor.0);
         status.ok().map_err(|e| e.to_string())?;
-        inspect_acl(owner, acl, strict)?;
+        let volume_root = path.parent().is_none() && path.has_root();
+        inspect_acl(owner, acl, strict, volume_root)?;
     }
-    Ok(metadata.is_dir())
+    Ok((metadata.is_dir(), file))
 }
 
 // The pointers must belong to a live, OS-validated security descriptor.
-unsafe fn inspect_acl(owner: PSID, acl: *const ACL, strict: bool) -> Result<(), String> {
+unsafe fn inspect_acl(
+    owner: PSID,
+    acl: *const ACL,
+    strict: bool,
+    volume_root: bool,
+) -> Result<(), String> {
     if !trusted(&sid_string(owner)?) {
         return Err("owner 必须为 SYSTEM、Administrators 或 TrustedInstaller".into());
     }
@@ -171,7 +195,7 @@ unsafe fn inspect_acl(owner: PSID, acl: *const ACL, strict: bool) -> Result<(), 
         let bytes = std::slice::from_raw_parts(ace.cast::<u8>(), size);
         let mask = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let sid = sid_string(PSID(ace.cast::<u8>().add(8).cast()))?;
-        if !allow_is_safe(&sid, mask, header[1], strict) {
+        if !path_allow_is_safe(&sid, mask, header[1], strict, volume_root) {
             return Err(format!("非可信 SID {sid} 具有写入或替换权限"));
         }
     }
@@ -180,6 +204,53 @@ unsafe fn inspect_acl(owner: PSID, acl: *const ACL, strict: bool) -> Result<(), 
 
 /// Validate a prospective root or an existing installation tree, without writes.
 pub fn check_install_path(path: &Path) -> Result<(), String> {
+    check_path(path, false).map(|_| ())
+}
+
+/// Create only missing directories with their final protected descriptor.
+/// Existing objects are never repaired, re-owned or removed.
+pub fn prepare_install_path(path: &Path) -> Result<(), String> {
+    let (mut guards, components) = check_path(path, false)?;
+    for component in components {
+        create_protected_directory(&component)?;
+        let (directory, guard) = inspect(&component, true)?;
+        if !directory {
+            return Err("新建组件不是目录。".into());
+        }
+        guards.push(guard);
+    }
+    // Keep every earlier no-delete handle alive until the strict recheck ends.
+    let final_guards = check_path(path, true)?;
+    drop(final_guards);
+    drop(guards);
+    Ok(())
+}
+
+fn create_protected_directory(path: &Path) -> Result<(), String> {
+    unsafe {
+        let input = wide(OsStr::new(INSTALL_DIRECTORY_SDDL));
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(input.as_ptr()),
+            1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _memory = LocalAllocation(descriptor.0);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: false.into(),
+        };
+        let name = wide(path.as_os_str());
+        // Unlike create_dir_all, ERROR_ALREADY_EXISTS is a failure, not adoption.
+        CreateDirectoryW(PCWSTR(name.as_ptr()), Some(&attributes))
+            .map_err(|e| format!("无法安全创建 {}：{e}", path.display()))
+    }
+}
+
+fn check_path(path: &Path, require_existing: bool) -> Result<(Vec<File>, Vec<PathBuf>), String> {
     let text = path.to_str().ok_or("目录必须为有效 Unicode")?;
     validate_spelling(text)?;
     unsafe {
@@ -212,18 +283,36 @@ pub fn check_install_path(path: &Path) -> Result<(), String> {
     ancestors.reverse();
     let mut existing = Vec::new();
     let mut missing = false;
+    let mut missing_components = Vec::new();
     for ancestor in ancestors {
         match fs::symlink_metadata(ancestor) {
             Ok(_) if !missing => existing.push(ancestor),
             Ok(_) => return Err("目录结构在检查期间发生变化。".into()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+                missing_components.push(ancestor.to_path_buf());
+            }
             Err(e) => return Err(format!("{}：{e}", ancestor.display())),
         }
     }
+    if require_existing && missing {
+        return Err("准备后的安装目录不存在。".into());
+    }
+    let mut guards = Vec::new();
     for (index, ancestor) in existing.iter().enumerate() {
-        let strict = index + 1 == existing.len();
-        let directory = inspect(ancestor, strict)
-            .map_err(|e| format!("安装目录不安全：{}：{e}", ancestor.display()))?;
+        let strict = !missing && index + 1 == existing.len();
+        let (directory, guard) = inspect(ancestor, strict).map_err(|e| {
+            format!(
+                "{}不安全：{}：{e}",
+                if strict {
+                    "已有安装目标"
+                } else {
+                    "安装路径祖先"
+                },
+                ancestor.display()
+            )
+        })?;
+        guards.push(guard);
         if !directory {
             return Err(format!("{} 不是目录", ancestor.display()));
         }
@@ -238,15 +327,16 @@ pub fn check_install_path(path: &Path) -> Result<(), String> {
                 if count > 4096 {
                     return Err("安装树过大，拒绝检查未知目录。".into());
                 }
-                if inspect(&entry.path(), true)
-                    .map_err(|e| format!("{}：{e}", entry.path().display()))?
-                {
+                let (directory, guard) = inspect(&entry.path(), true)
+                    .map_err(|e| format!("{}：{e}", entry.path().display()))?;
+                guards.push(guard);
+                if directory {
                     pending.push(entry.path());
                 }
             }
         }
     }
-    Ok(())
+    Ok((guards, missing_components))
 }
 
 #[cfg(test)]
@@ -274,12 +364,32 @@ mod tests {
             let mut acl = std::ptr::null_mut();
             GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted).unwrap();
             GetSecurityDescriptorDacl(descriptor, &mut present, &mut acl, &mut defaulted).unwrap();
-            inspect_acl(owner, acl, strict)
+            if sddl == INSTALL_DIRECTORY_SDDL {
+                use windows::Win32::Security::{GetSecurityDescriptorControl, SE_DACL_PROTECTED};
+                let mut control = 0u16;
+                let mut revision = 0u32;
+                GetSecurityDescriptorControl(descriptor, &mut control, &mut revision).unwrap();
+                assert_ne!(control & SE_DACL_PROTECTED.0, 0);
+                assert_eq!(sid_string(owner).unwrap(), ADMINS);
+                assert!(present.as_bool());
+                assert_eq!((*acl).AceCount, 3);
+                for index in 0..3 {
+                    let mut ace = std::ptr::null_mut();
+                    GetAce(acl, index, &mut ace).unwrap();
+                    let header = std::slice::from_raw_parts(ace.cast::<u8>(), 4);
+                    assert_eq!(header[0], 0); // allow
+                    assert_eq!(header[1], 3); // object + container inheritance
+                }
+            }
+            inspect_acl(owner, acl, strict, false)
         }
     }
 
     #[test]
     fn native_descriptors_are_fail_closed_without_changing_filesystem_acl() {
+        assert!(check_sddl(INSTALL_DIRECTORY_SDDL, true).is_ok());
+        assert!(check_sddl("O:BAD:(A;;GW;;;BU)", false).is_ok());
+        assert!(check_sddl("O:BAD:(A;;GW;;;BU)", true).is_err());
         assert!(check_sddl("O:BAD:(A;;FA;;;BA)(A;;FRFX;;;BU)", true).is_ok());
         assert!(check_sddl("O:SYD:", true).is_ok()); // empty DACL
         assert!(check_sddl("O:BAD:NO_ACCESS_CONTROL", true).is_err());
@@ -338,10 +448,33 @@ mod tests {
         }
         assert!(allow_is_safe("S-1-5-11", 0x1200a9, 0, true)); // read/execute
         assert!(allow_is_safe("S-1-5-11", 4, 0, false)); // root may create new dirs
+        for mask in [2, 4, 0x10, 0x100, 0x40000000] {
+            assert!(allow_is_safe("S-1-5-11", mask, 0, false));
+            assert!(!allow_is_safe("S-1-5-11", mask, 0, true));
+        }
+        for mask in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000, 0x02000000] {
+            assert!(!allow_is_safe("S-1-5-11", mask, 0, false));
+            assert!(!allow_is_safe("S-1-5-11", mask, 0, true));
+        }
         assert!(!allow_is_safe("S-1-5-11", 0x40, 0, false)); // not replace children
         assert!(allow_is_safe("S-1-5-11", 0x1f01ff, INHERIT_ONLY, false));
         assert!(!allow_is_safe("S-1-5-11", 0x1f01ff, INHERIT_ONLY, true));
         assert!(allow_is_safe(CREATOR_OWNER, 0x1f01ff, INHERIT_ONLY, true));
         assert!(!allow_is_safe(CREATOR_OWNER, 0x1f01ff, 0, true));
+    }
+
+    #[test]
+    fn volume_root_delete_is_not_a_child_replacement_right() {
+        let users = "S-1-5-11";
+        // Typical data-volume root: Modify without FILE_DELETE_CHILD.
+        assert!(path_allow_is_safe(users, 0x1301bf, 0, false, true));
+        assert!(!path_allow_is_safe(users, 0x1301bf, 0, false, false));
+        assert!(!path_allow_is_safe(users, 0x1301bf, 0, true, true));
+        for mask in [0x40, 0x40000, 0x80000, 0x10000000, 0x02000000] {
+            assert!(!path_allow_is_safe(users, mask, 0, false, true));
+        }
+        assert!(Path::new(r"D:\").parent().is_none());
+        assert!(Path::new(r"D:\").has_root());
+        assert!(Path::new(r"D:\Apps").parent().is_some());
     }
 }

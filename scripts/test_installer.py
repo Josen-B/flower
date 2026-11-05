@@ -28,14 +28,26 @@ class InstallerSourceTests(unittest.TestCase):
         checker = source.split("function SafeInstallPath", 1)[1].split("function NextButtonClick", 1)[0]
         self.assertLess(checker.index("GetSHA256OfFile"), checker.index("if Exec("))
         self.assertIn("check-install-path --path", checker)
+        page = source.split("function NextButtonClick", 1)[1].split("function PrepareInstallPath", 1)[0]
+        self.assertIn("SafeInstallPath(WizardDirValue)", page)
+        self.assertNotIn("prepare-install-path", page)
+        self.assertNotIn("PrepareInstallPath(", page)
+        for gate in ["HasFlowerRegistration", "DirExists(PayloadDir)", "HasNativeRuntime"]:
+            self.assertLess(prepare.index(gate), prepare.index("PrepareInstallPath("))
+        self.assertLess(prepare.index("PrepareInstallPath("), prepare.index("SafeInstallPath("))
+        creator = source.split("function PrepareInstallPath", 1)[1].split("function HasSubkeys", 1)[0]
+        self.assertLess(creator.index("GetSHA256OfFile"), creator.index("if Exec("))
+        self.assertIn("prepare-install-path --path", creator)
 
     def test_post_copy_and_uninstall_validate_before_executing_installed_tool(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
         post = source.split("procedure CurStepChanged", 1)[1].split("procedure CurPageChanged", 1)[0]
         self.assertLess(post.index("SafeInstallPath"), post.index("if Exec(PayloadDir"))
+        self.assertNotIn("PrepareInstallPath(", post)
         uninstall = source.split("function InitializeUninstall", 1)[1]
         self.assertLess(uninstall.index("FileCopy("), uninstall.index("SafeInstallPath"))
         self.assertLess(uninstall.index("SafeInstallPath"), uninstall.index("if not Exec(PayloadDir"))
+        self.assertNotIn("PrepareInstallPath(", uninstall)
 
 
 class InstallerTests(unittest.TestCase):

@@ -126,7 +126,9 @@ fn space_and_enter_commit_the_highlighted_candidate() {
 
 #[test]
 fn space_commits_raw_pinyin_when_no_candidate_exists() {
-    let mut session = session();
+    // A production dictionary may now resolve xyz as word initials.
+    // Exercise the no-match contract with an explicit small dictionary instead.
+    let mut session = PinyinSession::from_lexicon_tsv("ni\t你\t100", 9).unwrap();
     type_text(&mut session, "xyz");
     let update = session
         .process_key(KeyEvent::plain(Key::Space))

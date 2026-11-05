@@ -13,7 +13,14 @@
 - 原始下载地址、各文件哈希与上游 ZIP 哈希见 `manifest.json`。
   不使用该仓库混合其他来源的 `pinyin.txt`，也不引入 CC-CEDICT 或网站字典数据。
 - `scripts/build_lexicon.py` 将有实际读音的单字转换为无声调拼音，
-  `ü/u:` 记作 `v`。权重为静态优先级，不是语料词频。
+  `ü/u:` 记作 `v`。保留优先读音、其他基线读音、扩展读音三档，
+  档内使用固定 jieba 快照的精确单字文字频率（不是读音频率）。
+  以纯整数 log2 分桶压缩；确切公式、提交与 SHA-256 见 `../coverage.json`。
+- 词频复用 `../phrases/sources/dict.txt`，来自 fxsjy/jieba 提交
+  `67fa2e36e72f69d9134b8a1037b83fbb070b9775`，Copyright (c) 2013 Sun Junyi。
+  字节哈希及完整 MIT 许可由已有 `../phrases/manifest.json` 核验；
+  分发包复用 `licenses/phrases/LICENSE-jieba.txt`。不复制原始词典到运行包，
+  不使用 CC-CEDICT 数据生成单字库。
 - 分发包附带生成词库、8105 检查集、来源清单和覆盖报告。8 MB 原始 Unicode
   快照保留在源码仓库供重建，不是已安装程序的运行依赖；两份完整许可及本说明
   放入分发包 `licenses/dictionaries/`。
