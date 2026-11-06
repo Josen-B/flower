@@ -28,6 +28,7 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 pub struct Settings {
     pub candidate_page_size: usize,
     pub theme: Theme,
+    pub ai_correction_enabled: bool,
 }
 
 impl Default for Settings {
@@ -35,6 +36,7 @@ impl Default for Settings {
         Self {
             candidate_page_size: DEFAULT_CANDIDATE_PAGE_SIZE,
             theme: Theme::System,
+            ai_correction_enabled: true,
         }
     }
 }
@@ -318,7 +320,24 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.candidate_page_size, 9);
         assert_eq!(settings.theme, Theme::System);
+        assert!(settings.ai_correction_enabled);
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_settings_use_new_default_but_preserve_explicit_opt_out() {
+        let old: Settings =
+            serde_json::from_str(r#"{"candidate_page_size":7,"theme":"dark"}"#).unwrap();
+        assert!(old.ai_correction_enabled);
+        let opted_out = Settings {
+            ai_correction_enabled: false,
+            ..old
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&opted_out).unwrap()).unwrap();
+        assert!(!restored.ai_correction_enabled);
+        assert_eq!(restored.candidate_page_size, 7);
+        assert_eq!(restored.theme, Theme::Dark);
     }
 
     #[test]
@@ -344,6 +363,7 @@ mod tests {
         let settings = Settings {
             candidate_page_size: 7,
             theme: Theme::Dark,
+            ai_correction_enabled: false,
         };
         store.save(&settings).expect("save settings");
         assert_eq!(store.load().expect("load settings"), settings);
@@ -351,6 +371,7 @@ mod tests {
         let replacement = Settings {
             candidate_page_size: 19,
             theme: Theme::Light,
+            ai_correction_enabled: true,
         };
         store.save(&replacement).expect("replace settings");
         assert_eq!(store.load().expect("load replacement"), replacement);
@@ -370,6 +391,7 @@ mod tests {
         let original = Settings {
             candidate_page_size: 9,
             theme: Theme::System,
+            ai_correction_enabled: false,
         };
         store.save(&original).expect("save original settings");
         let original_json = fs::read(store.path()).expect("read original JSON");
@@ -377,6 +399,7 @@ mod tests {
         let settings = Settings {
             candidate_page_size: 0,
             theme: Theme::Dark,
+            ai_correction_enabled: false,
         };
         assert!(matches!(
             settings.validate(),
@@ -413,6 +436,7 @@ mod tests {
         let settings = Settings {
             candidate_page_size: 21,
             theme: Theme::Dark,
+            ai_correction_enabled: false,
         };
         store.save(&settings).expect("create directory and save");
         assert_eq!(store.load().expect("load settings"), settings);

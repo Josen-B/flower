@@ -12,11 +12,22 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import installer
-from scripts.test_package import PackageFixture, flower_package, make_pe
+from scripts.test_package import PackageFixture, ai_fixture, flower_package, make_pe
 
 
 class InstallerSourceTests(unittest.TestCase):
     """Static integration guards, not a substitute for executing the wizard."""
+
+    def test_shortcuts_have_clean_names_without_changing_commands(self):
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        icons = source.split("[Icons]", 1)[1].split("[Run]", 1)[0]
+        self.assertIn(r'Name: "{commonprograms}\Flower\启动 Flower";', icons)
+        self.assertIn(r'Name: "{commonprograms}\Flower\停用 Flower";', icons)
+        self.assertNotIn("当前用户", icons)
+        self.assertNotIn("(", icons)
+        self.assertIn('Parameters: "enable"', icons)
+        self.assertIn('Parameters: "disable"', icons)
+        self.assertNotIn("runas", icons)
 
     def test_non_elevated_copy_and_handle_only_rollback_contract(self):
         source = (installer.REPO / "src/platform/install_path.rs").read_text(encoding="utf-8-sig")
@@ -103,14 +114,106 @@ class InstallerSourceTests(unittest.TestCase):
 
 
 class InstallerTests(unittest.TestCase):
+    def test_base_rejects_unrecorded_model_and_variant_filename_mismatch(self):
+        original = self.archive.read_bytes()
+        self.rewrite(lambda c: c.update({
+            "flower-0.4.7-windows-x64/ai/model_int8.onnx": b"unrecorded",
+        }), rehash_payload=True)
+        with self.assertRaises(installer.InstallerError):
+            installer.verify_package(self.archive)
+        self.archive.write_bytes(original)
+        self.archive = self.archive.rename(
+            self.archive.with_name("flower-0.4.7-windows-x64-ai.zip"))
+        self.refresh_external_hash()
+        with self.assertRaisesRegex(installer.InstallerError, "变体"):
+            installer.verify_package(self.archive)
+
+    def test_new_version_rejects_base_even_with_rehashed_manifest(self):
+        def mutate(data):
+            name = "flower-0.4.7-windows-x64/manifest.json"
+            manifest = json.loads(data[name])
+            manifest.update(variant="base", ai={"available": False})
+            data[name] = json.dumps(manifest).encode()
+            for key in list(data):
+                if "/ai/" in key:
+                    del data[key]
+        self.rewrite(mutate, rehash_payload=True)
+        with self.assertRaisesRegex(installer.InstallerError, "完整 AI"):
+            installer.verify_package(self.archive)
+
+    def test_zip_windows_reparse_attribute_is_rejected(self):
+        with zipfile.ZipFile(self.archive, "a") as target:
+            info = zipfile.ZipInfo("flower-0.4.7-windows-x64/licenses/reparse.txt")
+            info.create_system = 0
+            info.external_attr = 0x400
+            target.writestr(info, b"reparse")
+        self.refresh_external_hash()
+        with self.assertRaisesRegex(installer.InstallerError, "非普通文件"):
+            installer.verify_package(self.archive)
+
+    def test_ai_installer_variant_and_source_zip_association(self):
+        (self.base / "nested-assets").mkdir()
+        with ai_fixture(self.base / "nested-assets") as (bundle, source, record):
+            (self.base / "ai-project").mkdir()
+            fixture = PackageFixture(self.base / "ai-project")
+            self.archive = flower_package.build_package(
+                repo_root=fixture.repo, output_dir=self.base / "ai-zip",
+                host_platform="win32", runner=fixture.runner(), ai_assets=bundle,
+            ).zip_path
+            verified = installer.verify_package(self.archive)
+            self.assertEqual(verified.variant, "ai")
+
+            result = self.build()
+            self.assertEqual(result.executable.name, "flower-0.4.7-windows-x64-setup.exe")
+            output = json.loads(result.manifest.read_bytes())
+            self.assertEqual(output["variant"], "ai")
+            self.assertEqual(output["source_zip"], self.archive.name)
+            self.assertEqual(output["source_zip_sha256"], verified.digest)
+            self.assertEqual(output["build_id"], f"0.4.7-{verified.digest[:12]}")
+
+    def test_ai_installer_rejects_partial_unrecorded_extra_and_forged_assets(self):
+        (self.base / "nested-assets").mkdir()
+        with ai_fixture(self.base / "nested-assets") as (bundle, source, record):
+            (self.base / "ai-project").mkdir()
+            fixture = PackageFixture(self.base / "ai-project")
+            self.archive = flower_package.build_package(
+                repo_root=fixture.repo, output_dir=self.base / "ai-zip",
+                host_platform="win32", runner=fixture.runner(), ai_assets=bundle,
+            ).zip_path
+            original = self.archive.read_bytes()
+            root = "flower-0.4.7-windows-x64/"
+
+            def manifest_change(contents, mutate):
+                obj = json.loads(contents[root + "manifest.json"])
+                mutate(obj)
+                contents[root + "manifest.json"] = json.dumps(obj).encode()
+
+            mutations = [
+                lambda c: c.pop(root + "ai/LICENSE-model.txt"),
+                lambda c: c.update({root + "ai/provider.dll": b"extra"}),
+                lambda c: c.update({root + "ai/model_int8.onnx": b"forged"}),
+                lambda c: c.update({root + "ai/manifest.json": source.read_bytes() + b"\n"}),
+                lambda c: manifest_change(c, lambda m: m.pop("ai")),
+                lambda c: manifest_change(c, lambda m: m["ai"].update(source_manifest_sha256="0" * 64)),
+                lambda c: manifest_change(c, lambda m: m.update(variant="base")),
+            ]
+            for mutate in mutations:
+                self.archive.write_bytes(original)
+                self.rewrite(mutate, rehash_payload=True)
+                with self.subTest(mutate=mutate):
+                    with self.assertRaises(installer.InstallerError):
+                        installer.verify_package(self.archive)
+            self.assertEqual(self.calls, 0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        bundle, _, _ = self.enterContext(ai_fixture(self.base))
         fixture = PackageFixture(self.base)
         self.archive = flower_package.build_package(
             repo_root=fixture.repo, output_dir=self.base / "zip",
-            host_platform="win32", runner=fixture.runner(),
+            host_platform="win32", runner=fixture.runner(), ai_assets=bundle,
         ).zip_path
         self.compiler = self.base / "compiler with spaces" / "ISCC.exe"
         self.compiler.parent.mkdir()
@@ -129,7 +232,7 @@ class InstallerTests(unittest.TestCase):
             for arg in args if arg.startswith("/D") and "=" in arg
         }
         payload = Path(options["PackageDir"])
-        self.assertEqual(options["FileVersion"], "0.1.0.0")
+        self.assertEqual(options["FileVersion"], "0.4.7.0")
         include = Path(options["FilesInclude"]).read_text(encoding="utf-8-sig")
         self.assertEqual(len(include.splitlines()), len(list(payload.rglob("*"))) -
                          len([p for p in payload.rglob("*") if p.is_dir()]))
@@ -146,7 +249,10 @@ class InstallerTests(unittest.TestCase):
             options["ExpectedSettingsHash"],
             hashlib.sha256((payload / "flower-settings.exe").read_bytes()).hexdigest(),
         )
-        output = Path(options["OutputDir"]) / f"flower-{options['AppVersion']}-windows-x64-setup.exe"
+        stem = next(arg[2:] for arg in args if arg.startswith("/F"))
+        expected_stem = self.archive.stem + "-setup"
+        self.assertEqual(stem, expected_stem)
+        output = Path(options["OutputDir"]) / f"{stem}.exe"
         output.write_bytes(make_pe(is_dll=False))
         return subprocess.CompletedProcess(args, 0, "", "")
 
@@ -178,7 +284,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_valid_package_and_build_hashes_manifest_and_cleanup(self):
         verified = installer.verify_package(self.archive)
-        self.assertEqual(verified.version, "0.1.0")
+        self.assertEqual(verified.version, "0.4.7")
         self.assertIn("data/pinyin/everyday_phrases.tsv", verified.payload)
         self.assertIn("data/pinyin/everyday_phrases.md", verified.payload)
         result = self.build()
@@ -209,8 +315,8 @@ class InstallerTests(unittest.TestCase):
             "root/CON", "root/CON .txt", "root/COM¹.txt",
             "root/a.", "root/file:stream", "root/{app}",
             "another-root/README.md",
-            "flower-0.1.0-windows-x64/unexpected.exe",
-            "flower-0.1.0-windows-x64/licenses/evil.exe",
+            "flower-0.4.7-windows-x64/unexpected.exe",
+            "flower-0.4.7-windows-x64/licenses/evil.exe",
         ]
         original = self.archive.read_bytes()
         for name in cases:
@@ -222,14 +328,14 @@ class InstallerTests(unittest.TestCase):
 
     def test_case_insensitive_collision_is_rejected(self):
         self.rewrite(lambda data: data.update({
-            "flower-0.1.0-windows-x64/readme.MD": b"duplicate",
+            "flower-0.4.7-windows-x64/readme.MD": b"duplicate",
         }))
         with self.assertRaises(installer.InstallerError):
             self.build()
 
     def test_zip_symlink_is_rejected(self):
         with zipfile.ZipFile(self.archive, "a") as target:
-            info = zipfile.ZipInfo("flower-0.1.0-windows-x64/licenses/link")
+            info = zipfile.ZipInfo("flower-0.4.7-windows-x64/licenses/link")
             info.create_system = 3
             info.external_attr = 0o120777 << 16
             target.writestr(info, "outside")
@@ -264,7 +370,7 @@ class InstallerTests(unittest.TestCase):
         def mutate(data):
             name = f"{self.archive.stem}/manifest.json"
             value = json.loads(data[name])
-            value["version"] = "70000.1.0"
+            value["version"] = "70000.4.7"
             data[name] = json.dumps(value).encode()
         self.rewrite(mutate, rehash_payload=True)
         with self.assertRaisesRegex(installer.InstallerError, "版本资源"):
@@ -272,7 +378,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_existing_output_is_preserved(self):
         self.output.mkdir()
-        name = self.output / "flower-0.1.0-windows-x64-setup.exe"
+        name = self.output / "flower-0.4.7-windows-x64-setup.exe"
         name.write_bytes(b"user-owned")
         with self.assertRaisesRegex(installer.InstallerError, "拒绝覆盖"):
             self.build()

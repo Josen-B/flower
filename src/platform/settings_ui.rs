@@ -12,26 +12,25 @@ use windows::Win32::Foundation::{
     COLORREF, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, COLOR_BTNTEXT,
-    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, SetTextColor, UpdateWindow,
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_PITCH,
+    FF_DONTCARE, FW_NORMAL, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetMessageW,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow,
     LoadCursorW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassExW,
     SendMessageW, SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    UnregisterClassW, BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_ERR, CB_GETDROPPEDSTATE, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    ES_AUTOHSCROLL, ES_NUMBER, GWLP_USERDATA, HMENU, IDCANCEL, IDC_ARROW, IDOK, IDYES,
-    MB_ICONERROR, MB_OK, MB_YESNO, MSG, SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY,
-    WM_SYSCOLORCHANGE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    UnregisterClassW, BN_CLICKED, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_ERR, CB_GETDROPPEDSTATE,
+    CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_NUMBER,
+    GWLP_USERDATA, HMENU, IDCANCEL, IDC_ARROW, IDOK, IDYES, MB_ICONERROR, MB_OK, MB_YESNO, MSG,
+    SW_SHOWNORMAL, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
+    WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SYSCOLORCHANGE, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::settings::{
@@ -41,11 +40,143 @@ use crate::settings::{
 use crate::user_dictionary::DictionaryStore;
 
 const WINDOW_CLASS_NAME: PCWSTR = windows::core::w!("Flower.SettingsWindow");
-const WINDOW_TITLE: PCWSTR = windows::core::w!("Flower 设置");
 const FONT_FACE: PCWSTR = windows::core::w!("Microsoft YaHei UI");
 const BASE_DPI: u32 = 96;
-const CLIENT_WIDTH: i32 = 460;
-const CLIENT_HEIGHT: i32 = 580;
+const CLIENT_WIDTH: i32 = 760;
+const CLIENT_HEIGHT: i32 = 680;
+const BACKGROUND: COLORREF = COLORREF(0x00f8f7f4);
+const WHITE: COLORREF = COLORREF(0x00ffffff);
+const TEXT: COLORREF = COLORREF(0x003a2b17);
+const MUTED: COLORREF = COLORREF(0x00756652);
+const ACCENT: COLORREF = COLORREF(0x00696b0f);
+const BORDER: COLORREF = COLORREF(0x00e9e5dc);
+const DANGER: COLORREF = COLORREF(0x003636a6);
+const CARDS: [[i32; 4]; 4] = [
+    [28, 104, 340, 248],
+    [392, 104, 340, 248],
+    [28, 368, 340, 232],
+    [392, 368, 340, 232],
+];
+
+fn paint_settings(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::*;
+    // All selected objects are stock objects; restore the DC before EndPaint.
+    unsafe {
+        let mut paint = PAINTSTRUCT::default();
+        let dc = BeginPaint(hwnd, &mut paint);
+        paint_canvas(hwnd, dc, &paint.rcPaint);
+        let _ = EndPaint(hwnd, &paint);
+    }
+}
+
+fn paint_canvas(hwnd: HWND, dc: HDC, rect: &RECT) {
+    use windows::Win32::Graphics::Gdi::*;
+    unsafe {
+        let saved = SaveDC(dc);
+        let brush = GetStockObject(DC_BRUSH);
+        SelectObject(dc, brush);
+        SelectObject(dc, GetStockObject(DC_PEN));
+        SetDCBrushColor(dc, BACKGROUND);
+        FillRect(dc, rect, windows::Win32::Graphics::Gdi::HBRUSH(brush.0));
+        SetDCBrushColor(dc, WHITE);
+        SetDCPenColor(dc, BORDER);
+        let dpi = GetDpiForWindow(hwnd).max(BASE_DPI);
+        for [x, y, width, height] in CARDS {
+            let _ = RoundRect(
+                dc,
+                scaled(x, dpi),
+                scaled(y, dpi),
+                scaled(x + width, dpi),
+                scaled(y + height, dpi),
+                scaled(22, dpi),
+                scaled(22, dpi),
+            );
+        }
+        let _ = RestoreDC(dc, saved);
+    }
+}
+
+fn paint_button(item: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::Controls::{ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
+    unsafe {
+        let saved = SaveDC(item.hDC);
+        SelectObject(item.hDC, GetStockObject(DC_BRUSH));
+        SelectObject(item.hDC, GetStockObject(DC_PEN));
+        let primary = item.CtlID == SAVE_BUTTON_ID as u32;
+        let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+        let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+        let fill = if disabled {
+            BORDER
+        } else if primary {
+            if pressed {
+                COLORREF(0x0050520b)
+            } else {
+                ACCENT
+            }
+        } else {
+            COLORREF(0x00f2f4f4)
+        };
+        SetDCBrushColor(item.hDC, fill);
+        SetDCPenColor(item.hDC, if primary { fill } else { BORDER });
+        let r = item.rcItem;
+        let dpi = GetDpiForWindow(item.hwndItem).max(BASE_DPI);
+        let _ = RoundRect(
+            item.hDC,
+            r.left,
+            r.top,
+            r.right,
+            r.bottom,
+            scaled(12, dpi),
+            scaled(12, dpi),
+        );
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(
+            item.hDC,
+            if disabled {
+                MUTED
+            } else if primary {
+                WHITE
+            } else if item.CtlID == CLEAR_LEARNING_ID as u32 {
+                DANGER
+            } else {
+                TEXT
+            },
+        );
+        let font = SendMessageW(
+            item.hwndItem,
+            windows::Win32::UI::WindowsAndMessaging::WM_GETFONT,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        if font.0 != 0 {
+            SelectObject(item.hDC, HGDIOBJ(font.0 as *mut c_void));
+        }
+        let mut text = [0u16; 128];
+        let length = GetWindowTextW(item.hwndItem, &mut text) as usize;
+        let mut text_rect = r;
+        if pressed {
+            text_rect.top += 1;
+        }
+        DrawTextW(
+            item.hDC,
+            &mut text[..length],
+            &mut text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
+        if item.itemState.0 & ODS_FOCUS.0 != 0 {
+            let inset = scaled(4, dpi);
+            let focus = RECT {
+                left: r.left + inset,
+                top: r.top + inset,
+                right: r.right - inset,
+                bottom: r.bottom - inset,
+            };
+            let _ = DrawFocusRect(item.hDC, &focus);
+        }
+        let _ = RestoreDC(item.hDC, saved);
+    }
+}
 
 const PAGE_LABEL_ID: i32 = 100;
 const PAGE_EDIT_ID: i32 = 101;
@@ -58,11 +189,15 @@ const CLEAR_LEARNING_ID: i32 = 107;
 const DOMAIN_COMBO_ID: i32 = 108;
 const DOMAIN_ENABLED_ID: i32 = 109;
 const DICTIONARY_STATUS_ID: i32 = 110;
+const AI_CORRECTION_ID: i32 = 111;
+const AI_CORRECTION_HINT_ID: i32 = 112;
+const LEARNING_HINT_ID: i32 = 113;
 const SAVE_BUTTON_ID: i32 = IDOK.0;
 const CANCEL_BUTTON_ID: i32 = IDCANCEL.0;
 
 /// Runs the settings window on the current thread and returns after it closes.
 pub fn run_settings_app() -> Result<(), String> {
+    initialize_standard_controls()?;
     let store = match SettingsStore::for_current_user() {
         Ok(store) => store,
         Err(error) => {
@@ -125,8 +260,16 @@ pub fn run_settings_app() -> Result<(), String> {
         ));
     }
 
+    let dictionary_store = match DictionaryStore::for_current_user() {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = unsafe { UnregisterClassW(WINDOW_CLASS_NAME, instance) };
+            return Err(format!("无法确定当前用户词典路径：{error}"));
+        }
+    };
     let state = Box::new(RefCell::new(SettingsUiState {
         store,
+        dictionary_store,
         settings,
         controls: SettingsControls::default(),
         fonts: Vec::new(),
@@ -154,11 +297,12 @@ pub fn run_settings_app() -> Result<(), String> {
 
     // SAFETY: The class is registered, the create parameter points to `state`
     // for the duration of the message loop, and the window starts hidden.
+    let window_title = wide_null(&format!("Flower 设置 · {}", env!("CARGO_PKG_VERSION")));
     let created = unsafe {
         CreateWindowExW(
             WS_EX_CONTROLPARENT,
             WINDOW_CLASS_NAME,
-            WINDOW_TITLE,
+            PCWSTR(window_title.as_ptr()),
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -210,47 +354,15 @@ pub fn run_settings_app() -> Result<(), String> {
             break Ok(());
         }
 
-        // SAFETY: `hwnd` is the live top-level control parent and `message`
-        // belongs to this thread. IsDialogMessage provides Tab navigation.
-        if unsafe { IsDialogMessageW(hwnd, &message) }.as_bool() {
+        // Owner-draw buttons do not advertise DLGC_DEFPUSHBUTTON. Route
+        // Enter/Esc before IsDialogMessage can synthesize the default IDOK.
+        if preprocess_settings_key(hwnd, state.as_ref(), &message) {
             continue;
         }
-        if message.message == WM_KEYDOWN
-            && window_is_owned(hwnd, state.as_ref())
-            && !theme_dropdown_open(state.as_ref())
-        {
-            let command = match message.wParam.0 as u32 {
-                key if key == VK_ESCAPE.0 as u32 => Some(CANCEL_BUTTON_ID),
-                key if key == VK_RETURN.0 as u32 => {
-                    let focus = unsafe { GetFocus() };
-                    let focused_id = if focus.is_invalid() {
-                        0
-                    } else {
-                        unsafe { GetDlgCtrlID(focus) }
-                    };
-                    let command = if matches!(
-                        focused_id,
-                        CANCEL_BUTTON_ID | CLEAR_LEARNING_ID | LEARNING_ID | DOMAIN_ENABLED_ID
-                    ) {
-                        focused_id
-                    } else {
-                        SAVE_BUTTON_ID
-                    };
-                    Some(command)
-                }
-                _ => None,
-            };
-            if let Some(command) = command {
-                let _ = unsafe {
-                    PostMessageW(
-                        hwnd,
-                        WM_COMMAND,
-                        WPARAM(command as usize | ((BN_CLICKED as usize) << 16)),
-                        LPARAM::default(),
-                    )
-                };
-                continue;
-            }
+        // SAFETY: Both the dialog and message belong to this thread.
+        // Tab/Shift+Tab, Space and all remaining dialog keys stay native.
+        if unsafe { IsDialogMessageW(hwnd, &message) }.as_bool() {
+            continue;
         }
         unsafe {
             let _ = TranslateMessage(&message);
@@ -304,8 +416,88 @@ pub fn run_settings_app() -> Result<(), String> {
     }
 }
 
+fn initialize_standard_controls() -> Result<(), String> {
+    use windows::Win32::UI::Controls::{
+        InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
+    };
+    let controls = INITCOMMONCONTROLSEX {
+        dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_STANDARD_CLASSES,
+    };
+    // Called only by the standalone settings entry point and owned fixtures,
+    // never by TSF activation or DLL initialization.
+    if unsafe { InitCommonControlsEx(&controls) }.as_bool() {
+        Ok(())
+    } else {
+        Err("无法初始化设置窗口的标准控件。".to_owned())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsKeyRoute {
+    Dialog,
+    NativeDropdown,
+    Command(i32),
+}
+
+fn settings_key_route(
+    hwnd: HWND,
+    state: &RefCell<SettingsUiState>,
+    message: &MSG,
+) -> SettingsKeyRoute {
+    use windows::Win32::UI::WindowsAndMessaging::IsChild;
+    if message.message != WM_KEYDOWN
+        || !matches!(message.wParam.0 as u16, key if key == VK_RETURN.0 || key == VK_ESCAPE.0)
+        || !window_is_owned(hwnd, state)
+        || (message.hwnd != hwnd && !unsafe { IsChild(hwnd, message.hwnd) }.as_bool())
+    {
+        return SettingsKeyRoute::Dialog;
+    }
+    // Bypass IsDialogMessage as well: the open combo must consume Enter/Esc
+    // itself, not let the dialog turn them into save/close commands.
+    if theme_dropdown_open(state) {
+        return SettingsKeyRoute::NativeDropdown;
+    }
+    let command = if message.wParam.0 == VK_ESCAPE.0 as usize {
+        CANCEL_BUTTON_ID
+    } else {
+        // WM_KEYDOWN's HWND is its focus target; no global focus lookup or
+        // handle from another window may determine a settings action.
+        match unsafe { GetDlgCtrlID(message.hwnd) } {
+            id @ (CANCEL_BUTTON_ID | CLEAR_LEARNING_ID | LEARNING_ID | DOMAIN_ENABLED_ID) => id,
+            _ => SAVE_BUTTON_ID,
+        }
+    };
+    SettingsKeyRoute::Command(command)
+}
+
+fn preprocess_settings_key(hwnd: HWND, state: &RefCell<SettingsUiState>, message: &MSG) -> bool {
+    match settings_key_route(hwnd, state, message) {
+        SettingsKeyRoute::Dialog => false,
+        SettingsKeyRoute::NativeDropdown => {
+            unsafe {
+                let _ = TranslateMessage(message);
+                DispatchMessageW(message);
+            }
+            true
+        }
+        SettingsKeyRoute::Command(command) => {
+            let _ = unsafe {
+                PostMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    WPARAM(command as usize | ((BN_CLICKED as usize) << 16)),
+                    LPARAM(0),
+                )
+            };
+            true
+        }
+    }
+}
+
 struct SettingsUiState {
     store: SettingsStore,
+    dictionary_store: DictionaryStore,
     settings: Settings,
     controls: SettingsControls,
     fonts: Vec<HFONT>,
@@ -327,6 +519,10 @@ struct SettingsControls {
     domain_combo: HWND,
     domain_enabled: HWND,
     dictionary_status: HWND,
+    ai_correction: HWND,
+    ai_correction_hint: HWND,
+    learning_hint: HWND,
+    headings: [HWND; 6],
 }
 
 unsafe extern "system" fn settings_window_proc(
@@ -410,13 +606,62 @@ unsafe fn handle_settings_message(
             let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC => {
+        windows::Win32::UI::WindowsAndMessaging::WM_PAINT => {
+            paint_settings(hwnd);
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT => {
+            let mut rect = RECT::default();
+            let _ =
+                unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect) };
+            paint_canvas(hwnd, HDC(wparam.0 as *mut c_void), &rect);
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_DRAWITEM => {
+            if lparam.0 != 0 {
+                let item =
+                    unsafe { &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT) };
+                paint_button(item);
+                return LRESULT(1);
+            }
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
             let hdc = HDC(wparam.0 as *mut c_void);
+            let id = unsafe { GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) };
+            let background = if matches!(id, NOTICE_ID | 200 | 201) {
+                BACKGROUND
+            } else {
+                WHITE
+            };
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, COLORREF(GetSysColor(COLOR_BTNTEXT)));
+                SetTextColor(
+                    hdc,
+                    if matches!(
+                        id,
+                        PAGE_HINT_ID
+                            | NOTICE_ID
+                            | AI_CORRECTION_HINT_ID
+                            | DICTIONARY_STATUS_ID
+                            | LEARNING_HINT_ID
+                            | 201
+                    ) {
+                        MUTED
+                    } else {
+                        TEXT
+                    },
+                );
+                windows::Win32::Graphics::Gdi::SetDCBrushColor(hdc, background);
             }
-            LRESULT(unsafe { GetSysColorBrush(COLOR_BTNFACE) }.0 as isize)
+            LRESULT(
+                unsafe {
+                    windows::Win32::Graphics::Gdi::GetStockObject(
+                        windows::Win32::Graphics::Gdi::DC_BRUSH,
+                    )
+                }
+                .0 as isize,
+            )
         }
         WM_DPICHANGED => {
             let new_dpi = (wparam.0 & 0xffff) as u32;
@@ -470,6 +715,28 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         .map(|state| state.settings.clone())
         .map_err(|_| "设置窗口状态正忙，无法初始化".to_owned())?;
 
+    for (index, caption) in [
+        format!("Flower  ·  {}", env!("CARGO_PKG_VERSION")),
+        "输入设置 · 让每一次表达更顺手".to_owned(),
+        "候选外观".to_owned(),
+        "离线 AI".to_owned(),
+        "本地学习".to_owned(),
+        "专业词库".to_owned(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let text = wide_null(caption);
+        let control = create_control(
+            hwnd,
+            instance,
+            windows::core::w!("STATIC"),
+            PCWSTR(text.as_ptr()),
+            WS_CHILD.0 | WS_VISIBLE.0,
+            200 + index as i32,
+        )?;
+        update_controls(state, |controls| controls.headings[index] = control)?;
+    }
     let label = create_control(
         hwnd,
         instance,
@@ -485,7 +752,12 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         instance,
         windows::core::w!("EDIT"),
         PCWSTR::null(),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::WS_BORDER.0
+            | ES_NUMBER as u32
+            | ES_AUTOHSCROLL as u32,
         PAGE_EDIT_ID,
     )?;
     update_controls(state, |controls| controls.page_edit = page_edit)?;
@@ -520,6 +792,39 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
     )?;
     update_controls(state, |controls| controls.theme_combo = theme_combo)?;
 
+    let ai_correction = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("启用离线 AI 纠错"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
+        AI_CORRECTION_ID,
+    )?;
+    update_controls(state, |controls| controls.ai_correction = ai_correction)?;
+    set_checked(ai_correction, settings.ai_correction_enabled);
+    let ai_correction_hint = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("STATIC"),
+        windows::core::w!(
+            "保存后，切走再切回 Flower 生效。\n首次加载最多 5 秒，状态见候选窗。\n\n范围未知或私密时不会送入模型。\n可用空白记事本对照验证。\nAI 候选须手动选择，不回改已上屏文字。"
+        ),
+        WS_CHILD.0 | WS_VISIBLE.0,
+        AI_CORRECTION_HINT_ID,
+    )?;
+    update_controls(state, |controls| {
+        controls.ai_correction_hint = ai_correction_hint
+    })?;
+    let learning_hint = create_control(
+        hwnd, instance, windows::core::w!("STATIC"),
+        windows::core::w!("默认开启，勾选后立即保存。\n成功选词会将候选向前移一位。\n清空学习不删除个人词条或专业词库。"),
+        WS_CHILD.0 | WS_VISIBLE.0, LEARNING_HINT_ID,
+    )?;
+    update_controls(state, |controls| controls.learning_hint = learning_hint)?;
+
     let notice = create_control(
         hwnd,
         instance,
@@ -535,7 +840,10 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         instance,
         windows::core::w!("BUTTON"),
         windows::core::w!("保存"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
         SAVE_BUTTON_ID,
     )?;
     update_controls(state, |controls| controls.save_button = save_button)?;
@@ -545,7 +853,10 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         instance,
         windows::core::w!("BUTTON"),
         windows::core::w!("关闭"),
-        WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
         CANCEL_BUTTON_ID,
     )?;
     update_controls(state, |controls| controls.cancel_button = cancel_button)?;
@@ -554,14 +865,14 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
         (
             LEARNING_ID,
             windows::core::w!("BUTTON"),
-            windows::core::w!("记住选词顺序（默认开启，仅保存在本机）"),
+            windows::core::w!("记住选词顺序 · 仅保存在本机"),
             windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
         ),
         (
             CLEAR_LEARNING_ID,
             windows::core::w!("BUTTON"),
             windows::core::w!("清空学习记录…"),
-            BS_PUSHBUTTON as u32,
+            windows::Win32::UI::WindowsAndMessaging::BS_OWNERDRAW as u32,
         ),
         (
             DOMAIN_COMBO_ID,
@@ -709,22 +1020,43 @@ fn layout_controls(state: &RefCell<SettingsUiState>, dpi: u32) {
         return;
     };
     // Win32 is called only after the state borrow has ended.
-    let _ = set_control_rect(controls.labels[0], 20, 20, 360, 24, dpi);
-    let _ = set_control_rect(controls.page_edit, 20, 48, 90, 28, dpi);
-    let _ = set_control_rect(controls.labels[1], 120, 52, 300, 24, dpi);
-    let _ = set_control_rect(controls.labels[2], 20, 90, 360, 24, dpi);
-    let _ = set_control_rect(controls.theme_combo, 20, 118, 180, 110, dpi);
-    let _ = set_control_rect(controls.learning, 20, 168, 420, 28, dpi);
-    let _ = set_control_rect(controls.clear_learning, 20, 206, 180, 30, dpi);
-    let _ = set_control_rect(controls.domain_combo, 20, 254, 420, 150, dpi);
-    let _ = set_control_rect(controls.domain_enabled, 20, 294, 420, 28, dpi);
-    let _ = set_control_rect(controls.dictionary_status, 20, 334, 420, 120, dpi);
-    let _ = set_control_rect(controls.notice, 20, 470, 420, 44, dpi);
-    let _ = set_control_rect(controls.save_button, 240, 530, 90, 30, dpi);
-    let _ = set_control_rect(controls.cancel_button, 350, 530, 90, 30, dpi);
+    for (control, rect) in control_layout(controls) {
+        let _ = set_control_rect(control, rect[0], rect[1], rect[2], rect[3], dpi);
+    }
+}
+
+fn control_layout(c: SettingsControls) -> Vec<(HWND, [i32; 4])> {
+    vec![
+        (c.headings[0], [28, 24, 704, 36]),
+        (c.headings[1], [28, 64, 704, 24]),
+        (c.headings[2], [48, 124, 292, 28]),
+        (c.headings[3], [412, 124, 300, 28]),
+        (c.headings[4], [48, 388, 300, 28]),
+        (c.headings[5], [412, 388, 300, 28]),
+        (c.labels[0], [48, 168, 292, 24]),
+        (c.page_edit, [48, 200, 80, 32]),
+        (c.labels[1], [140, 204, 200, 24]),
+        (c.labels[2], [48, 252, 292, 24]),
+        (c.theme_combo, [48, 284, 292, 128]),
+        (c.ai_correction, [412, 168, 300, 28]),
+        (c.ai_correction_hint, [412, 204, 300, 144]),
+        (c.learning, [48, 432, 300, 28]),
+        (c.learning_hint, [48, 472, 300, 64]),
+        (c.clear_learning, [48, 548, 180, 36]),
+        (c.domain_combo, [412, 424, 300, 144]),
+        (c.domain_enabled, [412, 464, 300, 28]),
+        (c.dictionary_status, [412, 500, 300, 88]),
+        (c.notice, [28, 616, 456, 40]),
+        (c.cancel_button, [508, 616, 104, 40]),
+        (c.save_button, [628, 616, 104, 40]),
+    ]
 }
 
 fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), WindowsError> {
+    let old_count = state
+        .try_borrow()
+        .map(|state| state.fonts.len())
+        .unwrap_or(0);
     let font = create_ui_font(dpi)?;
     let controls = match state.try_borrow_mut() {
         Ok(mut state) => {
@@ -754,6 +1086,9 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         controls.domain_combo,
         controls.domain_enabled,
         controls.dictionary_status,
+        controls.ai_correction,
+        controls.ai_correction_hint,
+        controls.learning_hint,
     ] {
         if !control.is_invalid() {
             unsafe {
@@ -766,11 +1101,72 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
             }
         }
     }
+    for (index, control) in controls.headings.into_iter().enumerate() {
+        let heading = create_sized_font(
+            dpi,
+            if index == 0 {
+                24
+            } else if index == 1 {
+                13
+            } else {
+                18
+            },
+        )?;
+        if let Ok(mut current) = state.try_borrow_mut() {
+            current.fonts.push(heading);
+        } else {
+            let _ = unsafe { DeleteObject(HGDIOBJ::from(heading)) };
+            continue;
+        }
+        unsafe {
+            SendMessageW(
+                control,
+                windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                WPARAM(heading.0 as usize),
+                LPARAM(1),
+            );
+        }
+    }
+    let hint_font = create_sized_font(dpi, 13)?;
+    if let Ok(mut current) = state.try_borrow_mut() {
+        current.fonts.push(hint_font);
+    } else {
+        let _ = unsafe { DeleteObject(HGDIOBJ::from(hint_font)) };
+        return Ok(());
+    }
+    for control in [
+        controls.labels[1],
+        controls.notice,
+        controls.ai_correction_hint,
+        controls.learning_hint,
+        controls.dictionary_status,
+    ] {
+        unsafe {
+            SendMessageW(
+                control,
+                windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                WPARAM(hint_font.0 as usize),
+                LPARAM(1),
+            );
+        }
+    }
+    let retired: Vec<_> = state
+        .try_borrow_mut()
+        .ok()
+        .map(|mut state| state.fonts.drain(..old_count).collect())
+        .unwrap_or_default();
+    for font in retired {
+        let _ = unsafe { DeleteObject(HGDIOBJ::from(font)) };
+    }
     Ok(())
 }
 
 fn create_ui_font(dpi: u32) -> Result<HFONT, WindowsError> {
-    let height = -scaled(16, dpi);
+    create_sized_font(dpi, 14)
+}
+
+fn create_sized_font(dpi: u32, size: i32) -> Result<HFONT, WindowsError> {
+    let height = -scaled(size, dpi);
     let font = unsafe {
         CreateFontW(
             height,
@@ -877,7 +1273,14 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
         return;
     };
     let selected = selected_domain(state, controls.domain_combo);
-    let result = DictionaryStore::for_current_user().and_then(|store| store.load());
+    let Some(store) = state
+        .try_borrow()
+        .ok()
+        .map(|state| state.dictionary_store.clone())
+    else {
+        return;
+    };
+    let result = store.load();
     match result {
         Ok(data) => {
             let names: Vec<_> = data.domains.iter().map(|item| item.name.clone()).collect();
@@ -907,6 +1310,16 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
                     );
                 }
             }
+            if data.domains.is_empty() {
+                unsafe {
+                    SendMessageW(
+                        controls.domain_combo,
+                        CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(windows::core::w!("暂无专业词库").as_ptr() as isize),
+                    );
+                }
+            }
             unsafe {
                 SendMessageW(
                     controls.domain_combo,
@@ -922,15 +1335,61 @@ fn refresh_dictionary(hwnd: HWND, state: &RefCell<SettingsUiState>) {
                     .get(selected_index)
                     .is_some_and(|item| item.enabled),
             );
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    controls.learning,
+                    TRUE,
+                );
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    controls.clear_learning,
+                    TRUE,
+                );
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    controls.domain_combo,
+                    windows::Win32::Foundation::BOOL::from(!data.domains.is_empty()),
+                );
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    controls.domain_enabled,
+                    windows::Win32::Foundation::BOOL::from(!data.domains.is_empty()),
+                );
+            }
             let status = format!(
-                "个人词条：{}；排序作用域：{}；专业词库：{}。\n选中词库：{}。\n成功选词前移一位；设置保存后重新切换输入法生效。\n清空学习不会删除个人词条。",
+                "个人词条 {} · 学习作用域 {} · 词库 {}\n选中词库：{}。立即保存，切换输入法生效。\n选词前移一位；清空学习不删除个人词条。",
                 data.entries.len(), data.rankings.len(), data.domains.len(),
                 data.domains.get(selected_index).map(|item| if item.enabled { "已启用" } else { "已停用" }).unwrap_or("无"));
             let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID, &status);
         }
         Err(error) => {
+            if let Ok(mut current) = state.try_borrow_mut() {
+                current.domain_names.clear();
+            }
+            unsafe {
+                SendMessageW(
+                    controls.domain_combo,
+                    windows::Win32::UI::WindowsAndMessaging::CB_RESETCONTENT,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                SendMessageW(
+                    controls.domain_combo,
+                    CB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(windows::core::w!("词典读取失败").as_ptr() as isize),
+                );
+                SendMessageW(controls.domain_combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            }
             set_checked(controls.learning, false);
             set_checked(controls.domain_enabled, false);
+            for control in [
+                controls.learning,
+                controls.clear_learning,
+                controls.domain_combo,
+                controls.domain_enabled,
+            ] {
+                let _ = unsafe {
+                    windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(control, FALSE)
+                };
+            }
             let _ = set_control_text(hwnd, DICTIONARY_STATUS_ID,
                 &format!("用户词典读取失败：{error}\n未重建或覆盖文件；词典操作不可用。请修复文件后重新打开设置。"));
         }
@@ -963,7 +1422,11 @@ fn dictionary_action(hwnd: HWND, state: &RefCell<SettingsUiState>, id: i32) {
         return;
     }
     let result = (|| -> Result<(), String> {
-        let store = DictionaryStore::for_current_user().map_err(|e| e.to_string())?;
+        let store = state
+            .try_borrow()
+            .map_err(|_| "词典状态正忙".to_owned())?
+            .dictionary_store
+            .clone();
         // Fail closed on corruption. The store also validates again under its write lock.
         store.load().map_err(|e| e.to_string())?;
         match id {
@@ -1069,6 +1532,7 @@ fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
     let settings = Settings {
         candidate_page_size: page_size,
         theme,
+        ai_correction_enabled: is_checked(controls.ai_correction),
     };
     settings
         .validate()
@@ -1112,6 +1576,18 @@ impl<'a> SaveGuard<'a> {
             None
         } else {
             current.saving = true;
+            let button = current.controls.save_button;
+            drop(current);
+            if !button.is_invalid() {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                        button,
+                        windows::core::w!("保存中…"),
+                    );
+                    let _ =
+                        windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, FALSE);
+                }
+            }
             Some(Self { state })
         }
     }
@@ -1119,8 +1595,22 @@ impl<'a> SaveGuard<'a> {
 
 impl Drop for SaveGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_borrow_mut() {
+        let button = if let Ok(mut state) = self.state.try_borrow_mut() {
             state.saving = false;
+            state.controls.save_button
+        } else {
+            return;
+        };
+        let parent = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(button) }
+            .unwrap_or_default();
+        if !button.is_invalid() && window_is_owned(parent, self.state) {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                    button,
+                    windows::core::w!("保存"),
+                );
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, TRUE);
+            }
         }
     }
 }
@@ -1220,4 +1710,497 @@ fn wide_null(text: &str) -> Vec<u16> {
 fn scaled(value: i32, dpi: u32) -> i32 {
     let dpi = if dpi == 0 { BASE_DPI } else { dpi.min(480) };
     ((i64::from(value) * i64::from(dpi) + i64::from(BASE_DPI / 2)) / i64::from(BASE_DPI)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // The library test executable has no settings-only manifest. Activate a
+    // private v6 context on this fixture thread, never in the production DLL.
+    // Raw declarations keep this test from adding a new Cargo feature.
+    #[repr(C)]
+    struct TestActCtx {
+        size: u32,
+        flags: u32,
+        source: *const u16,
+        architecture: u16,
+        language: u16,
+        assembly_directory: *const u16,
+        resource: *const u16,
+        application: *const u16,
+        module: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateActCtxW(context: *const TestActCtx) -> *mut c_void;
+        fn ActivateActCtx(context: *mut c_void, cookie: *mut usize) -> i32;
+        fn DeactivateActCtx(flags: u32, cookie: usize) -> i32;
+        fn ReleaseActCtx(context: *mut c_void);
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn FreeLibrary(module: *mut c_void) -> i32;
+    }
+
+    struct TestVisualStyles {
+        context: *mut c_void,
+        cookie: usize,
+        controls_module: *mut c_void,
+    }
+
+    impl TestVisualStyles {
+        fn activate(directory: &Path) -> Self {
+            let path = directory.join("fixture-v6.manifest");
+            std::fs::write(&path, r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+<assemblyIdentity name="Flower.SettingsFixture" version="1.0.0.0" type="win32"/>
+<dependency><dependentAssembly>
+<assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+</dependentAssembly></dependency></assembly>"#).unwrap();
+            let source = wide_null(path.to_str().unwrap());
+            let description = TestActCtx {
+                size: std::mem::size_of::<TestActCtx>() as u32,
+                flags: 0,
+                source: source.as_ptr(),
+                architecture: 0,
+                language: 0,
+                assembly_directory: std::ptr::null(),
+                resource: std::ptr::null(),
+                application: std::ptr::null(),
+                module: std::ptr::null_mut(),
+            };
+            let context = unsafe { CreateActCtxW(&description) };
+            assert_ne!(context as isize, -1, "fixture v6 context creation failed");
+            let mut cookie = 0;
+            let activated = unsafe { ActivateActCtx(context, &mut cookie) };
+            if activated == 0 {
+                unsafe { ReleaseActCtx(context) };
+                panic!("fixture v6 context activation failed");
+            }
+            // The test executable's import table already bound ComCtl32 v5
+            // before this thread activated v6. Resolve v6's export inside the
+            // private context instead of testing that unrelated v5 import.
+            let controls_module =
+                unsafe { LoadLibraryW(windows::core::w!("comctl32.dll").as_ptr()) };
+            assert!(!controls_module.is_null());
+            let styles = Self {
+                context,
+                cookie,
+                controls_module,
+            };
+            styles.initialize_controls();
+            styles
+        }
+
+        fn initialize_controls(&self) {
+            use windows::Win32::UI::Controls::{ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
+            let address =
+                unsafe { GetProcAddress(self.controls_module, b"InitCommonControlsEx\0".as_ptr()) };
+            assert!(!address.is_null());
+            let initialize: unsafe extern "system" fn(*const INITCOMMONCONTROLSEX) -> i32 =
+                unsafe { std::mem::transmute(address) };
+            let controls = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_STANDARD_CLASSES,
+            };
+            assert_ne!(unsafe { initialize(&controls) }, 0);
+        }
+    }
+
+    impl Drop for TestVisualStyles {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = FreeLibrary(self.controls_module);
+                let _ = DeactivateActCtx(0, self.cookie);
+                ReleaseActCtx(self.context);
+            }
+        }
+    }
+
+    fn test_state(directory: &Path) -> RefCell<SettingsUiState> {
+        RefCell::new(SettingsUiState {
+            store: SettingsStore::new(directory.join("settings.json")),
+            dictionary_store: DictionaryStore::new(directory.join("dictionary.json")),
+            settings: Settings::default(),
+            controls: SettingsControls::default(),
+            fonts: Vec::new(),
+            saving: false,
+            creation_error: None,
+            domain_names: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn settings_layout_stays_in_client_at_supported_dpis() {
+        for dpi in [96, 120, 144, 192, 240, 480] {
+            for (_, [x, y, width, height]) in control_layout(SettingsControls::default()) {
+                // COMBOBOX height includes the popup, not just its closed field.
+                assert!(x >= 28 && y >= 24 && width > 0 && height > 0);
+                assert!(scaled(x + width, dpi) <= scaled(CLIENT_WIDTH, dpi));
+                assert!(scaled(y + height, dpi) <= scaled(CLIENT_HEIGHT, dpi));
+            }
+            for [x, y, width, height] in CARDS {
+                assert!(scaled(x + width, dpi) <= scaled(CLIENT_WIDTH - 28, dpi));
+                assert!(scaled(y + height, dpi) <= scaled(600, dpi));
+            }
+        }
+    }
+
+    #[test]
+    fn settings_cards_have_separate_rows_and_columns() {
+        assert_eq!(CARDS[1][0] - (CARDS[0][0] + CARDS[0][2]), 24);
+        assert_eq!(CARDS[2][1] - (CARDS[0][1] + CARDS[0][3]), 16);
+        assert_eq!(CARDS[3][0], CARDS[1][0]);
+        assert_eq!(scaled(24, 144), 36);
+        assert_eq!(scaled(24, 0), 24);
+        assert_eq!(scaled(24, 960), 120);
+    }
+
+    #[test]
+    fn settings_closed_controls_do_not_overlap() {
+        let controls = SettingsControls {
+            theme_combo: HWND(1usize as *mut c_void),
+            domain_combo: HWND(2usize as *mut c_void),
+            ..Default::default()
+        };
+        let rectangles: Vec<_> = control_layout(controls)
+            .into_iter()
+            .map(|(hwnd, mut rect)| {
+                if hwnd == controls.theme_combo || hwnd == controls.domain_combo {
+                    rect[3] = 32;
+                }
+                rect
+            })
+            .collect();
+        for (index, a) in rectangles.iter().enumerate() {
+            for b in &rectangles[index + 1..] {
+                assert!(
+                    a[0] + a[2] <= b[0]
+                        || b[0] + b[2] <= a[0]
+                        || a[1] + a[3] <= b[1]
+                        || b[1] + b[3] <= a[1],
+                    "overlapping logical controls: {a:?}, {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_save_guard_is_exclusive_and_releases_on_drop() {
+        let state = test_state(Path::new("unused-settings-test"));
+        let guard = SaveGuard::acquire(&state).unwrap();
+        assert!(state.borrow().saving);
+        assert!(SaveGuard::acquire(&state).is_none());
+        drop(guard);
+        assert!(!state.borrow().saving);
+        assert!(SaveGuard::acquire(&state).is_some());
+    }
+
+    #[test]
+    fn settings_state_retains_both_injected_paths() {
+        let directory = Path::new("injected-settings-test");
+        let state = test_state(directory);
+        assert_eq!(state.borrow().store.path(), directory.join("settings.json"));
+        assert_eq!(
+            state.borrow().dictionary_store.path(),
+            directory.join("dictionary.json")
+        );
+        assert_eq!(theme_index(Theme::System), 0);
+        assert_eq!(theme_index(Theme::Light), 1);
+        assert_eq!(theme_index(Theme::Dark), 2);
+    }
+
+    // Explicit opt-in only. The caller supplies a session-owned artifacts
+    // directory. Neither store can resolve to a real user profile, and there
+    // is no message loop, global input, save click, or interactive close wait.
+    #[test]
+    #[ignore = "requires FLOWER_SETTINGS_PREVIEW_DIR pointing to owned session artifacts"]
+    fn settings_native_preview_fixture() {
+        owned_settings_fixture(false);
+    }
+
+    #[test]
+    #[ignore = "requires FLOWER_SETTINGS_PREVIEW_DIR pointing to owned session artifacts"]
+    fn settings_owned_window_keyboard_route() {
+        owned_settings_fixture(true);
+    }
+
+    fn owned_settings_fixture(check_route: bool) {
+        static OWNED_WINDOW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = OWNED_WINDOW_LOCK.lock().unwrap();
+        let root = std::env::var_os("FLOWER_SETTINGS_PREVIEW_DIR")
+            .expect("explicit session artifact directory required");
+        let root = std::path::PathBuf::from(root);
+        assert!(root.is_absolute(), "preview directory must be absolute");
+        assert!(
+            root.is_dir(),
+            "caller must create the owned artifact directory"
+        );
+        let directory = root.join(format!(
+            "settings-{}-{}",
+            if check_route { "route" } else { "preview" },
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("preview must use a new exclusive directory");
+        let _visual_styles = TestVisualStyles::activate(&directory);
+        let state = Box::new(test_state(&directory));
+        let instance = HINSTANCE::from(unsafe { GetModuleHandleW(PCWSTR::null()) }.unwrap());
+        let class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(settings_window_proc),
+            hInstance: instance,
+            lpszClassName: WINDOW_CLASS_NAME,
+            ..Default::default()
+        };
+        assert_ne!(unsafe { RegisterClassExW(&class) }, 0);
+        struct Preview {
+            hwnd: HWND,
+            instance: HINSTANCE,
+            state: Box<RefCell<SettingsUiState>>,
+        }
+        impl Drop for Preview {
+            fn drop(&mut self) {
+                let outcome = cleanup_window(self.hwnd, self.state.as_ref());
+                if matches!(
+                    outcome,
+                    WindowCleanup::Destroyed | WindowCleanup::AlreadyGone
+                ) {
+                    delete_all_fonts(self.state.as_ref());
+                } else if matches!(
+                    outcome,
+                    WindowCleanup::DetachFailed | WindowCleanup::UnattachedLiveWindow
+                ) {
+                    let retained = std::mem::replace(
+                        &mut self.state,
+                        Box::new(test_state(Path::new("unused-retained-preview"))),
+                    );
+                    std::mem::forget(retained);
+                }
+                let _ = unsafe { UnregisterClassW(WINDOW_CLASS_NAME, self.instance) };
+            }
+        }
+        let mut preview = Preview {
+            hwnd: HWND::default(),
+            instance,
+            state,
+        };
+        let dpi = unsafe { GetDpiForSystem() }.max(BASE_DPI);
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: scaled(CLIENT_WIDTH, dpi),
+            bottom: scaled(CLIENT_HEIGHT, dpi),
+        };
+        unsafe { AdjustWindowRectExForDpi(&mut rect, style, FALSE, WS_EX_CONTROLPARENT, dpi) }
+            .unwrap();
+        preview.hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                WINDOW_CLASS_NAME,
+                windows::core::w!("Flower · 原生设置预览"),
+                style,
+                32,
+                32,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                HWND::default(),
+                HMENU::default(),
+                instance,
+                Some(state_pointer(preview.state.as_ref())),
+            )
+        }
+        .unwrap();
+        unsafe {
+            let _ = ShowWindow(
+                preview.hwnd,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
+            );
+            let _ = UpdateWindow(preview.hwnd);
+        }
+        if check_route {
+            assert_owned_keyboard_route(preview.hwnd, preview.state.as_ref(), &directory);
+            return;
+        }
+        // PrintWindow renders only this owned HWND, including its native child
+        // controls. No screen or other application's DC is ever acquired.
+        write_preview_bitmap(preview.hwnd, &directory.join("settings.bmp"));
+        assert_eq!(
+            read_form(preview.state.as_ref()).unwrap(),
+            Settings::default()
+        );
+        assert!(preview.state.borrow().domain_names.is_empty());
+        assert!(!directory.join("settings.json").exists());
+        assert!(!directory.join("dictionary.json").exists());
+        let original_font_count = preview.state.borrow().fonts.len();
+        replace_font(preview.state.as_ref(), dpi).unwrap();
+        assert_eq!(preview.state.borrow().fonts.len(), original_font_count);
+        let guard = SaveGuard::acquire(preview.state.as_ref()).unwrap();
+        let save_button = preview.state.borrow().controls.save_button;
+        assert_eq!(read_control_text(save_button).unwrap(), "保存中…");
+        drop(guard);
+        assert_eq!(read_control_text(save_button).unwrap(), "保存");
+
+        // The immediate-save action is exercised only against the injected
+        // disposable dictionary; refresh must read it back, not a user path.
+        let learning = preview.state.borrow().controls.learning;
+        set_checked(learning, false);
+        dictionary_action(preview.hwnd, preview.state.as_ref(), LEARNING_ID);
+        let dictionary = preview.state.borrow().dictionary_store.clone();
+        assert!(!dictionary.load().unwrap().adaptive_ranking_enabled);
+        assert!(!is_checked(learning));
+        std::fs::write(dictionary.path(), b"invalid fixture json").unwrap();
+        refresh_dictionary(preview.hwnd, preview.state.as_ref());
+        write_preview_bitmap(preview.hwnd, &directory.join("settings-error.bmp"));
+        assert_eq!(
+            std::fs::read(dictionary.path()).unwrap(),
+            b"invalid fixture json"
+        );
+        assert!(!directory.join("settings.json").exists());
+        println!("native preview: {}", directory.display());
+    }
+
+    fn assert_owned_keyboard_route(hwnd: HWND, state: &RefCell<SettingsUiState>, directory: &Path) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_SPACE, VK_TAB};
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, CB_SHOWDROPDOWN, PM_REMOVE};
+        let controls = state.borrow().controls;
+        let key_message = |target, key: u16| MSG {
+            hwnd: target,
+            message: WM_KEYDOWN,
+            wParam: WPARAM(key as usize),
+            ..Default::default()
+        };
+        let pop_command = || {
+            let mut command = MSG::default();
+            assert!(
+                unsafe { PeekMessageW(&mut command, hwnd, WM_COMMAND, WM_COMMAND, PM_REMOVE) }
+                    .as_bool()
+            );
+            command
+        };
+        // Invoke the exact pre-dialog production helper, inspect its posted
+        // WM_COMMAND without dispatching save or the destructive confirmation.
+        for (target, expected) in [
+            (controls.cancel_button, CANCEL_BUTTON_ID),
+            (controls.clear_learning, CLEAR_LEARNING_ID),
+            (controls.page_edit, SAVE_BUTTON_ID),
+            (controls.save_button, SAVE_BUTTON_ID),
+        ] {
+            let _ = unsafe { SetFocus(target) };
+            let key = key_message(target, VK_RETURN.0);
+            assert_eq!(
+                settings_key_route(hwnd, state, &key),
+                SettingsKeyRoute::Command(expected)
+            );
+            assert!(preprocess_settings_key(hwnd, state, &key));
+            let command = pop_command();
+            assert_eq!(command.wParam.0 & 0xffff, expected as usize);
+            assert_eq!(command.wParam.0 >> 16, BN_CLICKED as usize);
+            assert!(!directory.join("settings.json").exists());
+            assert!(!directory.join("dictionary.json").exists());
+        }
+        for key in [VK_TAB.0, VK_SPACE.0] {
+            let message = key_message(controls.page_edit, key);
+            assert_eq!(
+                settings_key_route(hwnd, state, &message),
+                SettingsKeyRoute::Dialog
+            );
+            assert!(!preprocess_settings_key(hwnd, state, &message));
+        }
+        let foreign = key_message(HWND::default(), VK_RETURN.0);
+        assert!(!preprocess_settings_key(hwnd, state, &foreign));
+        // Both combos retain native Enter/Esc while expanded. Enable the
+        // fixture's empty-domain combo only for exercising its native popup.
+        for combo in [controls.theme_combo, controls.domain_combo] {
+            let _ = unsafe { EnableWindow(combo, TRUE) };
+            for key in [VK_RETURN.0, VK_ESCAPE.0] {
+                unsafe {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+                }
+                assert!(theme_dropdown_open(state));
+                let message = key_message(combo, key);
+                assert_eq!(
+                    settings_key_route(hwnd, state, &message),
+                    SettingsKeyRoute::NativeDropdown
+                );
+                assert!(preprocess_settings_key(hwnd, state, &message));
+                let mut command = MSG::default();
+                // Selection notifications are allowed, but never IDOK/IDCANCEL.
+                while unsafe { PeekMessageW(&mut command, hwnd, WM_COMMAND, WM_COMMAND, PM_REMOVE) }
+                    .as_bool()
+                {
+                    assert!(!matches!(
+                        (command.wParam.0 & 0xffff) as i32,
+                        SAVE_BUTTON_ID | CANCEL_BUTTON_ID | CLEAR_LEARNING_ID
+                    ));
+                }
+                unsafe {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+        let escape = key_message(controls.page_edit, VK_ESCAPE.0);
+        assert!(preprocess_settings_key(hwnd, state, &escape));
+        assert_eq!(pop_command().wParam.0 & 0xffff, CANCEL_BUTTON_ID as usize);
+        let close = key_message(controls.cancel_button, VK_RETURN.0);
+        assert!(preprocess_settings_key(hwnd, state, &close));
+        let close_command = pop_command();
+        unsafe {
+            DispatchMessageW(&close_command);
+        }
+        assert!(!window_is_owned(hwnd, state));
+        assert!(!directory.join("settings.json").exists());
+        assert!(!directory.join("dictionary.json").exists());
+        assert!(!preprocess_settings_key(hwnd, state, &close));
+    }
+
+    fn write_preview_bitmap(hwnd: HWND, path: &Path) {
+        use windows::Win32::Graphics::Gdi::*;
+        #[link(name = "user32")]
+        extern "system" {
+            fn PrintWindow(hwnd: *mut c_void, dc: *mut c_void, flags: u32) -> i32;
+        }
+        unsafe {
+            let mut rect = RECT::default();
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).unwrap();
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            let dc = CreateCompatibleDC(HDC::default());
+            assert!(!dc.is_invalid());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, HGDIOBJ::from(bitmap));
+            let rendered = PrintWindow(hwnd.0, dc.0, 0);
+            let byte_count = (width * height * 4) as usize;
+            let mut bytes = Vec::with_capacity(54 + byte_count);
+            bytes.extend_from_slice(b"BM");
+            bytes.extend_from_slice(&((54 + byte_count) as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+            bytes.extend_from_slice(&54u32.to_le_bytes());
+            bytes.extend_from_slice(std::slice::from_raw_parts(
+                (&info.bmiHeader as *const BITMAPINFOHEADER).cast::<u8>(),
+                40,
+            ));
+            bytes.extend_from_slice(std::slice::from_raw_parts(bits.cast::<u8>(), byte_count));
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ::from(bitmap));
+            let _ = DeleteDC(dc);
+            assert_ne!(rendered, 0, "PrintWindow failed");
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
 }

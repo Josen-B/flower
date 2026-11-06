@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "model": {
+    "repository": "Xenova/macbert4csc-base-chinese",
+    "revision": "7ebfe81cf502576e93c844b95354840b2ecb5c28",
+    "license": "Apache-2.0",
+    "upstream_repository": "shibing624/macbert4csc-base-chinese",
+    "upstream_revision": "615e6e09ef9a69ec487bc7c641ec3a311e2c11b9"
+  },
+  "runtime": {
+    "version": "1.20.0",
+    "license": "MIT",
+    "archive_url": "https://github.com/microsoft/onnxruntime/releases/download/v1.20.0/onnxruntime-win-x64-1.20.0.zip",
+    "archive_sha256": "b372de85cedd9387a0d4386b982265e8420e5bcc2f29394317e76525b832942e"
+  },
+  "files": [
+    {
+      "path": "LICENSE-model.txt",
+      "size": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "LICENSE-onnxruntime.txt",
+      "size": 1094,
+      "sha256": "c250d6278f0b47a6439fb7592b08b58a55eb9f535aa49a1db63211c3f982b674"
+    },
+    {
+      "path": "model_int8.onnx",
+      "size": 103126077,
+      "sha256": "11fd06011b1381bcb2f5ac1cd9c208d502ce652876c79c2903bcd786e0bfb97b"
+    },
+    {
+      "path": "onnxruntime.dll",
+      "size": 11567648,
+      "sha256": "52f8ebe8f08f369a44fed6d1cb680c7c89169795e1c2949ee25b88b538ef0948"
+    },
+    {
+      "path": "README-conversion.md",
+      "size": 1116,
+      "sha256": "15fc16bc3a465e8262e7fc1b8bac027f8c169a7470bec2e2fad1ef35e0fa87be"
+    },
+    {
+      "path": "README-model.md",
+      "size": 6259,
+      "sha256": "3e977aef5f9c5b69d1c8f7710283b0323f7869571f7f3d23588f3f6d14adc389"
+    },
+    {
+      "path": "ThirdPartyNotices-onnxruntime.txt",
+      "size": 345046,
+      "sha256": "fac5bb85f568b38fd8f3a6aea32737985841f23a1a43e9ce952f79474f883aa9"
+    },
+    {
+      "path": "vocab.txt",
+      "size": 109540,
+      "sha256": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c"
+    }
+  ]
+}

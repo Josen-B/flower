@@ -13,6 +13,19 @@ impl Candidate {
             comment: comment.into(),
         }
     }
+
+    pub fn is_ai(&self) -> bool {
+        self.comment == crate::ai::AI_COMMENT
+    }
+
+    /// Display-only provenance; never part of committed text.
+    pub fn display_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.is_ai() {
+            std::borrow::Cow::Owned(format!("{} ✓ AI", self.text))
+        } else {
+            std::borrow::Cow::Borrowed(&self.text)
+        }
+    }
 }
 
 /// The complete state change returned after processing a key or selection.

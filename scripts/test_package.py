@@ -298,7 +298,7 @@ class PackageFixture:
             UNICODE_TEXT, encoding="utf-8"
         )
 
-        self.root_id = "path+file:///fixture#flower@0.1.0"
+        self.root_id = "path+file:///fixture#flower@0.4.7"
         self.dependencies = [
             self._dependency("alpha", "1.0.0", "MIT OR Apache-2.0"),
             self._dependency("beta", "1.0.0", "MIT"),
@@ -315,7 +315,7 @@ class PackageFixture:
                 file_names=("LICENSE-MIT", "LICENSE-APACHE", "LICENSE-UNICODE"),
             ),
         ]
-        self.metadata = self._metadata("0.1.0")
+        self.metadata = self._metadata("0.4.7")
 
     def _dependency(
         self,
@@ -393,7 +393,335 @@ class PackageFixture:
         )
 
 
+@contextlib.contextmanager
+def ai_fixture(base: Path):
+    """仅测试 patch 小模型常量与固定源读取位置；生产没有绕过开关。"""
+    ai = flower_package.package_ai_assets
+    bundle = base / "ai-bundle"
+    bundle.mkdir()
+    source_repo = base / "ai-source"
+    (source_repo / "data/ai").mkdir(parents=True)
+    data = {name: ("fixture " + name).encode() for name in ai.FILES}
+    record = {
+        "schema_version": 1, "model": dict(ai.MODEL),
+        "runtime": {"version": "1.20.0", "license": "MIT",
+                    "archive_url": ai.ARCHIVE_URL, "archive_sha256": "a" * 64},
+        "files": [{"path": name, "size": len(value), "sha256": ai.sha256(value)}
+                  for name, value in sorted(data.items())],
+    }
+    source = source_repo / "data/ai/manifest.json"
+    source.write_text(json.dumps(record), encoding="utf-8")
+    data["manifest.json"] = source.read_bytes()
+    for name, value in data.items():
+        (bundle / name).write_bytes(value)
+    original = ai.source_manifest
+    with mock.patch.object(ai, "MODEL_SIZE", len(data["model_int8.onnx"])), \
+            mock.patch.object(ai, "MODEL_SHA256", ai.sha256(data["model_int8.onnx"])), \
+            mock.patch.object(ai, "source_manifest", lambda repo: original(source_repo)):
+        yield bundle, source, record
+
+
+ISC_TEXT = (
+    "Copyright © 2015, Simonas Kazlauskas\n\n"
+    "Permission to use, copy, modify, and/or distribute this software for any purpose with or without\n"
+    "fee is hereby granted, provided that the above copyright notice and this permission notice appear\n"
+    "in all copies.\n\n"
+    'THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS\n'
+    "SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE\n"
+    "AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES\n"
+    "WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,\n"
+    "NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF\n"
+    "THIS SOFTWARE.\n"
+)
+
+
+TITLELESS_MIT_TEXT = """Copyright (c) 2019 Tokio Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+"""
+
+
+class MitLicenseTests(unittest.TestCase):
+    def test_titleless_complete_body_and_whitespace_are_recognized(self):
+        for text in (TITLELESS_MIT_TEXT, "\t\r\n".join(TITLELESS_MIT_TEXT.split())):
+            self.assertEqual(flower_package._classify_license_text("LICENSE", text), {"MIT"})
+
+    def test_titleless_truncation_missing_copyright_and_changed_terms_fail(self):
+        for text in (
+            TITLELESS_MIT_TEXT.split("Permission", 1)[0],
+            "Permission" + TITLELESS_MIT_TEXT.split("Permission", 1)[1],
+            TITLELESS_MIT_TEXT.split("THE SOFTWARE", 1)[0],
+            TITLELESS_MIT_TEXT.rsplit("THE SOFTWARE.", 1)[0],
+            TITLELESS_MIT_TEXT.replace("shall be included", "may be included"),
+            TITLELESS_MIT_TEXT.replace("AND NONINFRINGEMENT.", ""),
+            TITLELESS_MIT_TEXT + "\nAdditional commercial restriction.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("MIT", flower_package._classify_license_text("LICENSE", text))
+
+    def test_titleless_collection_preserves_bytes_and_rejects_truncation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            original = TITLELESS_MIT_TEXT.replace("\n", "\r\n").encode()
+            license_path = directory / "LICENSE"
+            license_path.write_bytes(original)
+            package = {"name": "mit-fixture", "version": "1.0.0", "license": "MIT",
+                       "manifest_path": str(directory / "Cargo.toml")}
+            payload, notices = flower_package._dependency_license_bundle([package])
+            self.assertEqual(payload["licenses/mit-fixture-1.0.0/LICENSE"], original)
+            self.assertEqual(notices[0]["spdx"], "MIT")
+            license_path.write_text(TITLELESS_MIT_TEXT.split("THE SOFTWARE", 1)[0])
+            with self.assertRaises(flower_package.PackagingError):
+                flower_package._dependency_license_bundle([package])
+
+    def test_only_exact_legacy_dual_expression_is_accepted(self):
+        self.assertEqual(
+            flower_package._license_expression_terms("MIT/Apache-2.0", "fixture"),
+            {"MIT", "Apache-2.0"},
+        )
+        for expression in ("MIT/ISC", "Apache-2.0/MIT", "MIT / Apache-2.0",
+                           "MIT/Apache-2.0 OR ISC", "MIT/LicenseRef-Unknown",
+                           " MIT/Apache-2.0 ", "MIT OR LicenseRef-Unknown"):
+            with self.subTest(expression=expression):
+                with self.assertRaises(flower_package.PackagingError):
+                    flower_package._license_expression_terms(expression, "fixture")
+
+    def test_legacy_dual_collection_requires_both_texts_and_retains_declaration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            texts = {"LICENSE": TITLELESS_MIT_TEXT.encode(), "LICENSE-APACHE": APACHE_TEXT.encode()}
+            for name, data in texts.items():
+                (directory / name).write_bytes(data)
+            package = {"name": "dual-fixture", "version": "1.0.0",
+                       "license": "MIT/Apache-2.0",
+                       "manifest_path": str(directory / "Cargo.toml")}
+            payload, notices = flower_package._dependency_license_bundle([package])
+            self.assertEqual(notices[0]["spdx"], "MIT/Apache-2.0")
+            for name, data in texts.items():
+                self.assertEqual(payload["licenses/dual-fixture-1.0.0/" + name], data)
+                (directory / name).unlink()
+                with self.subTest(missing=name):
+                    with self.assertRaises(flower_package.PackagingError):
+                        flower_package._dependency_license_bundle([package])
+                (directory / name).write_bytes(data)
+
+
+class IscLicenseTests(unittest.TestCase):
+    def test_complete_body_without_title_and_with_whitespace_is_recognized(self):
+        for text in (ISC_TEXT, "ISC License\n\n" + ISC_TEXT,
+                     "\t \r\n".join(ISC_TEXT.split())):
+            with self.subTest(text=text):
+                self.assertEqual(flower_package._classify_license_text("LICENSE", text), {"ISC"})
+                self.assertEqual(flower_package._classify_license_text("unrelated.txt", text), {"ISC"})
+
+    def test_title_declaration_truncation_and_changed_terms_are_rejected(self):
+        cases = [
+            "ISC License", "SPDX-License-Identifier: ISC",
+            "ISC License\nCopyright © 2015, Simonas Kazlauskas",
+            ISC_TEXT.split("Permission", 1)[1],
+            ISC_TEXT.split("THE SOFTWARE", 1)[0],
+            ISC_TEXT.rsplit("THIS SOFTWARE.", 1)[0],
+            ISC_TEXT.replace("in all copies.", ""),
+            ISC_TEXT.replace("NEGLIGENCE OR OTHER TORTIOUS ACTION,", ""),
+            ISC_TEXT.replace("fee is hereby granted", "fee may be granted"),
+            ISC_TEXT + "\nAdditional restriction: commercial use prohibited.",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertNotIn("ISC", flower_package._classify_license_text("LICENSE-ISC", text))
+
+    def test_collector_requires_body_and_preserves_original_full_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            original = ISC_TEXT.replace("\n", "\r\n").encode("utf-8")
+            (directory / "LICENSE").write_bytes(original)
+            package = {
+                "name": "isc-fixture", "version": "1.0.0", "license": "ISC",
+                "manifest_path": str(directory / "Cargo.toml"),
+            }
+            payload, notices = flower_package._dependency_license_bundle([package])
+            self.assertEqual(payload["licenses/isc-fixture-1.0.0/LICENSE"], original)
+            self.assertEqual(notices[0]["spdx"], "ISC")
+            for invalid in (None, "", "ISC License", "SPDX-License-Identifier: ISC",
+                            ISC_TEXT.split("THE SOFTWARE", 1)[0]):
+                with self.subTest(invalid=invalid):
+                    if invalid is None:
+                        (directory / "LICENSE").unlink()
+                    else:
+                        (directory / "LICENSE").write_text(invalid, encoding="utf-8")
+                    with self.assertRaises(flower_package.PackagingError):
+                        flower_package._dependency_license_bundle([package])
+
+
 class PackageTests(unittest.TestCase):
+    def test_ai_bundle_and_variant_manifest(self):
+        with ai_fixture(self.base) as (bundle, source, record):
+            result = flower_package.build_package(
+                repo_root=self.fixture.repo, output_dir=self.base / "ai-out",
+                host_platform="win32", runner=self.fixture.runner(), ai_assets=bundle,
+            )
+            self.assertEqual(result.zip_path.name, "flower-0.4.7-windows-x64.zip")
+            with zipfile.ZipFile(result.zip_path) as archive:
+                root = "flower-0.4.7-windows-x64/"
+                manifest = json.loads(archive.read(root + "manifest.json"))
+                self.assertEqual(manifest["variant"], "ai")
+                self.assertEqual(manifest["ai"], {
+                    "available": True, "source_manifest_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "source": record,
+                })
+                self.assertEqual(archive.read(root + "ai/manifest.json"), source.read_bytes())
+                sums = archive.read(root + "SHA256SUMS").decode()
+                for name in flower_package.package_ai_assets.BUNDLE_FILES:
+                    value = archive.read(root + "ai/" + name)
+                    self.assertIn(f"{hashlib.sha256(value).hexdigest()}  ai/{name}\n", sums)
+                self.assertEqual(len(manifest["binaries"]), 3)
+
+    def test_ai_bundle_rejects_missing_changed_extra_and_manifest_bytes(self):
+        ai = flower_package.package_ai_assets
+        with ai_fixture(self.base) as (bundle, source, record):
+            for name in ai.BUNDLE_FILES:
+                path = bundle / name
+                original = path.read_bytes()
+                with self.subTest(missing=name):
+                    path.unlink()
+                    with self.assertRaises(ValueError):
+                        ai.load_bundle(bundle, self.fixture.repo)
+                    path.write_bytes(original)
+                with self.subTest(changed=name):
+                    path.write_bytes(original + b" ")
+                    with self.assertRaises(ValueError):
+                        ai.load_bundle(bundle, self.fixture.repo)
+                    path.write_bytes(original)
+            for name in ("extra.dll", "README.md", "subdir"):
+                path = bundle / name
+                path.write_bytes(b"extra")
+                with self.assertRaises(ValueError):
+                    ai.load_bundle(bundle, self.fixture.repo)
+                path.unlink()
+
+    def test_ai_source_rejects_untrusted_metadata_paths_hashes_and_model(self):
+        ai = flower_package.package_ai_assets
+        with ai_fixture(self.base) as (bundle, source, record):
+            original = source.read_bytes()
+            mutations = [
+                lambda r: r["model"].update(license="MIT"),
+                lambda r: r["model"].update(revision="other"),
+                lambda r: r["runtime"].update(license="Apache-2.0"),
+                lambda r: r["runtime"].update(archive_url="https://example.com/runtime.zip"),
+                lambda r: r["runtime"].update(archive_sha256="placeholder"),
+                lambda r: r["files"][0].update(path="../LICENSE-model.txt"),
+                lambda r: r["files"][0].update(path="C:/LICENSE-model.txt"),
+                lambda r: r["files"][0].update(path="CON"),
+                lambda r: r["files"][0].update(size=True),
+                lambda r: r["files"][0].update(sha256="0" * 64),
+                lambda r: r["files"].append(dict(r["files"][0])),
+                lambda r: r["files"].pop(),
+                lambda r: next(row for row in r["files"] if row["path"] == "model_int8.onnx").update(sha256="0" * 64),
+            ]
+            for mutate in mutations:
+                changed = json.loads(original)
+                mutate(changed)
+                source.write_text(json.dumps(changed), encoding="utf-8")
+                (bundle / "manifest.json").write_bytes(source.read_bytes())
+                with self.subTest(mutate=mutate):
+                    with self.assertRaises(ValueError):
+                        ai.load_bundle(bundle, self.fixture.repo)
+            source.write_bytes(b'{"schema_version":1,"schema_version":1}')
+            with self.assertRaises(ValueError):
+                ai.source_manifest(self.fixture.repo)
+
+    def test_ai_rejects_reparse_files_and_parents(self):
+        ai = flower_package.package_ai_assets
+        with ai_fixture(self.base) as (bundle, source, record):
+            original = Path.lstat
+
+            for target in (bundle, bundle.parent, bundle / "onnxruntime.dll", source):
+                def reparse(path, *args, **kwargs):
+                    info = original(path, *args, **kwargs)
+                    if path == target:
+                        return mock.Mock(st_mode=info.st_mode, st_file_attributes=0x400)
+                    return info
+
+                with self.subTest(target=target):
+                    with mock.patch.object(Path, "lstat", reparse):
+                        with self.assertRaisesRegex(ValueError, "reparse"):
+                            ai.load_bundle(bundle, self.fixture.repo)
+            with mock.patch.object(ai.stat, "S_ISREG", return_value=False):
+                with self.assertRaisesRegex(ValueError, "普通文件"):
+                    ai.load_bundle(bundle, self.fixture.repo)
+            with mock.patch.object(ai, "MAX_PAYLOAD", 16):
+                with self.assertRaises(ValueError):
+                    ai.load_bundle(bundle, self.fixture.repo)
+
+    def test_ai_cli_requires_explicit_directory(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                flower_package._build_parser().parse_args(["--ai-assets"])
+            with self.assertRaises(SystemExit):
+                flower_package._build_parser().parse_args([])
+
+    def test_missing_ai_assets_fail_before_any_cargo_call(self):
+        runner = self.fixture.runner()
+        with self.assertRaisesRegex(flower_package.PackagingError, "AI 资产"):
+            flower_package.build_package(
+                repo_root=self.fixture.repo, output_dir=self.base / "missing-ai",
+                host_platform="win32", runner=runner, ai_assets=self.base / "absent",
+            )
+        self.assertEqual(runner.calls, [])
+
+    def test_missing_explicit_assets_refuses_base_before_cargo(self):
+        runner = self.fixture.runner()
+        with self.assertRaisesRegex(flower_package.PackagingError, "--ai-assets"):
+            flower_package.build_package(
+                repo_root=self.fixture.repo, host_platform="win32", runner=runner,
+            )
+        self.assertEqual(runner.calls, [])
+
+    def test_variant_names_share_top_level(self):
+        self.assertEqual(
+            flower_package._package_paths("0.4.7", "ai")[1],
+            "flower-0.4.7-windows-x64.zip",
+        )
+        self.assertEqual(
+            flower_package._package_paths("0.4.6"),
+            ("flower-0.4.6-windows-x64", "flower-0.4.6-windows-x64.zip",
+             "flower-0.4.6-windows-x64.zip.sha256"),
+        )
+        self.assertEqual(
+            flower_package._package_paths("0.4.6", "ai"),
+            ("flower-0.4.6-windows-x64", "flower-0.4.6-windows-x64-ai.zip",
+             "flower-0.4.6-windows-x64-ai.zip.sha256"),
+        )
+        with self.assertRaises(flower_package.PackagingError):
+            flower_package._package_paths("0.4.6", "../ai")
+
+    def test_new_build_preserves_both_historical_archives(self):
+        output = self.base / "history"
+        output.mkdir()
+        names = ("flower-0.4.6-windows-x64.zip", "flower-0.4.6-windows-x64-ai.zip")
+        for name in names:
+            (output / name).write_bytes(name.encode())
+        result = self.run_package(self.fixture.runner(), "history")
+        self.assertEqual(result.zip_path.name, "flower-0.4.7-windows-x64.zip")
+        for name in names:
+            self.assertEqual((output / name).read_bytes(), name.encode())
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -402,11 +730,14 @@ class PackageTests(unittest.TestCase):
 
     def run_package(self, runner: FakeRunner, output_name: str = "out"):
         output = self.base / output_name
+        asset_base = Path(self.enterContext(tempfile.TemporaryDirectory(dir=self.base)))
+        bundle = self.enterContext(ai_fixture(asset_base))
         return flower_package.build_package(
             repo_root=self.fixture.repo,
             output_dir=output,
             host_platform="win32",
             runner=runner,
+            ai_assets=bundle[0],
         )
 
     def test_dictionary_bundle_rejects_changed_generated_data_and_missing_license(self):
@@ -501,7 +832,7 @@ class PackageTests(unittest.TestCase):
         argument_error = io.StringIO()
         with contextlib.redirect_stderr(argument_error):
             with self.assertRaises(SystemExit) as raised:
-                flower_package.main(["--不存在的选项"])
+                flower_package.main(["--ai-assets", "assets", "--不存在的选项"])
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("无法识别的参数", argument_error.getvalue())
 
@@ -509,7 +840,8 @@ class PackageTests(unittest.TestCase):
         with mock.patch.object(flower_package.sys, "platform", "linux"):
             with contextlib.redirect_stderr(error):
                 result = flower_package.main(
-                    ["--output-dir", str(self.base / "not-created")]
+                    ["--ai-assets", str(self.base / "assets"),
+                     "--output-dir", str(self.base / "not-created")]
                 )
         self.assertNotEqual(result, 0)
         self.assertIn("只支持 Windows", error.getvalue())
@@ -612,7 +944,7 @@ class PackageTests(unittest.TestCase):
             self.assertTrue(required <= relative_names)
             self.assertEqual(
                 {name for name in relative_names if not name.startswith("licenses/")},
-                required,
+                required | {"ai/" + name for name in flower_package.package_ai_assets.BUNDLE_FILES},
             )
             self.assertFalse(any(
                 name.lower().endswith((".pdb", ".rlib"))
@@ -635,7 +967,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(everyday["sha256"], hashlib.sha256(data).hexdigest())
             self.assertEqual(everyday["license"], "MIT")
             self.assertIn("manual", everyday["weight_kind"])
-            self.assertEqual(manifest["version"], "0.1.0")
+            self.assertEqual(manifest["version"], "0.4.7")
             self.assertEqual(manifest["target"], "x86_64-pc-windows-msvc")
             self.assertFalse(manifest["distribution"]["authenticode_signed"])
             self.assertFalse(manifest["distribution"]["windows_desktop_verified"])
@@ -910,8 +1242,8 @@ class PackageTests(unittest.TestCase):
     def test_existing_outputs_are_not_modified(self) -> None:
         output = self.base / "existing"
         output.mkdir()
-        zip_path = output / "flower-0.1.0-windows-x64.zip"
-        checksum_path = output / "flower-0.1.0-windows-x64.zip.sha256"
+        zip_path = output / "flower-0.4.7-windows-x64.zip"
+        checksum_path = output / "flower-0.4.7-windows-x64.zip.sha256"
         zip_path.write_bytes(b"existing zip")
         checksum_path.write_bytes(b"existing checksum")
         runner = self.fixture.runner()
@@ -923,20 +1255,20 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in output.iterdir()},
             {
-                "flower-0.1.0-windows-x64.zip",
-                "flower-0.1.0-windows-x64.zip.sha256",
+                "flower-0.4.7-windows-x64.zip",
+                "flower-0.4.7-windows-x64.zip.sha256",
             },
         )
 
     def test_unsafe_version_is_rejected_before_build(self) -> None:
-        for index, version in enumerate(("../0.1.0", "1" * 129)):
+        for index, version in enumerate(("../0.4.7", "1" * 129)):
             with self.subTest(version=version):
                 self.fixture.metadata = self.fixture._metadata(version)
                 runner = self.fixture.runner()
                 with self.assertRaisesRegex(flower_package.PackagingError, "文件名"):
                     self.run_package(runner, f"unsafe-version-{index}")
                 self.assertEqual(len(runner.calls), 1)
-                self.assertFalse(any(self.base.rglob("*0.1.0.zip")))
+                self.assertFalse(any(self.base.rglob("*0.4.7.zip")))
 
     def test_failure_during_archive_write_removes_only_its_staging(self) -> None:
         output = self.base / "cleanup"
@@ -1006,17 +1338,17 @@ class PackageTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("模拟第二产物发布失败", message)
         self.assertIn("回滚失败", message)
-        zip_path = output / "flower-0.1.0-windows-x64.zip"
+        zip_path = output / "flower-0.4.7-windows-x64.zip"
         self.assertTrue(zip_path.is_file())
         self.assertFalse(
-            (output / "flower-0.1.0-windows-x64.zip.sha256").exists()
+            (output / "flower-0.4.7-windows-x64.zip.sha256").exists()
         )
         self.assertFalse(any(output.glob(".flower-package-*")))
 
     def test_rollback_does_not_delete_externally_replaced_product(self) -> None:
         output = self.base / "external-replacement"
         output.mkdir()
-        zip_path = output / "flower-0.1.0-windows-x64.zip"
+        zip_path = output / "flower-0.4.7-windows-x64.zip"
         real_publish = flower_package._publish_no_overwrite
         publish_count = 0
 
@@ -1037,7 +1369,7 @@ class PackageTests(unittest.TestCase):
         self.assertIn("外部替换", str(raised.exception))
         self.assertEqual(zip_path.read_bytes(), b"external replacement")
         self.assertFalse(
-            (output / "flower-0.1.0-windows-x64.zip.sha256").exists()
+            (output / "flower-0.4.7-windows-x64.zip.sha256").exists()
         )
 
     def test_missing_rust_docs_has_actionable_error(self) -> None:
@@ -1057,7 +1389,7 @@ class PackageTests(unittest.TestCase):
     def test_dangling_symlink_output_is_rejected(self) -> None:
         output = self.base / "dangling"
         output.mkdir()
-        link = output / "flower-0.1.0-windows-x64.zip"
+        link = output / "flower-0.4.7-windows-x64.zip"
         try:
             link.symlink_to(output / "missing-target")
         except (OSError, NotImplementedError):

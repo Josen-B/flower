@@ -119,7 +119,11 @@ impl CandidatePopupLayout {
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
-                scaled(candidate_cell_width(&candidate.text, index) as i32, dpi).max(1)
+                scaled(
+                    candidate_cell_width(&candidate.display_text(), index) as i32,
+                    dpi,
+                )
+                .max(1)
             })
             .collect();
         let total_width = cell_widths

@@ -4,12 +4,17 @@ use std::process::ExitCode;
 
 use flower::user_dictionary::DictionaryStore;
 
+#[cfg(target_os = "windows")]
+#[path = "../ai/inference.rs"]
+mod ai_inference;
+
 const USAGE: &str = "Flower 设置程序
 
 用法：
   flower-settings
   flower-settings --help
   flower-settings --start-input-method
+  flower-settings ai probe <bundle-directory>
   flower-settings dictionary status
   flower-settings dictionary import <path> [--domain <name>]
   flower-settings dictionary export <path> [--domain <name>]
@@ -28,6 +33,8 @@ const USAGE: &str = "Flower 设置程序
 enum Command {
     Gui,
     StartInputMethod,
+    AiServer,
+    AiProbe(PathBuf),
     Help,
     Unicode(char),
     Status,
@@ -88,6 +95,10 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Gui),
         [arg] if arg == "--start-input-method" => Ok(Command::StartInputMethod),
+        [arg] if arg == "--ai-server" => Ok(Command::AiServer),
+        [cmd, op, path] if cmd == "ai" && op == "probe" && !path.is_empty() => {
+            Ok(Command::AiProbe(PathBuf::from(path)))
+        }
         [arg] if arg == "--help" || arg == "-h" => Ok(Command::Help),
         [cmd, value] if cmd == "unicode" => Ok(Command::Unicode(unicode_scalar(&text(value)?)?)),
         [cmd, rest @ ..] if cmd == "dictionary" => match rest {
@@ -167,6 +178,42 @@ fn start_input_method() -> Result<(), String> {
 
 fn execute(command: Command) -> Result<(), String> {
     match command {
+        Command::AiServer => {
+            #[cfg(target_os = "windows")]
+            {
+                require_non_elevated()?;
+                return ai_inference::run_server();
+            }
+            #[cfg(not(target_os = "windows"))]
+            return Err("离线 AI 仅支持 Windows x64。".to_owned());
+        }
+        Command::AiProbe(bundle) => {
+            #[cfg(target_os = "windows")]
+            {
+                use std::io::Read;
+                require_non_elevated()?;
+                let mut input = String::new();
+                std::io::stdin()
+                    .take(4097)
+                    .read_to_string(&mut input)
+                    .map_err(|_| "无法读取测试输入。")?;
+                if input.len() > 4096 {
+                    return Err("测试输入过长。".into());
+                }
+                let corrected = ai_inference::probe(&bundle, input.trim_end_matches(['\r', '\n']))?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&flower::ai::Response { id: 0, corrected })
+                        .map_err(|_| "无法序列化测试结果。")?
+                );
+                return Ok(());
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = bundle;
+                return Err("离线 AI 仅支持 Windows x64。".to_owned());
+            }
+        }
         Command::StartInputMethod => return start_input_method(),
         Command::Help => {
             println!("{USAGE}");
@@ -266,6 +313,13 @@ mod tests {
         );
         assert!(command(&["--start-input-method", "extra"]).is_err());
         assert!(command(&["--start-input-method", "--help"]).is_err());
+        assert_eq!(command(&["--ai-server"]).unwrap(), Command::AiServer);
+        assert!(command(&["--ai-server", "extra"]).is_err());
+        assert_eq!(
+            command(&["ai", "probe", "fixed-bundle"]).unwrap(),
+            Command::AiProbe(PathBuf::from("fixed-bundle"))
+        );
+        assert!(command(&["ai", "probe"]).is_err());
         assert!(command(&["dictionary", "status", "--help"]).is_err());
         assert!(command(&["--help", "extra"]).is_err());
         assert!(command(&["dictionary", "learning", "yes"]).is_err());

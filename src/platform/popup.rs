@@ -69,11 +69,12 @@ mod windows_impl {
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
         GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W, InvalidateRect, MonitorFromRect,
-        MonitorFromWindow, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-        CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT,
-        DEFAULT_CHARSET, DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-        OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+        MonitorFromWindow, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT,
+        COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_PITCH,
+        DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL,
+        HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS,
+        PAINTSTRUCT, TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -92,6 +93,7 @@ mod windows_impl {
         WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
+    use crate::ai::AiStatus;
     use crate::platform::candidate::{
         clamp_candidate_popup, position_candidate_popup, CandidatePopupAction,
         CandidatePopupLayout, PopupPoint, PopupRect, PopupSize,
@@ -107,6 +109,56 @@ mod windows_impl {
 
     const BASE_DPI: u32 = 96;
     const WM_FLOWER_DISPATCH_ACTION: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+    const AI_IDLE_TIMER: usize = 0x4641;
+
+    /// Keeps status geometry out of the selectable candidate model.
+    struct PopupLayout {
+        candidates: CandidatePopupLayout,
+        size: PopupSize,
+        status: Option<PopupRect>,
+    }
+
+    impl PopupLayout {
+        fn new(
+            snapshot: &CandidatePopupSnapshot,
+            dpi: u32,
+            bounds: PopupSize,
+            status: Option<AiStatus>,
+        ) -> Self {
+            let height = bounds.height.max(1);
+            let status_height = if status.is_some() {
+                scaled(22, dpi).max(1).min(height)
+            } else {
+                0
+            };
+            let mut candidates = CandidatePopupLayout::new(
+                snapshot,
+                dpi,
+                PopupSize::new(bounds.width, (height - status_height).max(1)),
+            );
+            // CandidatePopupLayout requires a positive bound; at a one-pixel
+            // work area the status owns that pixel and no candidate can fit.
+            if height <= status_height {
+                candidates.candidates.clear();
+                candidates.size.height = 0;
+            }
+            let size = PopupSize::new(
+                candidates.size.width,
+                candidates
+                    .size
+                    .height
+                    .saturating_add(status_height)
+                    .min(height),
+            );
+            let status =
+                status.map(|_| PopupRect::new(0, candidates.size.height, size.width, size.height));
+            Self {
+                candidates,
+                size,
+                status,
+            }
+        }
+    }
 
     /// Owns only the temporary built-in hidden window, never the real popup.
     struct HiddenDpiProbe(Option<HWND>);
@@ -163,10 +215,13 @@ mod windows_impl {
 
     struct PopupState {
         snapshot: Option<CandidatePopupSnapshot>,
+        ai_status: Option<AiStatus>,
+        last_caret: Option<PopupRect>,
         dpi: u32,
         theme: Theme,
         pending_actions: VecDeque<CandidatePopupAction>,
         action_sink: Option<PopupActionSink>,
+        idle_sink: Option<Rc<dyn Fn()>>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -324,10 +379,13 @@ mod windows_impl {
 
             let state = Box::new(RefCell::new(PopupState {
                 snapshot: None,
+                ai_status: None,
+                last_caret: None,
                 dpi: BASE_DPI,
                 theme: Theme::System,
                 pending_actions: VecDeque::new(),
                 action_sink: None,
+                idle_sink: None,
             }));
             let state_pointer: *const c_void =
                 (state.as_ref() as *const RefCell<PopupState>).cast::<c_void>();
@@ -390,6 +448,39 @@ mod windows_impl {
             Ok(())
         }
 
+        /// Changes only the fixed, non-selectable diagnostic row.
+        pub(crate) fn set_ai_status(&mut self, status: AiStatus) -> Result<(), PopupError> {
+            self.ensure_alive()?;
+            let (added, caret) = {
+                let mut state = self
+                    .state
+                    .as_deref()
+                    .ok_or(PopupError::Destroyed)?
+                    .try_borrow_mut()
+                    .map_err(|_| state_busy_error())?;
+                if state.ai_status == Some(status) {
+                    return Ok(());
+                }
+                let added = state.ai_status.is_none();
+                state.ai_status = Some(status);
+                (added, state.last_caret)
+            };
+            // Only the first status changes geometry. Never show a hidden popup.
+            if added && self.is_visible() {
+                if let Some(caret) = caret {
+                    self.show_at(caret)?;
+                }
+            }
+            // SAFETY: The live window is invalidated without activating it.
+            if !unsafe { InvalidateRect(self.hwnd, None, TRUE) }.as_bool() {
+                return Err(PopupError::win32(
+                    "AI status invalidation",
+                    WindowsError::from_win32(),
+                ));
+            }
+            Ok(())
+        }
+
         /// 注册或解除鼠标动作回调。
         ///
         /// 回调只接收纯数据动作。窗口销毁、隐藏和失焦都会清除尚未派发的动作；
@@ -422,6 +513,44 @@ mod windows_impl {
             }
         }
 
+        /// Owner-thread polling hook. The callback may request asynchronous TSF
+        /// reads, but must never edit a host document from the window procedure.
+        pub(crate) fn set_idle_sink(
+            &mut self,
+            sink: Option<Rc<dyn Fn()>>,
+        ) -> Result<(), PopupError> {
+            self.ensure_alive()?;
+            let enabled = sink.is_some();
+            let state = self.state.as_deref().ok_or(PopupError::Destroyed)?;
+            state
+                .try_borrow_mut()
+                .map_err(|_| state_busy_error())?
+                .idle_sink = sink;
+            unsafe {
+                if enabled {
+                    if windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                        self.hwnd,
+                        AI_IDLE_TIMER,
+                        50,
+                        None,
+                    ) == 0
+                    {
+                        state
+                            .try_borrow_mut()
+                            .map_err(|_| state_busy_error())?
+                            .idle_sink = None;
+                        return Err(PopupError::win32("AI timer", WindowsError::from_win32()));
+                    }
+                } else {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                        self.hwnd,
+                        AI_IDLE_TIMER,
+                    );
+                }
+            }
+            Ok(())
+        }
+
         /// 替换绘制快照，并按当前 DPI 设置自然尺寸。
         pub fn update(&mut self, snapshot: &CandidatePopupSnapshot) -> Result<(), PopupError> {
             self.ensure_alive()?;
@@ -430,8 +559,15 @@ mod windows_impl {
             // and the call has no pointer arguments.
             let dpi = unsafe { GetDpiForWindow(self.hwnd) };
             let dpi = if dpi == 0 { BASE_DPI } else { dpi };
+            let status = self
+                .state
+                .as_deref()
+                .ok_or(PopupError::Destroyed)?
+                .try_borrow()
+                .map_err(|_| state_busy_error())?
+                .ai_status;
             let natural =
-                CandidatePopupLayout::new(snapshot, dpi, PopupSize::new(i32::MAX, i32::MAX)).size;
+                PopupLayout::new(snapshot, dpi, PopupSize::new(i32::MAX, i32::MAX), status).size;
 
             // SAFETY: The window is live. Resizing does not activate it, and a
             // null insert-after handle is ignored because SWP_NOZORDER is set.
@@ -458,6 +594,20 @@ mod windows_impl {
                 state.snapshot = Some(snapshot.clone());
                 state.dpi = dpi;
                 state.pending_actions.clear();
+            }
+
+            // A visible refresh must retain its caret anchor and screen clamp.
+            let caret = self
+                .state
+                .as_deref()
+                .ok_or(PopupError::Destroyed)?
+                .try_borrow()
+                .map_err(|_| state_busy_error())?
+                .last_caret;
+            if self.is_visible() {
+                if let Some(caret) = caret {
+                    return self.show_at(caret);
+                }
             }
 
             // SAFETY: The window is live and the null rectangle invalidates the
@@ -551,6 +701,13 @@ mod windows_impl {
         pub fn show_at(&self, caret: PopupRect) -> Result<(), PopupError> {
             self.ensure_alive()?;
             let snapshot = self.snapshot().ok_or(PopupError::NoSnapshot)?;
+            let status = self
+                .state
+                .as_deref()
+                .ok_or(PopupError::Destroyed)?
+                .try_borrow()
+                .map_err(|_| state_busy_error())?
+                .ai_status;
             self.hide();
             let native_caret = RECT {
                 left: caret.left,
@@ -585,10 +742,11 @@ mod windows_impl {
             // Move while hidden with a temporary size that fits the selected
             // monitor. This guarantees that `GetDpiForWindow` observes the
             // target monitor rather than an adjacent monitor at the caret edge.
-            let temporary_layout = CandidatePopupLayout::new(
+            let temporary_layout = PopupLayout::new(
                 &snapshot,
                 BASE_DPI,
                 PopupSize::new(work_area.width(), work_area.height()),
+                status,
             );
             let temporary = position_candidate_popup(caret, temporary_layout.size, work_area)
                 .ok_or_else(|| {
@@ -610,10 +768,11 @@ mod windows_impl {
             }
             .map_err(|error| PopupError::win32("target monitor move", error))?;
             let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(BASE_DPI);
-            let layout = CandidatePopupLayout::new(
+            let layout = PopupLayout::new(
                 &snapshot,
                 dpi,
                 PopupSize::new(work_area.width(), work_area.height()),
+                status,
             );
             let placement =
                 position_candidate_popup(caret, layout.size, work_area).ok_or_else(|| {
@@ -639,6 +798,7 @@ mod windows_impl {
                     .try_borrow_mut()
                     .map_err(|_| state_busy_error())?;
                 state.dpi = dpi;
+                state.last_caret = Some(caret);
             }
 
             // SAFETY: The window is live. SWP_SHOWWINDOW shows it without
@@ -868,6 +1028,15 @@ mod windows_impl {
                 dispatch_one_popup_action(hwnd);
                 LRESULT(0)
             }
+            windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == AI_IDLE_TIMER => {
+                let callback = unsafe { popup_state_pointer(hwnd).as_ref() }
+                    .and_then(|state| state.try_borrow().ok())
+                    .and_then(|state| state.idle_sink.clone());
+                if let Some(callback) = callback {
+                    callback();
+                }
+                LRESULT(0)
+            }
             WM_PAINT => {
                 let render_data = popup_render_data(hwnd);
                 paint_popup(hwnd, render_data.as_ref());
@@ -891,7 +1060,10 @@ mod windows_impl {
                     unsafe { popup_state_pointer(hwnd).as_ref() }.and_then(|state| {
                         if let Ok(mut state) = state.try_borrow_mut() {
                             state.dpi = new_dpi.max(1);
-                            state.snapshot.clone()
+                            state
+                                .snapshot
+                                .clone()
+                                .map(|snapshot| (snapshot, state.ai_status))
                         } else {
                             None
                         }
@@ -902,13 +1074,14 @@ mod windows_impl {
                     // SAFETY: WM_DPICHANGED supplies a pointer to a RECT that is
                     // valid for the duration of this message.
                     let suggested = unsafe { *(lparam.0 as *const RECT) };
-                    if let Some(snapshot) = snapshot.as_ref() {
+                    if let Some((snapshot, status)) = snapshot.as_ref() {
                         let work_area = monitor_work_area(rect_from_windows(suggested));
                         if let Some(work_area) = work_area {
-                            let layout = CandidatePopupLayout::new(
+                            let layout = PopupLayout::new(
                                 snapshot,
                                 new_dpi,
                                 PopupSize::new(work_area.width(), work_area.height()),
+                                *status,
                             );
                             let requested = PopupRect::new(
                                 suggested.left,
@@ -941,12 +1114,16 @@ mod windows_impl {
                 LRESULT(0)
             }
             WM_NCDESTROY => {
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, AI_IDLE_TIMER)
+                };
                 // SAFETY: The user data slot is either null or points to the
                 // live RefCell retained by the owning Rust struct.
                 if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
                     if let Ok(mut state) = state.try_borrow_mut() {
                         state.pending_actions.clear();
                         state.action_sink = None;
+                        state.idle_sink = None;
                     }
                 }
                 // SAFETY: The window is being destroyed. Clear the non-owning
@@ -1021,15 +1198,16 @@ mod windows_impl {
         let state = unsafe { popup_state_pointer(hwnd).as_ref()? };
         let state = state.try_borrow().ok()?;
         let snapshot = state.snapshot.as_ref()?;
-        let layout = CandidatePopupLayout::new(
+        let layout = PopupLayout::new(
             snapshot,
             state.dpi,
             PopupSize::new(client.right - client.left, client.bottom - client.top),
+            state.ai_status,
         );
 
         // Win32 must not be called while the RefCell borrow is held. The layout
         // and hit test are pure Rust operations.
-        layout.hit_test(snapshot, point)
+        layout.candidates.hit_test(snapshot, point)
     }
 
     fn queue_popup_action(hwnd: HWND, action: CandidatePopupAction) -> bool {
@@ -1129,7 +1307,9 @@ mod windows_impl {
         }
     }
 
-    fn popup_render_data(hwnd: HWND) -> Option<(CandidatePopupSnapshot, u32, Theme)> {
+    fn popup_render_data(
+        hwnd: HWND,
+    ) -> Option<(CandidatePopupSnapshot, u32, Theme, Option<AiStatus>)> {
         // SAFETY: The user data slot is either null or points to the live
         // RefCell retained by the owning Rust struct.
         let state = unsafe { popup_state_pointer(hwnd).as_ref()? };
@@ -1139,10 +1319,13 @@ mod windows_impl {
         let theme = state.theme;
 
         // The borrow ends here, before any paint or other Win32 call.
-        Some((snapshot, dpi, theme))
+        Some((snapshot, dpi, theme, state.ai_status))
     }
 
-    fn paint_popup(hwnd: HWND, render_data: Option<&(CandidatePopupSnapshot, u32, Theme)>) {
+    fn paint_popup(
+        hwnd: HWND,
+        render_data: Option<&(CandidatePopupSnapshot, u32, Theme, Option<AiStatus>)>,
+    ) {
         let mut paint = PAINTSTRUCT::default();
         // SAFETY: `hwnd` is live and `paint` is valid writable storage.
         let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -1159,7 +1342,7 @@ mod windows_impl {
             client = fallback;
         }
 
-        let Some((snapshot, dpi, theme)) = render_data else {
+        let Some((snapshot, dpi, theme, status)) = render_data else {
             fill_rect(hdc, &client, COLORREF(system_popup_palette().background));
             return;
         };
@@ -1175,25 +1358,40 @@ mod windows_impl {
             SetBkMode(hdc, TRANSPARENT);
         }
 
-        let layout = CandidatePopupLayout::new(
+        let layout = PopupLayout::new(
             snapshot,
             dpi,
             PopupSize::new(client.right - client.left, client.bottom - client.top),
+            *status,
         );
         for (index, (row, candidate)) in layout
+            .candidates
             .candidates
             .iter()
             .zip(snapshot.candidates.iter())
             .enumerate()
         {
             let mut row_rect = windows_rect(*row);
-            let line = format!("{}. {}", index + 1, candidate.text);
+            let line = format!("{}. {}", index + 1, candidate.display_text());
             let (line, width) = fitted_candidate_text(hdc, &line, row.width());
             let highlighted = snapshot.highlighted == Some(index);
             if highlighted {
-                let highlight = candidate_highlight_rect(*row, width);
-                fill_rect(hdc, &highlight, COLORREF(palette.highlight));
-                set_text_color(hdc, COLORREF(palette.highlight_text));
+                let highlight = candidate_highlight_rect(*row, width, dpi);
+                let painted = fill_candidate_highlight(
+                    hdc,
+                    &highlight,
+                    dpi,
+                    COLORREF(palette.highlight),
+                    COLORREF(palette.background),
+                );
+                set_text_color(
+                    hdc,
+                    COLORREF(if painted {
+                        palette.highlight_text
+                    } else {
+                        palette.text
+                    }),
+                );
             } else {
                 set_text_color(hdc, COLORREF(palette.text));
             }
@@ -1206,6 +1404,24 @@ mod windows_impl {
             );
         }
 
+        if let (Some(status), Some(rect)) = (status, layout.status) {
+            let padding = scaled(8, dpi).min(rect.width() / 2).max(0);
+            let mut text_rect = windows_rect(PopupRect::new(
+                rect.left + padding,
+                rect.top,
+                rect.right - padding,
+                rect.bottom,
+            ));
+            let (text, _) =
+                fitted_candidate_text(hdc, status.label(), text_rect.right - text_rect.left);
+            set_text_color(hdc, COLORREF(palette.text));
+            draw_text(
+                hdc,
+                &text,
+                &mut text_rect,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            );
+        }
         drop(font);
     }
 
@@ -1225,14 +1441,108 @@ mod windows_impl {
         fit_candidate_text(text, available, |text| measured_width(hdc, text))
     }
 
-    fn candidate_highlight_rect(cell: PopupRect, measured_width: i32) -> RECT {
+    fn candidate_highlight_rect(cell: PopupRect, measured_width: i32, dpi: u32) -> RECT {
+        let width = if measured_width > 0 {
+            measured_width.saturating_add(scaled(6, dpi))
+        } else {
+            0
+        };
         RECT {
-            right: cell
-                .left
-                .saturating_add(measured_width.max(0))
-                .min(cell.right),
+            right: cell.left.saturating_add(width).min(cell.right),
             ..windows_rect(cell)
         }
+    }
+
+    fn fill_candidate_highlight(
+        hdc: HDC,
+        rect: &RECT,
+        dpi: u32,
+        color: COLORREF,
+        background: COLORREF,
+    ) -> bool {
+        let Some(width) = rect.right.checked_sub(rect.left) else {
+            return false;
+        };
+        let Some(height) = rect.bottom.checked_sub(rect.top) else {
+            return false;
+        };
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        let diameter = scaled(8, dpi).max(1).min(width).min(height);
+        // Bound transient storage to 16 MiB even for malformed/oversized rectangles.
+        let Some(count) = (width as usize)
+            .checked_mul(height as usize)
+            .filter(|count| *count <= 4 * 1024 * 1024)
+        else {
+            return false;
+        };
+        let mut pixels = Vec::<u32>::new();
+        if pixels.try_reserve_exact(count).is_err() {
+            return false;
+        }
+        // COLORREF is 0x00BBGGRR; a little-endian BI_RGB word is 0x00RRGGBB.
+        let blend = |coverage: u32| {
+            let channel = |shift: u32| -> u32 {
+                let fg = (color.0 >> shift) & 255;
+                let bg = (background.0 >> shift) & 255;
+                (fg * coverage + bg * (64 - coverage) + 32) / 64
+            };
+            (channel(0) << 16) | (channel(8) << 8) | channel(16)
+        };
+        let solid = blend(64);
+        let radius = f64::from(diameter) / 2.0;
+        for y in 0..height {
+            for x in 0..width {
+                // Reflect to one corner so all four coverage masks are identical.
+                let cx = x.min(width - 1 - x);
+                let cy = y.min(height - 1 - y);
+                if f64::from(cx) >= radius || f64::from(cy) >= radius {
+                    pixels.push(solid);
+                    continue;
+                }
+                let mut coverage = 0;
+                for sy in 0..8 {
+                    for sx in 0..8 {
+                        let dx = radius - (f64::from(cx) + (f64::from(sx) + 0.5) / 8.0);
+                        let dy = radius - (f64::from(cy) + (f64::from(sy) + 0.5) / 8.0);
+                        if dx * dx + dy * dy <= radius * radius {
+                            coverage += 1;
+                        }
+                    }
+                }
+                pixels.push(blend(coverage));
+            }
+        }
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: pixels contains every scanline of the top-down 32-bit DIB.
+        (unsafe {
+            SetDIBitsToDevice(
+                hdc,
+                rect.left,
+                rect.top,
+                width as u32,
+                height as u32,
+                0,
+                0,
+                0,
+                height as u32,
+                pixels.as_ptr().cast(),
+                &info,
+                DIB_RGB_COLORS,
+            )
+        }) == height
     }
 
     fn fit_candidate_text(
@@ -1410,7 +1720,59 @@ mod windows_impl {
     #[cfg(test)]
     mod candidate_paint_tests {
         use super::*;
-        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GetPixel, HBITMAP,
+        };
+
+        #[test]
+        fn ai_status_layout_preserves_candidates_and_excludes_status_hits() {
+            let snapshot = CandidatePopupSnapshot {
+                revision: 1,
+                preedit: String::new(),
+                candidates: vec![crate::engine::Candidate::new("你好", "nihao")],
+                highlighted: None,
+                page: 0,
+                page_count: 0,
+            };
+            for dpi in [96, 144, 192, 480] {
+                let bounds = PopupSize::new(4000, 4000);
+                let plain = PopupLayout::new(&snapshot, dpi, bounds, None);
+                let original = CandidatePopupLayout::new(&snapshot, dpi, bounds);
+                assert_eq!(plain.candidates, original);
+                assert_eq!(plain.size, original.size);
+                assert!(plain.status.is_none());
+                let status = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
+                assert_eq!(status.candidates, plain.candidates);
+                assert_eq!(status.size.width, plain.size.width);
+                assert_eq!(status.size.height, plain.size.height + scaled(22, dpi));
+                let row = status.status.unwrap();
+                assert_eq!(row.top, plain.size.height);
+                assert_eq!(
+                    status
+                        .candidates
+                        .hit_test(&snapshot, PopupPoint { x: 8, y: row.top }),
+                    None
+                );
+                for width in [1, 7, 32, 560] {
+                    for height in [1, 7, 22, 45, 100] {
+                        let layout = PopupLayout::new(
+                            &snapshot,
+                            dpi,
+                            PopupSize::new(width, height),
+                            Some(AiStatus::Checking),
+                        );
+                        assert!(layout.size.width <= width && layout.size.height <= height);
+                        let row = layout.status.unwrap();
+                        assert!(row.top >= 0 && row.bottom <= height && row.right <= width);
+                        assert!(layout
+                            .candidates
+                            .candidates
+                            .iter()
+                            .all(|cell| cell.bottom <= row.top));
+                    }
+                }
+            }
+        }
 
         #[test]
         fn candidate_gdi_selected_font_fits_actual_display_including_ellipsis() {
@@ -1433,11 +1795,16 @@ mod windows_impl {
                     assert!(width >= 0 && width <= available);
                     assert_eq!(measured_width(hdc, &display), Some(width));
                     let cell = PopupRect::new(17, 8, 17 + available, 38);
-                    let highlight = candidate_highlight_rect(cell, width);
+                    let highlight = candidate_highlight_rect(cell, width, dpi);
                     assert_eq!(highlight.left, cell.left);
                     assert_eq!(highlight.top, cell.top);
                     assert_eq!(highlight.bottom, cell.bottom);
-                    assert_eq!(highlight.right, cell.left + width);
+                    let expected = if width > 0 {
+                        width.saturating_add(scaled(6, dpi)).min(available)
+                    } else {
+                        0
+                    };
+                    assert_eq!(highlight.right, cell.left + expected);
                     assert!(highlight.right <= cell.right);
                     if available == roomy {
                         assert!(highlight.right < cell.right);
@@ -1468,8 +1835,194 @@ mod windows_impl {
                 (String::new(), 0)
             );
             let cell = PopupRect::new(10, 8, 20, 38);
-            assert_eq!(candidate_highlight_rect(cell, i32::MAX).right, 20);
-            assert_eq!(candidate_highlight_rect(cell, -1).right, 10);
+            assert_eq!(candidate_highlight_rect(cell, i32::MAX, 96).right, 20);
+            assert_eq!(candidate_highlight_rect(cell, -1, 96).right, 10);
+        }
+
+        #[test]
+        fn candidate_highlight_padding_scales_and_stays_inside_its_cell() {
+            for dpi in [0, 96, 144, 192, 480, u32::MAX] {
+                let cell = PopupRect::new(10, 8, 210, 38);
+                let rect = candidate_highlight_rect(cell, 30, dpi);
+                assert_eq!(rect.right, (40 + scaled(6, dpi)).min(210));
+                assert_eq!(rect.left, cell.left);
+                assert_eq!(candidate_highlight_rect(cell, 0, dpi).right, cell.left);
+                let narrow = PopupRect::new(10, 8, 11, 38);
+                assert_eq!(
+                    candidate_highlight_rect(narrow, 30, dpi).right,
+                    narrow.right
+                );
+            }
+        }
+
+        #[test]
+        fn candidate_highlight_gdi_has_round_corners_and_does_not_paint_next_cell() {
+            struct Surface {
+                dc: HDC,
+                bitmap: HBITMAP,
+                previous: HGDIOBJ,
+            }
+            impl Drop for Surface {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = SelectObject(self.dc, self.previous);
+                        let _ = DeleteObject(self.bitmap);
+                        let _ = DeleteDC(self.dc);
+                    }
+                }
+            }
+            let dc = unsafe { CreateCompatibleDC(None) };
+            assert!(!dc.is_invalid());
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: 100,
+                    biHeight: -60,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            let bitmap = unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                .unwrap_or_else(|error| {
+                    let _ = unsafe { DeleteDC(dc) };
+                    panic!("create offscreen bitmap: {error}");
+                });
+            let previous = unsafe { SelectObject(dc, bitmap) };
+            let surface = Surface {
+                dc,
+                bitmap,
+                previous,
+            };
+            for background in [
+                COLORREF(0x00ff_ffff),
+                COLORREF(0x0020_2020),
+                COLORREF(0x0038_7124),
+            ] {
+                let highlight = COLORREF(0x00d7_7800);
+                for dpi in [96, 144, 192, 480] {
+                    fill_rect(
+                        surface.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: 100,
+                            bottom: 60,
+                        },
+                        background,
+                    );
+                    let cell = PopupRect::new(10, 10, 90, 40);
+                    let rect = candidate_highlight_rect(cell, 30, dpi);
+                    assert!(fill_candidate_highlight(
+                        surface.dc, &rect, dpi, highlight, background,
+                    ));
+                    assert_eq!(unsafe { GetPixel(surface.dc, 10, 10) }, background);
+                    assert_eq!(unsafe { GetPixel(surface.dc, 25, 25) }, highlight);
+                    assert_eq!(unsafe { GetPixel(surface.dc, rect.right, 25) }, background);
+                    assert_eq!(unsafe { GetPixel(surface.dc, 90, 25) }, background);
+                    let mut mixed = std::collections::BTreeSet::new();
+                    for y in 0..60 {
+                        for x in 0..100 {
+                            let pixel = unsafe { GetPixel(surface.dc, x, y) };
+                            if x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom
+                            {
+                                assert_eq!(pixel, background, "outside {x},{y} at {dpi} DPI");
+                            } else {
+                                assert_eq!(pixel, unsafe {
+                                    GetPixel(surface.dc, rect.right - 1 - (x - rect.left), y)
+                                });
+                                assert_eq!(pixel, unsafe {
+                                    GetPixel(surface.dc, x, rect.bottom - 1 - (y - rect.top))
+                                });
+                                if pixel != background && pixel != highlight {
+                                    mixed.insert(pixel.0);
+                                    for shift in [0, 8, 16] {
+                                        let fg = (highlight.0 >> shift) & 255;
+                                        let bg = (background.0 >> shift) & 255;
+                                        let actual = (pixel.0 >> shift) & 255;
+                                        assert!((fg.min(bg)..=fg.max(bg)).contains(&actual));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert!(mixed.len() > 1, "multiple AA coverage levels at {dpi} DPI");
+                    assert!(!fill_candidate_highlight(
+                        surface.dc,
+                        &RECT::default(),
+                        dpi,
+                        highlight,
+                        background,
+                    ));
+                    assert!(fill_candidate_highlight(
+                        surface.dc,
+                        &RECT {
+                            left: 1,
+                            top: 1,
+                            right: 2,
+                            bottom: 2
+                        },
+                        dpi,
+                        highlight,
+                        background,
+                    ));
+                    for (width, height) in [(1, 1), (1, 3), (2, 2), (3, 5), (5, 2)] {
+                        let tiny = RECT {
+                            left: 2,
+                            top: 2,
+                            right: 2 + width,
+                            bottom: 2 + height,
+                        };
+                        assert!(fill_candidate_highlight(
+                            surface.dc, &tiny, dpi, highlight, background
+                        ));
+                        for y in 0..height {
+                            for x in 0..width {
+                                let pixel = unsafe { GetPixel(surface.dc, 2 + x, 2 + y) };
+                                assert_eq!(pixel, unsafe {
+                                    GetPixel(surface.dc, 2 + width - 1 - x, 2 + y)
+                                });
+                                assert_eq!(pixel, unsafe {
+                                    GetPixel(surface.dc, 2 + x, 2 + height - 1 - y)
+                                });
+                            }
+                        }
+                    }
+                    for invalid in [
+                        RECT {
+                            left: 2,
+                            top: 2,
+                            right: 1,
+                            bottom: 3,
+                        },
+                        RECT {
+                            left: 2,
+                            top: 2,
+                            right: 3,
+                            bottom: 1,
+                        },
+                        RECT {
+                            left: i32::MIN,
+                            top: 0,
+                            right: i32::MAX,
+                            bottom: 1,
+                        },
+                        RECT {
+                            left: 0,
+                            top: 0,
+                            right: 100_000,
+                            bottom: 100_000,
+                        },
+                    ] {
+                        assert!(!fill_candidate_highlight(
+                            surface.dc, &invalid, dpi, highlight, background
+                        ));
+                    }
+                }
+            }
         }
     }
 }

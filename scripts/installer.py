@@ -47,6 +47,7 @@ class VerifiedPackage:
     digest: str
     payload: dict[str, bytes]
     binaries: list[dict]
+    variant: str = "base"
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,8 @@ def verify_package(archive: Path) -> VerifiedPackage:
             name = entry.filename
             if name != entry.orig_filename or not _safe_relative(name) or entry.is_dir():
                 raise InstallerError(f"ZIP 路径不安全或包含非文件条目：{name}")
-            if stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG):
+            if (stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG)
+                    or entry.external_attr & 0x400):
                 raise InstallerError("ZIP 包含符号链接或其他非普通文件")
             components = name.split("/", 1)
             if len(components) != 2:
@@ -116,7 +118,9 @@ def verify_package(archive: Path) -> VerifiedPackage:
                 raise InstallerError("ZIP 存在多个顶层或大小写冲突的重复条目")
             seen.add(name.casefold())
             relative = components[1]
-            if relative not in ROOT_FILES and not relative.startswith("licenses/"):
+            if (relative not in ROOT_FILES
+                    and relative not in {"ai/" + name for name in pack.package_ai_assets.BUNDLE_FILES}
+                    and not relative.startswith("licenses/")):
                 raise InstallerError(f"ZIP 存在白名单之外的文件：{relative}")
             if relative.startswith("licenses/") and Path(relative).suffix.lower() in (
                 ".exe", ".dll", ".ps1", ".bat", ".cmd", ".com",
@@ -143,6 +147,22 @@ def verify_package(archive: Path) -> VerifiedPackage:
         or top != f"flower-{version}-windows-x64"
     ):
         raise InstallerError("manifest 身份、目标或顶层目录不匹配")
+    variant = manifest.get("variant", "base")
+    release = tuple(int(part) for part in re.split(r"[-+]", version, maxsplit=1)[0].split("."))
+    if release >= (0, 4, 7) and variant != "ai":
+        raise InstallerError("0.4.7 起必须提供完整 AI 分发包")
+    ai_payload = {name[3:]: value for name, value in payload.items() if name.startswith("ai/")}
+    if variant == "ai":
+        try:
+            ai_record = pack.package_ai_assets.verify_payload(ai_payload, REPO)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise InstallerError(f"AI payload 校验失败：{error}") from error
+        if manifest.get("ai") != ai_record:
+            raise InstallerError("manifest AI 记录与固定源指纹不匹配")
+    elif variant != "base" or ai_payload or manifest.get("ai", {"available": False}) != {"available": False}:
+        raise InstallerError("普通包不能包含 AI 资产或可用记录")
+    if archive.name != pack._package_paths(version, variant)[1]:
+        raise InstallerError("ZIP 文件名与 manifest 变体不匹配")
     hashes: dict[str, str] = {}
     for line in payload["SHA256SUMS"].decode("utf-8").splitlines():
         row = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
@@ -178,7 +198,7 @@ def verify_package(archive: Path) -> VerifiedPackage:
             raise InstallerError("DLL 缺少必需导出")
     if manifest.get("cargo_lock_sha256") != hashes["Cargo.lock"]:
         raise InstallerError("Cargo.lock 哈希与 manifest 不匹配")
-    return VerifiedPackage(version, digest, payload, records)
+    return VerifiedPackage(version, digest, payload, records, variant)
 
 
 def find_compiler(explicit: Path | None) -> Path:
@@ -230,6 +250,8 @@ def build_installer(
     if host != "win32":
         raise InstallerError("真实 EXE 安装器仅在 Windows 上构建")
     verified = verify_package(archive)
+    if verified.variant != "ai":
+        raise InstallerError("新安装器只能从完整 AI 分发包构建")
     iscc = find_compiler(compiler)
     engine_license = (iscc.parent / "license.txt").read_bytes()
     if not engine_license.startswith(b"Inno Setup License") or b"Jordan Russell" not in engine_license:
@@ -273,6 +295,7 @@ def build_installer(
         exe = stage / f"{stem}.exe"
         args = [
             str(iscc), "/Q",
+            f"/F{stem}",
             f"/DAppVersion={verified.version}", f"/DBuildId={build_id}",
             f"/DFileVersion={file_version}",
             f"/DPackageDir={payload}", f"/DFilesInclude={include}",
@@ -307,6 +330,8 @@ def build_installer(
         manifest.write_text(json.dumps({
             "schema_version": 1, "package": "flower", "version": verified.version,
             "format": "inno-setup-exe", "payload_target": pack.TARGET,
+            "variant": verified.variant,
+            "source_zip": archive.name,
             "source_zip_sha256": verified.digest, "build_id": build_id,
             "installer": {"file": exe.name, "size": len(executable), "sha256": exe_hash},
             "authenticode_signed": False, "windows_desktop_verified": False,

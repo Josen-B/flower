@@ -3,7 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    for file in ["assets/flower.rc", "assets/flower.ico"] {
+    for file in [
+        "assets/flower.rc",
+        "assets/flower.ico",
+        "assets/flower-settings.rc",
+        "assets/flower-settings.manifest",
+    ] {
         println!("cargo:rerun-if-changed={file}");
     }
     for name in [
@@ -38,6 +43,26 @@ fn main() {
     assert!(status.success(), "Windows icon resource compilation failed");
     println!("cargo:rustc-link-arg-cdylib={}", resource.display());
     println!("cargo:rustc-link-arg-bins={}", resource.display());
+    // Visual styles and DPI awareness belong only to the standalone settings
+    // executable. Never attach this application manifest to the TSF host DLL.
+    let manifest_resource =
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("flower-settings.res");
+    let status = Command::new(&compiler)
+        .current_dir(&root)
+        .arg("/nologo")
+        .arg("/fo")
+        .arg(&manifest_resource)
+        .arg(root.join("assets/flower-settings.rc"))
+        .status()
+        .unwrap_or_else(|error| panic!("could not execute {}: {error}", compiler.display()));
+    assert!(
+        status.success(),
+        "Settings manifest resource compilation failed"
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=flower-settings={}",
+        manifest_resource.display()
+    );
 }
 
 fn find_resource_compiler() -> Option<PathBuf> {

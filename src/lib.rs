@@ -5,6 +5,7 @@
 //! [`engine`], [`settings`], [`registration`], and [`platform`]. The most common engine and
 //! settings items are also re-exported at the crate root for convenience.
 
+pub mod ai;
 pub mod engine;
 pub mod platform;
 pub mod registration;

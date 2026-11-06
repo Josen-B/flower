@@ -75,8 +75,8 @@ Source: "notice.zh-CN.txt"; DestDir: "{app}\versions\{#BuildId}"; DestName: "INS
 Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\installer"; DestName: "INNO-SETUP.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{commonprograms}\Flower\启用 Flower（当前用户）"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
-Name: "{commonprograms}\Flower\停用 Flower（当前用户）"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "disable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\启动 Flower"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\停用 Flower"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "disable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
 Name: "{commonprograms}\Flower\Flower 设置"; Filename: "{app}\versions\{#BuildId}\flower-settings.exe"
 Name: "{commonprograms}\Flower\Flower 安装说明"; Filename: "{app}\versions\{#BuildId}\INSTALLER-README.txt"
 

@@ -92,6 +92,28 @@ fn validate_spelling(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Adapt runtime module-directory spelling only, without filesystem access.
+/// This is not a safety proof: callers must still use `check_install_path`
+/// before checking their fixed helper and model paths. Never canonicalize here,
+/// since that could hide reparse points from the existing tree inspection.
+pub(crate) fn normalize_runtime_directory(path: &Path) -> Result<PathBuf, String> {
+    let text = path.to_str().ok_or("目录必须为有效 Unicode")?;
+    let normalized = match text.strip_prefix(r"\\?\") {
+        Some(local)
+            if local
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+                && local.as_bytes().get(1..3) == Some(b":\\") =>
+        {
+            local
+        }
+        _ => text,
+    };
+    validate_spelling(normalized)?;
+    Ok(PathBuf::from(normalized))
+}
+
 fn reserved_number(s: &str) -> bool {
     matches!(
         s,
@@ -779,6 +801,89 @@ mod tests {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn normalize_runtime_directory_accepts_normal_and_verbatim_native_paths() {
+        for normal in [
+            r"C:\Program Files\Flower",
+            r"d:\软件 和 空格\Flower",
+            r"D:\Flower",
+        ] {
+            let verbatim = format!(r"\\?\{normal}");
+            for input in [normal, verbatim.as_str()] {
+                let normalized = normalize_runtime_directory(Path::new(input)).unwrap();
+                assert_eq!(normalized.as_os_str(), OsStr::new(normal));
+            }
+            // Runtime adaptation must not widen the installation CLI grammar.
+            assert!(validate_spelling(&verbatim).is_err());
+        }
+        let boundary = format!("C:\\{}", "a".repeat(217));
+        assert_eq!(boundary.len(), 220);
+        assert!(normalize_runtime_directory(Path::new(&boundary)).is_ok());
+        assert!(normalize_runtime_directory(Path::new(&format!(r"\\?\{boundary}"))).is_ok());
+    }
+
+    #[test]
+    fn normalize_runtime_directory_rejects_unsupported_spellings() {
+        for invalid in [
+            r"\\server\share\Flower",
+            r"\\?\UNC\server\share\Flower",
+            r"\\.\C:\Flower",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\Flower",
+            r"\\?\Volume{00112233-4455-6677-8899-aabbccddeeff}\Flower",
+            r"C:\",
+            r"C:Flower",
+            r"Flower",
+            r"\Flower",
+            r"C:/Flower",
+            r"\\?\1:\Flower",
+            r"\\?\é:\Flower",
+            r"\\?\C:/Flower",
+            r"\\?\",
+            r"\??\C:\Flower",
+        ] {
+            assert!(
+                normalize_runtime_directory(Path::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            r"C:\",
+            r"C:Flower",
+            r"C:\a\.\Flower",
+            r"C:\a\..\Flower",
+            r"C:\a.\Flower",
+            r"C:\a \Flower",
+            r"C:\a:stream",
+            r"C:\CON.txt",
+            r"C:\COM1",
+            r"C:\LPT²",
+            r"C:\\Flower",
+            r"C:\Flower\",
+            r"C:\a/b",
+            r"C:\a*b",
+            r#"C:\a"b"#,
+            r"C:\a?b",
+            r"C:\a<b",
+            r"C:\a>b",
+            r"C:\a|b",
+            "C:\\a\0b",
+            "C:\\a\nb",
+            &format!("C:\\{}", "a".repeat(218)),
+            &format!("C:\\{}", "字".repeat(73)),
+        ] {
+            for input in [invalid.to_owned(), format!(r"\\?\{invalid}")] {
+                assert!(
+                    normalize_runtime_directory(Path::new(&input)).is_err(),
+                    "{input}"
+                );
+            }
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let non_unicode =
+            std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800]);
+        assert!(normalize_runtime_directory(Path::new(&non_unicode)).is_err());
     }
 
     #[test]

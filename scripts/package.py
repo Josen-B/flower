@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 try:
-    from scripts import build_lexicon
+    from scripts import build_lexicon, package_ai_assets
 except ModuleNotFoundError:
     import build_lexicon
+    import package_ai_assets
 
 
 TARGET = "x86_64-pc-windows-msvc"
@@ -30,7 +31,7 @@ EXPECTED_ROOT_LICENSE = "MIT OR Apache-2.0"
 EXPECTED_DLL_EXPORTS = frozenset({"DllGetClassObject", "DllCanUnloadNow"})
 SAFE_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 SUPPORTED_LICENSE_IDS = frozenset(
-    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0"}
+    {"MIT", "Apache-2.0", "Unlicense", "Unicode-3.0", "ISC"}
 )
 LICENSE_FILE_PREFIXES = (
     "LICENSE",
@@ -183,9 +184,13 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _package_paths(version: str) -> tuple[str, str, str]:
+def _package_paths(version: str, variant: str = "base") -> tuple[str, str, str]:
+    if variant not in ("base", "ai"):
+        raise PackagingError(f"未知分发变体：{variant!r}")
     base = f"flower-{version}-windows-x64"
-    return base, f"{base}.zip", f"{base}.zip.sha256"
+    release = tuple(int(part) for part in re.split(r"[-+]", version, maxsplit=1)[0].split("."))
+    stem = base + ("-ai" if variant == "ai" and release < (0, 4, 7) else "")
+    return base, f"{stem}.zip", f"{stem}.zip.sha256"
 
 
 def _exists_even_dangling(path: Path) -> bool:
@@ -317,6 +322,8 @@ def _resolved_dependencies(
 def _license_expression_terms(expression: object, label: str) -> set[str]:
     if not isinstance(expression, str) or not expression.strip():
         raise PackagingError(f"{label}缺少 SPDX 许可表达式")
+    if expression == "MIT/Apache-2.0":
+        expression = "MIT OR Apache-2.0"
 
     tokens: list[str] = []
     position = 0
@@ -403,6 +410,52 @@ def _classify_license_text(name: str, text: str) -> set[str]:
         classes.add("MIT")
     if "COPYRIGHT" in upper_name and "permission is hereby granted" in normalized:
         classes.add("MIT")
+    mit_body = (
+        "Permission is hereby granted, free of charge, to any person obtaining a "
+        'copy of this software and associated documentation files (the "Software"), '
+        "to deal in the Software without restriction, including without limitation "
+        "the rights to use, copy, modify, merge, publish, distribute, sublicense, "
+        "and/or sell copies of the Software, and to permit persons to whom the "
+        "Software is furnished to do so, subject to the following conditions: "
+        "The above copyright notice and this permission notice shall be included "
+        "in all copies or substantial portions of the Software. "
+        'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR '
+        "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, "
+        "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL "
+        "THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR "
+        "OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, "
+        "ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR "
+        "OTHER DEALINGS IN THE SOFTWARE."
+    )
+    if re.fullmatch(
+        r"Copyright (?:©|\(c\))? ?"
+        r"[0-9]{4}(?:[-, ]+[0-9]{4})*,? [^\r\n]+? "
+        + re.escape(mit_body),
+        " ".join(text.split()),
+    ) is not None:
+        classes.add("MIT")
+    isc_body = (
+        "Permission to use, copy, modify, and/or distribute this software for any "
+        "purpose with or without fee is hereby granted, provided that the above "
+        "copyright notice and this permission notice appear in all copies. "
+        'THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES '
+        "WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF "
+        "MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR "
+        "ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES "
+        "WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN "
+        "ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF "
+        "OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE."
+    )
+    # 只折叠空白；正文的措辞、大小写和标点必须保持完整。
+    isc_text = " ".join(text.split())
+    isc_match = re.fullmatch(
+        r"(?:ISC License )?Copyright (?:©|\(c\))? ?"
+        r"[0-9]{4}(?:[-, ]+[0-9]{4})*,? [^\r\n]+? "
+        + re.escape(isc_body),
+        isc_text,
+    )
+    if isc_match is not None:
+        classes.add("ISC")
     return classes
 
 
@@ -1323,6 +1376,7 @@ def _build_payloads(
     dependency_notices: Sequence[dict],
     rust_payload: Mapping[str, bytes],
     rust_std: dict,
+    ai_bundle: tuple[dict[str, bytes], dict] | None = None,
 ) -> tuple[dict[str, bytes], str]:
     top_level, _, _ = _package_paths(version)
     readme = _read_bytes(repo_root / "docs" / "distribution.md", "中文分发说明")
@@ -1379,10 +1433,14 @@ def _build_payloads(
         "数据许可不改写 Flower 程序代码的许可。\n"
     ).encode("utf-8")
 
+    if ai_bundle is not None:
+        payload.update(ai_bundle[0])
     manifest = {
         "schema_version": 1,
         "package": "flower",
         "version": version,
+        "variant": "ai" if ai_bundle is not None else "base",
+        "ai": ai_bundle[1] if ai_bundle is not None else {"available": False},
         "target": TARGET,
         "rustc": rust_std["rustc"],
         "cargo_lock_sha256": _sha256(cargo_lock),
@@ -1407,6 +1465,8 @@ def _build_payloads(
     for relative, data in sorted(payload.items()):
         checksum_lines.append(f"{_sha256(data)}  {relative}")
     payload["SHA256SUMS"] = ("\n".join(checksum_lines) + "\n").encode("utf-8")
+    if sum(map(len, payload.values())) > package_ai_assets.MAX_PAYLOAD:
+        raise PackagingError("包内 payload 超过 256 MiB，拒绝扩大安装器边界")
     return payload, top_level
 
 
@@ -1453,6 +1513,7 @@ def build_package(
     output_dir: Path | None = None,
     host_platform: str | None = None,
     runner: Runner | None = None,
+    ai_assets: Path | None = None,
 ) -> PackageResult:
     """执行真实校验并构建分发包。
 
@@ -1477,6 +1538,14 @@ def build_package(
             "请在有 MSVC x64 工具链的 Windows 10/11 上运行。"
         )
     invoke = _subprocess_runner if runner is None else runner
+    if ai_assets is None:
+        raise PackagingError("必须显式提供 --ai-assets AI 资产目录；不再构建普通包")
+    ai_bundle = None
+    if ai_assets is not None:
+        try:
+            ai_bundle = package_ai_assets.load_bundle(Path(ai_assets), repo)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise PackagingError(f"AI 资产校验失败：{error}") from error
 
     metadata_stdout = _checked_output(
         invoke,
@@ -1553,6 +1622,7 @@ def build_package(
         dependency_notices,
         rust_payload,
         rust_std,
+        ai_bundle,
     )
 
     if _exists_even_dangling(output):
@@ -1630,6 +1700,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser._optionals.title = "选项"
     parser.add_argument(
+        "--ai-assets", type=Path, metavar="目录", required=True,
+        help="显式指定固定九文件 AI 资产目录，构建完整离线分发包",
+    )
+    parser.add_argument(
         "-h",
         "--help",
         action="help",
@@ -1648,7 +1722,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        result = build_package(output_dir=args.output_dir)
+        result = build_package(output_dir=args.output_dir, ai_assets=args.ai_assets)
     except PackagingError as error:
         print(f"错误：{error}", file=sys.stderr)
         return 1

@@ -21,7 +21,8 @@ fn test_key_reports_handled_keys_without_an_active_composition() {
     let router = router();
 
     assert_eq!(router.test_key(KeyEvent::plain(Key::Char('n'))), Ok(true));
-    assert_eq!(router.test_key(KeyEvent::plain(Key::Char('!'))), Ok(false));
+    assert_eq!(router.test_key(KeyEvent::plain(Key::Char('!'))), Ok(true));
+    assert_eq!(router.test_key(KeyEvent::plain(Key::Char('@'))), Ok(false));
 
     for key in [
         Key::Backspace,

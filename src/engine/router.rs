@@ -47,6 +47,18 @@ impl EngineRouter {
         self.session.commit_raw()
     }
 
+    pub fn ai_input(&self) -> Option<crate::ai::AiInput> {
+        self.session.ai_input()
+    }
+
+    pub fn apply_ai_candidate(
+        &mut self,
+        expected: &crate::ai::AiInput,
+        corrected: &str,
+    ) -> Option<CompositionUpdate> {
+        self.session.apply_ai_candidate(expected, corrected)
+    }
+
     /// Selects and commits a zero-based candidate from the current page.
     pub fn select_candidate(&mut self, index: usize) -> Result<CompositionUpdate, EngineError> {
         self.session.select_candidate(index)

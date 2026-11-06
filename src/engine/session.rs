@@ -35,6 +35,8 @@ pub struct PinyinSession {
     candidates: Vec<Candidate>,
     page: usize,
     highlighted: Option<usize>,
+    double_quote_open: bool,
+    single_quote_open: bool,
 }
 
 /// Stable name for hosts that associate one session with one input context.
@@ -82,6 +84,8 @@ impl PinyinSession {
             candidates: Vec::new(),
             page: 0,
             highlighted: None,
+            double_quote_open: true,
+            single_quote_open: true,
         })
     }
 
@@ -95,7 +99,31 @@ impl PinyinSession {
             return Ok(self.snapshot(false));
         }
 
-        match event.key {
+        // Platform-neutral callers can also supply Shift plus a digit directly.
+        let key = match event.key {
+            Key::Char(c) if event.modifiers.shift && c.is_ascii_digit() => {
+                Key::Char(b")!@#$%^&*("[(c as u8 - b'0') as usize] as char)
+            }
+            key => key,
+        };
+        if let Key::Char(character) = key {
+            if let Some(punctuation) = self.chinese_punctuation(character) {
+                let mut update = if self.is_composing() {
+                    self.commit_current()?
+                } else {
+                    self.pending_learning.clear();
+                    self.pending_promotions.clear();
+                    self.snapshot(true)
+                };
+                update
+                    .commit
+                    .get_or_insert_with(String::new)
+                    .push_str(punctuation);
+                return Ok(update);
+            }
+        }
+
+        match key {
             Key::Char(character) if character.is_ascii_alphabetic() => {
                 if self.raw.len() + self.confirmed.iter().map(|s| s.raw.len()).sum::<usize>() >= 128
                 {
@@ -210,6 +238,38 @@ impl PinyinSession {
         }
     }
 
+    fn chinese_punctuation(&mut self, character: char) -> Option<&'static str> {
+        Some(match character {
+            ',' => "，",
+            '.' => "。",
+            '?' => "？",
+            '!' => "！",
+            ';' => "；",
+            ':' => "：",
+            '(' => "（",
+            ')' => "）",
+            '[' => "【",
+            ']' => "】",
+            '<' => "《",
+            '>' => "》",
+            '/' | '\\' => "、",
+            '~' => "～",
+            '^' => "……",
+            '_' => "——",
+            '"' => {
+                let text = if self.double_quote_open { "“" } else { "”" };
+                self.double_quote_open = !self.double_quote_open;
+                text
+            }
+            '\'' if !self.is_composing() => {
+                let text = if self.single_quote_open { "‘" } else { "’" };
+                self.single_quote_open = !self.single_quote_open;
+                text
+            }
+            _ => return None,
+        })
+    }
+
     /// Selects and commits a zero-based candidate from the current page.
     pub fn select_candidate(&mut self, index: usize) -> Result<CompositionUpdate, EngineError> {
         if !self.is_composing() {
@@ -232,13 +292,20 @@ impl PinyinSession {
                 candidate_count,
             })?;
 
+        if choice.candidate.is_ai() {
+            let corrected = choice.candidate.text;
+            self.clear_composition();
+            let mut update = self.snapshot(true);
+            update.commit = Some(corrected);
+            return Ok(update);
+        }
         let promotion = (choice.consumed == self.raw.len()).then(|| PromotionEvent {
             order: RankingOrder {
                 input: self.raw.clone(),
                 candidates: self
                     .choices
                     .iter()
-                    .filter(|c| c.consumed == self.raw.len())
+                    .filter(|c| c.consumed == self.raw.len() && !c.candidate.is_ai())
                     .map(Self::ranking_candidate)
                     .collect(),
             },
@@ -397,6 +464,54 @@ impl PinyinSession {
         update
     }
 
+    /// Source for a suggestion, not permission to cross the host privacy boundary.
+    pub fn ai_input(&self) -> Option<crate::ai::AiInput> {
+        if !self.is_composing()
+            || self.page != 0
+            || self.highlighted != Some(0)
+            || self.choices.iter().any(|c| c.candidate.is_ai())
+        {
+            return None;
+        }
+        let choice = self.choices.iter().find(|c| c.consumed == self.raw.len())?;
+        let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
+        let source = prefix + &choice.candidate.text;
+        if !crate::ai::eligible_text(&source) {
+            return None;
+        }
+        let raw: String = self.confirmed.iter().map(|s| s.raw.as_str()).collect();
+        Some(crate::ai::AiInput {
+            raw: raw + &self.raw,
+            source,
+        })
+    }
+
+    pub fn apply_ai_candidate(
+        &mut self,
+        expected: &crate::ai::AiInput,
+        corrected: &str,
+    ) -> Option<CompositionUpdate> {
+        if self.ai_input().as_ref() != Some(expected)
+            || !crate::ai::valid_correction(&expected.source, corrected)
+        {
+            return None;
+        }
+        let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
+        self.choices.retain(|c| {
+            c.consumed != self.raw.len() || format!("{}{}", prefix, c.candidate.text) != corrected
+        });
+        let mut choice = Choice::word(
+            Candidate::new(corrected, crate::ai::AI_COMMENT),
+            self.raw.len(),
+            1,
+        );
+        choice.events.clear();
+        self.choices.insert(1, choice);
+        self.candidates = self.choices.iter().map(|c| c.candidate.clone()).collect();
+        self.rebuild_pages();
+        Some(self.snapshot(true))
+    }
+
     fn commit_literal(&mut self) -> Result<CompositionUpdate, EngineError> {
         let text = self
             .confirmed
@@ -482,7 +597,7 @@ impl PinyinSession {
             let mut end = start;
             let mut used = 0u32;
             while end < self.candidates.len() && end - start < limit {
-                let width = candidate_cell_width(&self.candidates[end].text, end - start);
+                let width = candidate_cell_width(&self.candidates[end].display_text(), end - start);
                 if let Some(budget) = self.candidate_width {
                     if end > start && used.saturating_add(width) > budget {
                         break;

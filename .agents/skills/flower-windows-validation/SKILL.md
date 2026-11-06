@@ -57,11 +57,25 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 0.4.4 紧凑候选和 Shift 手势
 
-- 当前契约 `design/compact-candidates-and-shift.md`：移除整个页脚及幽灵点击区，不移除引擎分页/键盘翻页。候选高亮使用当前选入字体的真实 GDI 字宽，与实际省略文本共用结果；背景紧贴词尾而整 cell 点击不变。纯估算不能代替选字体后的度量，离屏测试不等于实际宿主外观验收。
+- 当前契约 `design/compact-candidates-and-shift.md`：移除整个页脚及幽灵点击区，不移除引擎分页/键盘翻页。候选高亮使用当前选入字体的真实 GDI 字宽，与实际省略文本共用结果；0.4.5 在词尾加6逻辑像素留白、4逻辑像素圆角，DPI缩放并夹在本 cell 内，整 cell 点击不变。0.4.10改用8×8子采样圆角覆盖率与当次背景色预混合、32位顶向下DIB单次绘制，保持半径/留白/点击；COLORREF的BBGGRR须转换为DIB的RRGGBB，限制缓冲分配并处理绘制失败。离屏像素应检查多级混合色、四角对称、明暗/彩色背景通道、极小尺寸、角外留背景、内部填色、相邻项未被涂色，测量失败/零宽不能因padding画出空背景。纯估算不能代替选字体后的度量，离屏测试不等于实际宿主外观验收。
 - 单独 Shift 在真实 down/up 识别；OnTest 纯预测。英文 pending 手势时可预测 TRUE 以接收组合键真实 OnKeyDown，再取消手势并返回 FALSE直通。检查线程键盘快照中的预按普通键/双 Shift/控制键，查询失败拒绝，不只看 Shift 后收到的字母。repeat 不重新建立或刷新手势身份。
 - ThreadMgr 文档焦点与 context push/pop 独立 generation 能防切走再回误切；订阅 sink 不持服务，保留线程/卸载计数，guard解除。generation只在新手势建立时保存，不能被repeat刷新。真实 Push/Pop 后插入repeat再release是必要回归；仅比较当前context会漏掉往返。
 - 原拼音转换恢复 confirmed.raw+remaining raw，不学习；同步编辑成功且token/epoch/context/generation有效才发布英文模式。无效client、写前stale校验、失焦及纯试探需单独证明，不承诺TSF部分写后失败能回滚宿主文档。
 - 安装完成默认启动现在只普通用户 enable 后退出，不再打开设置，取代下方0.4.3启动GUI约定。无参设置入口保持；包核验禁止运行有效启动命令。
+
+## 可选离线AI与分发验证
+
+- 契约见 `design/offline-ai-correction.md`。0.4.7起默认开启（显式关闭配置保留）、停顿后追加 `✓ AI` 建议、显式选择才提交；原候选立即可用，AI不学习、不改已提交正文、不读取周边宿主文本。发出与发布前分别在真实只读cookie内用 `GetAppProperty` 检查安全scope，未知/敏感拒绝，不能用模型probe替代这些门禁。0.4.10的AI明确文本集合为0/50/52/53/54/55/57/58/68，学习仍仅0/57/58；拒绝原因固定S01–S11。Chromium形态须用真实ITextStoreACP属性host补验，owner测试不能代替ACP桥接；官方示例使用GetAppProperty，不以GetProperty或VT_EMPTY兜底。GetInputScopes即使失败/超限也释放已返回的COM分配指针，失败/超限不构造slice。
+- 把推理纯逻辑、固定真实模型、生产IPC、安全TSF接线和真实桌面分开记录。显式ignored真模型单例必须实际命中；假transport只证明接线。冷加载、热推理、IPC整体与250ms去抖分别计时，测峰值工作集，不只报模型磁盘体积。0.4.8将生产IPC与TSF共同有界等待改为5秒以容纳冷加载，不能只延长测试探针或只改传输层；超时/晚到仍须完整拒绝旧票据，待只读cookie也需有界并释放源状态。
+- 候选窗固定AI状态行用于区分关闭、组件不可用、输入未达条件、范围受限、检查中、无建议、已建议和超时/编辑会话失败；不含输入、不持久化、不参与候选编号/点击/提交。先读真实状态而不是把无对号都归因模型；浏览器/Electron安全范围未知仍拒绝，不为正例将空VARIANT当默认scope。设置标题版本不证明宿主已换DLL；状态行缺失需核实实际加载版本，不能自动改注册或强杀用户进程。
+- 用真实WM_TIMER消息泵驱动隔离TSF异步读会话，分别证明私密范围0请求、None响应状态、超过旧1秒但在新预算内可发布；手动调用idle不能代替timer投递证据。真实AiClient+管道人工1.2秒响应可验证期限与取消join，但不冒充真实模型或浏览器验收。
+- 固定模型及ORT必须对照源码内嵌可信manifest，不接受用户bundle自签清单；核对九文件完整大小/摘要、词表特殊ID和许可来源。原生DLL显式绝对路径加载与限制依赖搜索不替代生产安装目录及祖先ACL保护。TSF DLL不引用ORT推理模块；额外运行库仅在AI私有白名单中。
+- 源快照、request id、期限、epoch、revision、焦点/context generation都要覆盖；无回包也必须主动失效并清理源文本。真实TSF `SetFocus(None)` 成功不保证平台查询立即无top context，fixture要断言实际状态；保留原动作和预期，不以降低断言掩盖环境差异。后台shutdown需取消完成并join后才释放DLL计数。
+- 模型质量用预先固定的正确句和错句分组，保存raw输出与过滤结果，分别报误改、漏报和金标命中；不要为演示降低阈值或把小样本当泛化准确率。转换仓库无独立许可、训练数据未审计等限制必须随最终包的共同README携带，源码旁说明不足以证明随包告知。
+- 0.4.7起只构建内置AI的标准文件名，CLI和实际构建API都必须显式提供资产，不能回退base；内部variant=ai、AI可用记录、九文件固定摘要和安装器source ZIP关联仍须完整验证。旧0.4.6两变体的只读兼容不等于允许新构建生成普通包，历史制品不可覆盖。新依赖许可证若不识别，按实际完整正文增加窄识别与失败用例，不能凭SPDX/文件名绕过；ISC须包括授权、通知保留、无担保及责任排除，原始字节仍随包。
+- AI正向验收须从真实内置词库的 `ai_input()` 源文本经固定模型，明确assert非None金标、注入、选择及不学习；允许所有输入None的探针不证明纠错可见。模型纠正文已有普通候选时应按契约复用并标记来源，不能去重后静默丢弃；遍历全部页检查无重复，标记仅在显示路径。普通词条fixture和单独模型probe不能替代这项信号。
+- 中文标点需证明无预编辑时的真实TSF插入，而不仅是引擎产生commit。无composition不可访问composition范围；用当前写cookie的InsertTextAtSelection及强类型flags直接插入并移光标。覆盖组词确认再追加、尾部raw保留、引号OnTest预测不改变方向、快捷键/英文直通和原翻页键；不注入全局键或读取用户文档。
+- 集成探针从已核验AI包启动自有broker，仅经命名管道发送固定测试句，finally停止并wait自己持有的child，不能杀用户进程。该显式probe可在自有验证目录运行，但不证明生产受保护目录门禁或真实宿主体验。两变体只读检查通过仍不等于签名发行、真实安装/卸载或桌面端到端通过。
 
 ## 0.4.3 固定安装、启动与真实学习链路（启动GUI为历史）
 
@@ -91,6 +105,15 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 观察唯一临时文件，并以拒绝 WRITE sharing 的只读打开确认生产写句柄已关闭；结合生产路径 `write_all -> sync_all -> close -> publish` 确定检查点，不用固定 sleep 宣称已进入写入阶段。
 - 用测试程序自身的精确 helper 启动子进程，只终止该测试拥有的 child 并 wait/reap；断言失败也须通过 guard 停止并回收子进程。读取 staged JSON 检查新 generation，再强制结束，验证旧目标逐字节不变、可重新加载与管理写入、orphan 不被误恢复。清理仅限本次测试目录。
 - `tests/user_dictionary_process.rs` 的 `killed_writer_before_atomic_publish_preserves_old_bytes_and_allows_recovery` 是定向入口。此类证据只覆盖同步完成但尚未发布时的进程结束，不证明写入中途、真实磁盘满、系统崩溃或掉电耐久性；不要为扩大表述而自动执行危险注入。
+
+## 运行期路径与原生设置视觉
+
+- 注册canonical路径与GetModuleFileNameW可能保留 `\\?\C:\...`。AI初始化不能把它直接交给仅接受普通盘符的安装CLI语法检查；仅在运行期入口精确适配verbatim本地磁盘形式，再跑原祖先/整树/owner/DACL/reparse/hardlink检查。不要扩大CLI路径接受范围、盲目剥所有前缀或canonicalize后掩盖链接。纯规范化测试和可写fixture仍被拒绝的实际门禁测试分别记录，不把字符串转换当安全证明。
+- AI初始化失败应保留固定阶段原因：模块路径、路径形式、目录安全、缺helper/资产、client或timer；不要持久记录输入或本机路径，也不要把helper存在称模型运行就绪。
+- Win32设置可用原生卡片/多级字体/owner-draw主次按钮改善视觉，但不引入无真实行为的导航。DictionaryStore和SettingsStore须注入，预览及动作只用自有fixture，窗口截图来自自己HWND而非桌面；字典错误不重建覆盖。UI美化需保留立即保存/表单保存/清空确认的区别。
+- BS_OWNERDRAW不能与BS_DEFPUSHBUTTON互斥位硬或。生产键盘循环若先IsDialogMessageW，Enter可能抢先发IDOK，把聚焦关闭/危险动作变成保存；必须验证实际路由优先级、展开下拉Enter/Esc、Tab/ShiftTab/Space，不以静态布局或没有消息循环的截图fixture证明键盘正确。
+- visualstyles/PerMonitorV2/asInvoker的应用manifest仅附到flower-settings.exe，不附TSF DLL或改变宿主DPI；按需在GUI启动前InitCommonControlsEx。资源只读映射验证settings包含而其他PE没有这些声明，图标仍单独核验。测试进程截图不等于最终EXE的v6主题或实际多屏验收。
+- 快捷方式显示名变更不等于改EXE文件名、参数或权限。启动/停用仍普通用户enable/disable；只改新安装器声明，不自动删除真实用户旧快捷方式或更改注册。
 
 ## 交接
 

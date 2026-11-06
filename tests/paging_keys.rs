@@ -56,7 +56,10 @@ fn windows_punctuation_and_numpad_preserve_modifiers() {
             Some(KeyEvent::new(key, modifiers))
         );
     }
-    assert_eq!(map_windows_virtual_key(0xBD, Modifiers::SHIFT), None);
+    assert_eq!(
+        map_windows_virtual_key(0xBD, Modifiers::SHIFT),
+        Some(KeyEvent::new(Key::Char('_'), Modifiers::SHIFT))
+    );
     let ctrl_plus = map_windows_virtual_key(0xBB, Modifiers::CONTROL).unwrap();
     assert!(ctrl_plus.is_passthrough());
 }

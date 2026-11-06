@@ -28,7 +28,11 @@ mod windows_exports {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
 
+    use crate::ai::{AiInput, Request, Response};
+
+    use crate::ai::{AiStatus, ScopeBlockReason};
     use crate::engine::{
         map_windows_virtual_key, CompositionUpdate, EngineRouter, KeyEvent, Modifiers,
     };
@@ -58,7 +62,7 @@ mod windows_exports {
         ITfContextComposition, ITfContextView, ITfEditSession, ITfEditSession_Impl,
         ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfRange,
         ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, TF_AE_NONE, TF_ANCHOR_END,
-        TF_ES_ASYNC, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
+        TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_IAS_QUERYONLY, TF_SELECTION,
         TF_SELECTIONSTYLE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -335,9 +339,553 @@ mod windows_exports {
         learning: Option<LearningWorker>,
         _learning_registration: Option<ObjectRegistration>,
         local_data_error: bool,
+        ai: Option<AiScheduler>,
+        ai_unavailable: AiStatus,
     }
 
     type SharedActivation = Rc<RefCell<Option<Activation>>>;
+
+    trait AiTransport {
+        fn submit(&self, request: Request) -> bool;
+        fn try_result(&self) -> Option<Response>;
+        fn shutdown(&mut self);
+    }
+
+    impl AiTransport for crate::ai::ipc::AiClient {
+        fn submit(&self, request: Request) -> bool {
+            self.submit(request)
+        }
+        fn try_result(&self) -> Option<Response> {
+            self.try_result()
+        }
+        fn shutdown(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    struct AiScheduler {
+        transport: Box<dyn AiTransport>,
+        // Drop calls shutdown/join before this independent DLL count is released.
+        _registration: ObjectRegistration,
+        last_input: Instant,
+        next_id: u64,
+        attempted: bool,
+        pending: Option<AiPending>,
+        status: AiStatus,
+    }
+
+    impl Drop for AiScheduler {
+        fn drop(&mut self) {
+            self.transport.shutdown();
+        }
+    }
+
+    impl AiScheduler {
+        fn new(transport: Box<dyn AiTransport>) -> Self {
+            Self {
+                transport,
+                _registration: ObjectRegistration::new(),
+                last_input: Instant::now(),
+                next_id: 0,
+                attempted: true,
+                pending: None,
+                status: AiStatus::Waiting,
+            }
+        }
+
+        fn input(&mut self) {
+            self.last_input = Instant::now();
+            self.pending = None;
+            self.attempted = false;
+            self.status = AiStatus::Waiting;
+        }
+
+        fn invalidate(&mut self) {
+            self.pending = None;
+            self.attempted = true;
+            self.status = AiStatus::Waiting;
+        }
+    }
+
+    fn ai_status(active: &Activation) -> AiStatus {
+        if !active.settings.ai_correction_enabled {
+            AiStatus::Disabled
+        } else {
+            active
+                .ai
+                .as_ref()
+                .map_or(active.ai_unavailable, |ai| ai.status)
+        }
+    }
+
+    fn refresh_ai_status(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
+        let status = shared
+            .try_borrow()
+            .ok()
+            .and_then(|state| state.as_ref().filter(|a| a.token == token).map(ai_status));
+        if let Some(status) = status {
+            if let Some(mut popup) = take_thread_popup(token, owner) {
+                let _ = popup.window.set_ai_status(status);
+                return_thread_popup(token, owner, popup);
+            }
+        }
+    }
+
+    fn set_ai_status(shared: &SharedActivation, ticket: &AiTicket, status: AiStatus) {
+        if let Ok(mut state) = shared.try_borrow_mut() {
+            if let Some(ai) = state
+                .as_mut()
+                .filter(|a| a.token == ticket.token)
+                .and_then(|a| a.ai.as_mut())
+            {
+                if ai
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.ticket.id == ticket.id)
+                {
+                    ai.status = status;
+                }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct AiTicket {
+        id: u64,
+        token: ActivationToken,
+        owner: ThreadId,
+        epoch: u64,
+        generation: u64,
+        key: ContextKey,
+        revision: u64,
+    }
+
+    struct AiPending {
+        ticket: AiTicket,
+        queued: Instant,
+        dispatched: Option<Instant>,
+        input: Option<AiInput>,
+        reading: bool,
+    }
+
+    /// Resolve our DLL by an address in this module, never the host executable.
+    fn protected_ai_helper() -> std::result::Result<std::path::PathBuf, AiStatus> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::System::LibraryLoader::{
+            GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+        let mut module = HMODULE::default();
+        let mut path = vec![0u16; 32768];
+        // SAFETY: The address belongs to this loaded DLL; no refcount change.
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                PCWSTR(protected_ai_helper as *const () as *const u16),
+                &mut module,
+            )
+            .map_err(|_| AiStatus::ModulePathFailed)?;
+            let len = GetModuleFileNameW(module, &mut path) as usize;
+            if len == 0 || len >= path.len() {
+                return Err(AiStatus::ModulePathFailed);
+            }
+            path.truncate(len);
+        }
+        let dll = std::path::PathBuf::from(std::ffi::OsString::from_wide(&path));
+        ai_helper_at_module_path(&dll)
+    }
+
+    fn ai_helper_at_module_path(
+        dll: &std::path::Path,
+    ) -> std::result::Result<std::path::PathBuf, AiStatus> {
+        let parent = dll.parent().ok_or(AiStatus::UnsupportedPath)?;
+        let directory = crate::platform::install_path::normalize_runtime_directory(parent)
+            .map_err(|_| AiStatus::UnsupportedPath)?;
+        crate::platform::install_path::check_install_path(&directory)
+            .map_err(|_| AiStatus::UnsafeDirectory)?;
+        let helper = directory.join("flower-settings.exe");
+        if !helper.is_file() {
+            return Err(AiStatus::MissingHelper);
+        }
+        if !directory.join("ai").is_dir() {
+            return Err(AiStatus::MissingAssets);
+        }
+        Ok(helper)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn native_ai_canonical_module_path_does_not_bypass_acl() {
+        let module = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let normal =
+            crate::platform::install_path::normalize_runtime_directory(module.parent().unwrap())
+                .unwrap();
+        assert_eq!(
+            ai_helper_at_module_path(&module),
+            ai_helper_at_module_path(&normal.join(module.file_name().unwrap())),
+            "verbatim and ordinary spellings must reach the same security gate"
+        );
+        assert_eq!(
+            ai_helper_at_module_path(&module),
+            Err(AiStatus::UnsafeDirectory),
+            "the user-writable test payload is not a protected installation"
+        );
+    }
+
+    fn ai_ticket_valid(active: &Activation, ticket: &AiTicket) -> bool {
+        active.token == ticket.token
+            && active.owner_thread == ticket.owner
+            && std::thread::current().id() == ticket.owner
+            && active.foreground
+            && !active.processing
+            && !active.english
+            && active.focus_epoch == ticket.epoch
+            && active.context_generation.get() == ticket.generation
+            && active.shown_context == Some(ticket.key)
+            && active.contexts.get(&ticket.key).is_some_and(|entry| {
+                entry.controller.is_active()
+                    && entry.composition.is_some()
+                    && !entry.composition_terminated()
+                    && entry.popup_model.snapshot().is_some_and(|snapshot| {
+                        snapshot.revision == ticket.revision
+                            && snapshot.page == 0
+                            && snapshot.highlighted == Some(0)
+                    })
+            })
+            && active.ai.as_ref().is_some_and(|ai| {
+                ai.pending
+                    .as_ref()
+                    .is_some_and(|p| p.ticket.id == ticket.id)
+            })
+    }
+
+    fn clear_ai_pending(shared: &SharedActivation, ticket: &AiTicket) {
+        if let Ok(mut state) = shared.try_borrow_mut() {
+            if let Some(ai) = state
+                .as_mut()
+                .filter(|a| a.token == ticket.token)
+                .and_then(|a| a.ai.as_mut())
+            {
+                if ai
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.ticket.id == ticket.id)
+                {
+                    ai.pending = None;
+                    if ai.status == AiStatus::Checking {
+                        ai.status = AiStatus::Waiting;
+                    }
+                }
+            }
+        }
+    }
+
+    #[implement(ITfEditSession)]
+    struct AiReadSession {
+        activation: std::rc::Weak<RefCell<Option<Activation>>>,
+        ticket: AiTicket,
+        context: ITfContext,
+        manager: ITfThreadMgr,
+        // None is the send gate; Some is the result publication gate.
+        response: Option<Response>,
+        _registration: ObjectRegistration,
+    }
+
+    impl ITfEditSession_Impl for AiReadSession_Impl {
+        fn DoEditSession(&self, cookie: u32) -> Result<()> {
+            let this = self.get_impl();
+            if std::thread::current().id() != this.ticket.owner {
+                return Err(E_UNEXPECTED.into());
+            }
+            let Some(shared) = this.activation.upgrade() else {
+                return Ok(());
+            };
+            let valid = focused_context_key(&this.manager) == Some(this.ticket.key)
+                && shared.try_borrow().ok().is_some_and(|state| {
+                    state
+                        .as_ref()
+                        .is_some_and(|a| ai_ticket_valid(a, &this.ticket))
+                });
+            // No source text is constructed before the read-cookie privacy gate.
+            if !valid {
+                clear_ai_pending(&shared, &this.ticket);
+                return Ok(());
+            }
+            if let Err(reason) = check_scope(&this.context, cookie, ScopePolicy::Ai) {
+                set_ai_status(&shared, &this.ticket, AiStatus::ScopeBlocked(reason));
+                clear_ai_pending(&shared, &this.ticket);
+                refresh_ai_status(&shared, this.ticket.token, this.ticket.owner);
+                return Ok(());
+            }
+            if this.response.is_none() {
+                let Ok(mut state) = shared.try_borrow_mut() else {
+                    clear_ai_pending(&shared, &this.ticket);
+                    return Ok(());
+                };
+                let Some(active) = state.as_mut().filter(|a| ai_ticket_valid(a, &this.ticket))
+                else {
+                    return Ok(());
+                };
+                let ai = active.ai.as_mut().unwrap();
+                if ai.pending.as_ref().is_some_and(|pending| {
+                    pending.queued.elapsed() > Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS)
+                }) {
+                    ai.pending = None;
+                    ai.status = AiStatus::EditFailed;
+                    return Ok(());
+                }
+                let input = active
+                    .contexts
+                    .get(&this.ticket.key)
+                    .and_then(|e| e.router.ai_input());
+                let ai = active.ai.as_mut().unwrap();
+                let Some(input) = input else {
+                    ai.pending = None;
+                    ai.status = AiStatus::Ineligible;
+                    return Ok(());
+                };
+                if ai.transport.submit(Request {
+                    id: this.ticket.id,
+                    text: input.source.clone(),
+                }) {
+                    if let Some(pending) = ai.pending.as_mut() {
+                        pending.dispatched = Some(Instant::now());
+                        pending.input = Some(input);
+                        pending.reading = false;
+                        ai.status = AiStatus::Checking;
+                    }
+                } else {
+                    ai.pending = None;
+                    ai.status = AiStatus::Failed;
+                }
+                return Ok(());
+            }
+            let response = this.response.as_ref().unwrap();
+            let composition = {
+                let Ok(state) = shared.try_borrow() else {
+                    return Ok(());
+                };
+                state
+                    .as_ref()
+                    .and_then(|a| a.contexts.get(&this.ticket.key))
+                    .and_then(|e| e.composition.clone())
+            };
+            let caret = composition
+                .as_ref()
+                .and_then(|c| composition_caret(&this.context, c, cookie));
+            let snapshot = {
+                let Ok(mut state) = shared.try_borrow_mut() else {
+                    return Ok(());
+                };
+                let Some(active) = state.as_mut().filter(|a| ai_ticket_valid(a, &this.ticket))
+                else {
+                    drop(state);
+                    clear_ai_pending(&shared, &this.ticket);
+                    return Ok(());
+                };
+                let pending = active.ai.as_mut().unwrap().pending.take().unwrap();
+                active.ai.as_mut().unwrap().status = AiStatus::Waiting;
+                if response.id != pending.ticket.id
+                    || !pending.dispatched.is_some_and(|at| {
+                        at.elapsed() <= Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS)
+                    })
+                {
+                    active.ai.as_mut().unwrap().status = AiStatus::Failed;
+                    return Ok(());
+                }
+                let entry = active.contexts.get_mut(&this.ticket.key).unwrap();
+                let Some(input) = pending.input else {
+                    return Ok(());
+                };
+                if entry.router.ai_input().as_ref() != Some(&input) {
+                    return Ok(());
+                }
+                let Some(corrected) = response.corrected.as_ref() else {
+                    active.ai.as_mut().unwrap().status = AiStatus::NoSuggestion;
+                    return Ok(());
+                };
+                let Some(update) = entry.router.apply_ai_candidate(&input, corrected) else {
+                    return Ok(());
+                };
+                // AI never passes through CompositionController or a write cookie.
+                entry.popup_model.apply_update(&update);
+                let snapshot = entry.popup_model.snapshot().cloned();
+                active.ai.as_mut().unwrap().status = AiStatus::Suggested;
+                snapshot
+            };
+            if let Some(snapshot) = snapshot {
+                if let Some(mut popup) = take_thread_popup(this.ticket.token, this.ticket.owner) {
+                    popup.window.cancel_pending_actions();
+                    if popup.window.update(&snapshot).is_ok() {
+                        if let Some(caret) = caret {
+                            let _ = popup.window.show_at(PopupRect::new(
+                                caret.left,
+                                caret.top,
+                                caret.right,
+                                caret.bottom,
+                            ));
+                        }
+                    }
+                    return_thread_popup(this.ticket.token, this.ticket.owner, popup);
+                }
+            }
+            refresh_ai_status(&shared, this.ticket.token, this.ticket.owner);
+            Ok(())
+        }
+    }
+
+    /// Timer callback only queues read sessions. It never writes host text.
+    fn ai_idle(shared: &SharedActivation, token: ActivationToken, owner: ThreadId) {
+        if std::thread::current().id() != owner {
+            return;
+        }
+        let manager = {
+            let Ok(state) = shared.try_borrow() else {
+                return;
+            };
+            let Some(active) = state.as_ref().filter(|a| a.token == token) else {
+                return;
+            };
+            active.thread_manager.clone()
+        };
+        // Query COM outside the activation borrow, including when no result is
+        // ready. A missing top context must release the retained source now.
+        let focused = focused_context_key(&manager);
+        let work = (|| {
+            let mut state = shared.try_borrow_mut().ok()?;
+            let active = state.as_mut().filter(|a| a.token == token)?;
+            if focused.is_none() || focused != active.shown_context {
+                active.ai.as_mut()?.invalidate();
+                return None;
+            }
+            if active.processing {
+                return None;
+            }
+            let invalid = active
+                .ai
+                .as_ref()
+                .and_then(|ai| ai.pending.as_ref())
+                .is_some_and(|pending| !ai_ticket_valid(active, &pending.ticket));
+            if invalid {
+                active.ai.as_mut()?.invalidate();
+                return None;
+            }
+            let ai = active.ai.as_mut()?;
+            if let Some(pending) = ai.pending.as_ref() {
+                if pending.dispatched.is_none()
+                    && pending.queued.elapsed()
+                        > Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS)
+                {
+                    ai.pending = None;
+                    ai.status = AiStatus::EditFailed;
+                    return None;
+                }
+                if pending.dispatched.is_some_and(|at| {
+                    at.elapsed() > Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS)
+                }) {
+                    ai.pending = None;
+                    ai.status = AiStatus::Failed;
+                    return None;
+                }
+                if pending.reading {
+                    return None;
+                }
+                let response = ai.transport.try_result()?;
+                let pending = ai.pending.as_mut()?;
+                if response.id != pending.ticket.id {
+                    ai.pending = None;
+                    ai.status = AiStatus::Failed;
+                    return None;
+                }
+                pending.reading = true;
+                let ticket = pending.ticket.clone();
+                let context = active.contexts.get(&ticket.key)?.context.clone();
+                return Some((
+                    ticket,
+                    context,
+                    active.thread_manager.clone(),
+                    active.client_id,
+                    Some(response),
+                ));
+            }
+            // Drain late/duplicate responses before accepting a new request.
+            let _ = ai.transport.try_result();
+            if ai.attempted
+                || ai.last_input.elapsed() < Duration::from_millis(crate::ai::DEBOUNCE_MS)
+                || !active.foreground
+                || active.english
+            {
+                return None;
+            }
+            let key = active.shown_context?;
+            let entry = active.contexts.get(&key)?;
+            if !entry.controller.is_active()
+                || entry.composition.is_none()
+                || entry.composition_terminated()
+            {
+                return None;
+            }
+            let snapshot = entry.popup_model.snapshot()?;
+            if snapshot.page != 0 || snapshot.highlighted != Some(0) {
+                return None;
+            }
+            let revision = snapshot.revision;
+            ai.next_id = ai.next_id.checked_add(1)?;
+            ai.attempted = true;
+            ai.status = AiStatus::Checking;
+            let ticket = AiTicket {
+                id: ai.next_id,
+                token,
+                owner,
+                epoch: active.focus_epoch,
+                generation: active.context_generation.get(),
+                key,
+                revision,
+            };
+            ai.pending = Some(AiPending {
+                ticket: ticket.clone(),
+                queued: Instant::now(),
+                dispatched: None,
+                input: None,
+                reading: true,
+            });
+            Some((
+                ticket,
+                entry.context.clone(),
+                active.thread_manager.clone(),
+                active.client_id,
+                None,
+            ))
+        })();
+        refresh_ai_status(shared, token, owner);
+        let Some((ticket, context, manager, client, response)) = work else {
+            return;
+        };
+        if focused_context_key(&manager) != Some(ticket.key) {
+            clear_ai_pending(shared, &ticket);
+            return;
+        }
+        let session: ITfEditSession = AiReadSession {
+            activation: Rc::downgrade(shared),
+            ticket: ticket.clone(),
+            context: context.clone(),
+            manager,
+            response,
+            _registration: ObjectRegistration::new(),
+        }
+        .into();
+        // SAFETY: TSF owns the read cookie and schedules this on the owning STA.
+        let status =
+            unsafe { context.RequestEditSession(client, &session, TF_ES_ASYNC | TF_ES_READ) };
+        if !matches!(status, Ok(hr) if hr.is_ok()) {
+            set_ai_status(shared, &ticket, AiStatus::EditFailed);
+            clear_ai_pending(shared, &ticket);
+            refresh_ai_status(shared, token, owner);
+        }
+    }
 
     /// Tracks only a standalone physical Shift gesture; test callbacks never mutate it.
     #[derive(Default)]
@@ -734,8 +1282,21 @@ mod windows_exports {
         }
 
         fn commit(&mut self, text: &str) -> Result<()> {
-            let range = self.text_range()?;
             let text: Vec<u16> = text.encode_utf16().collect();
+            if self.composition.is_none() {
+                let insert: ITfInsertAtSelection = self.context.cast()?;
+                // SAFETY: This is an explicit key commit in the current write
+                // session. No surrounding document text is read.
+                let range = unsafe {
+                    insert.InsertTextAtSelection(
+                        self.edit_cookie,
+                        windows::Win32::UI::TextServices::INSERT_TEXT_AT_SELECTION_FLAGS(0),
+                        &text,
+                    )
+                }?;
+                return self.move_selection_to_end(&range);
+            }
+            let range = self.text_range()?;
             // SAFETY: The range belongs to the active composition, and the
             // UTF-16 buffer remains alive for the duration of the call.
             unsafe { range.SetText(self.edit_cookie, 0, &text) }?;
@@ -763,7 +1324,51 @@ mod windows_exports {
     }
 
     fn learning_scope_value_is_safe(scope: i32) -> bool {
-        matches!(scope, 0 | 57 | 58)
+        use windows::Win32::UI::TextServices::{IS_CHAT, IS_DEFAULT, IS_TEXT};
+        [IS_DEFAULT, IS_TEXT, IS_CHAT].iter().any(|s| s.0 == scope)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScopePolicy {
+        Learning,
+        Ai,
+    }
+
+    fn scope_policy(
+        scopes: &[windows::Win32::UI::TextServices::InputScope],
+        policy: ScopePolicy,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        use windows::Win32::UI::TextServices::*;
+        if scopes.iter().any(|s| {
+            [
+                IS_PASSWORD,
+                IS_PRIVATE,
+                IS_NUMERIC_PASSWORD,
+                IS_NUMERIC_PIN,
+                IS_ALPHANUMERIC_PIN,
+                IS_ALPHANUMERIC_PIN_SET,
+            ]
+            .contains(s)
+        }) {
+            return Err(ScopeBlockReason::Sensitive);
+        }
+        if scopes.iter().all(|s| {
+            learning_scope_value_is_safe(s.0)
+                || matches!(policy, ScopePolicy::Ai)
+                    && [
+                        IS_SEARCH,
+                        IS_SEARCH_INCREMENTAL,
+                        IS_CHINESE_HALFWIDTH,
+                        IS_CHINESE_FULLWIDTH,
+                        IS_NATIVE_SCRIPT,
+                        IS_CHAT_WITHOUT_EMOJI,
+                    ]
+                    .contains(s)
+        }) {
+            Ok(())
+        } else {
+            Err(ScopeBlockReason::Unsupported)
+        }
     }
 
     #[cfg(test)]
@@ -772,12 +1377,32 @@ mod windows_exports {
         for scope in [0, 57, 58] {
             assert!(learning_scope_value_is_safe(scope));
         }
-        for scope in [-1, 31, 61, 999] {
+        for scope in [-1, 31, 61, 63, 64, 65, 66, 50, 52, 53, 54, 55, 68, 999] {
             assert!(!learning_scope_value_is_safe(scope));
         }
+        use windows::Win32::UI::TextServices::InputScope;
+        for scope in [0, 50, 52, 53, 54, 55, 57, 58, 68] {
+            assert_eq!(scope_policy(&[InputScope(scope)], ScopePolicy::Ai), Ok(()));
+        }
+        assert_eq!(
+            scope_policy(&[InputScope(999), InputScope(61)], ScopePolicy::Ai),
+            Err(ScopeBlockReason::Sensitive)
+        );
+        assert_eq!(
+            scope_policy(&[InputScope(0), InputScope(999)], ScopePolicy::Ai),
+            Err(ScopeBlockReason::Unsupported)
+        );
     }
 
     fn scope_allows_learning(context: &ITfContext, cookie: u32) -> bool {
+        check_scope(context, cookie, ScopePolicy::Learning).is_ok()
+    }
+
+    fn check_scope(
+        context: &ITfContext,
+        cookie: u32,
+        policy: ScopePolicy,
+    ) -> std::result::Result<(), ScopeBlockReason> {
         use windows::Win32::UI::TextServices::{ITfInputScope, GUID_PROP_INPUTSCOPE};
         // Read the application's declaration over the actual selection inside
         // this edit session. Missing, unsupported, or mixed unsafe scopes deny
@@ -788,42 +1413,58 @@ mod windows_exports {
             let result = context.GetSelection(cookie, u32::MAX, &mut selection, &mut fetched);
             let range = std::mem::ManuallyDrop::take(&mut selection[0].range);
             if result.is_err() || fetched != 1 {
-                return false;
+                return Err(ScopeBlockReason::Selection);
             }
             let Some(range) = range else {
-                return false;
+                return Err(ScopeBlockReason::Selection);
             };
             let property = context.GetAppProperty(&GUID_PROP_INPUTSCOPE);
             record_result(Stage::LearningAppProperty, &property);
             let Ok(property) = property else {
-                return false;
+                return Err(ScopeBlockReason::Property);
             };
             let value = property.GetValue(cookie, &range);
             record_result(Stage::LearningScopeValue, &value);
             let Ok(value) = value else {
-                return false;
+                return Err(ScopeBlockReason::Value);
             };
+            // VARIANT's discriminant must be checked before querying its payload.
+            let vt = value.as_raw().Anonymous.Anonymous.vt;
+            if vt == 0 {
+                return Err(ScopeBlockReason::Undeclared);
+            }
+            if vt != 13 {
+                return Err(ScopeBlockReason::InvalidValue);
+            }
             let Ok(unknown) = windows::core::IUnknown::try_from(&value) else {
-                return false;
+                return Err(ScopeBlockReason::InvalidValue);
             };
             let Ok(scope) = unknown.cast::<ITfInputScope>() else {
-                return false;
+                return Err(ScopeBlockReason::Interface);
             };
             let mut scopes = std::ptr::null_mut();
             let mut count = 0;
-            if scope.GetInputScopes(&mut scopes, &mut count).is_err() {
-                return false;
+            let read = scope.GetInputScopes(&mut scopes, &mut count);
+            struct ScopeAllocation(*mut windows::Win32::UI::TextServices::InputScope);
+            impl Drop for ScopeAllocation {
+                fn drop(&mut self) {
+                    if !self.0.is_null() {
+                        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(self.0.cast())) };
+                    }
+                }
             }
-            if scopes.is_null() {
-                return false;
+            let allocation = ScopeAllocation(scopes);
+            read.map_err(|_| ScopeBlockReason::Read)?;
+            if count == 0 {
+                return Err(ScopeBlockReason::Empty);
             }
-            let allowed = count > 0
-                && count <= 256
-                && std::slice::from_raw_parts(scopes, count as usize)
-                    .iter()
-                    .all(|scope| learning_scope_value_is_safe(scope.0));
-            windows::Win32::System::Com::CoTaskMemFree(Some(scopes.cast()));
-            allowed
+            if allocation.0.is_null() || count > 256 {
+                return Err(ScopeBlockReason::InvalidList);
+            }
+            scope_policy(
+                std::slice::from_raw_parts(allocation.0, count as usize),
+                policy,
+            )
         }
     }
 
@@ -1330,6 +1971,9 @@ mod windows_exports {
                     return;
                 };
                 let entry = entry.clone();
+                if let Some(ai) = active.ai.as_mut() {
+                    ai.invalidate();
+                }
                 active.processing = true;
                 let processing = ProcessingGuard {
                     activation: Rc::clone(shared),
@@ -1727,6 +2371,9 @@ mod windows_exports {
                     active.shown_context = None;
                 }
                 if let Some(mut entry) = entry.take() {
+                    if let Some(ai) = active.ai.as_mut() {
+                        ai.input();
+                    }
                     if !entry.router.is_composing() {
                         entry
                             .router
@@ -1956,6 +2603,40 @@ mod windows_exports {
             }
             let token = next_activation_token();
             let owner_thread = std::thread::current().id();
+            let mut ai_unavailable = AiStatus::Unavailable;
+            let mut ai = if settings.ai_correction_enabled {
+                match protected_ai_helper().and_then(|helper| {
+                    crate::ai::ipc::AiClient::start(helper).map_err(|_| AiStatus::ClientFailed)
+                }) {
+                    Ok(client) => Some(AiScheduler::new(Box::new(client))),
+                    Err(reason) => {
+                        ai_unavailable = reason;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if ai.is_some() {
+                let weak = Rc::downgrade(&self.get_impl().activation);
+                let sink: Rc<dyn Fn()> = Rc::new(move || {
+                    if let Some(shared) = weak.upgrade() {
+                        ai_idle(&shared, token, owner_thread);
+                    }
+                });
+                if popup.set_idle_sink(Some(sink)).is_err() {
+                    ai = None;
+                    ai_unavailable = AiStatus::TimerFailed;
+                    let _ = popup.set_idle_sink(None);
+                }
+            }
+            let _ = popup.set_ai_status(if !settings.ai_correction_enabled {
+                AiStatus::Disabled
+            } else if ai.is_some() {
+                AiStatus::Waiting
+            } else {
+                ai_unavailable
+            });
             let action_activation = Rc::clone(&self.get_impl().activation);
             let action_sink: Rc<dyn Fn(CandidatePopupAction)> = Rc::new(move |action| {
                 dispatch_popup_action(&action_activation, token, owner_thread, action);
@@ -2000,6 +2681,8 @@ mod windows_exports {
                             .map(|_| ObjectRegistration::new()),
                         learning,
                         local_data_error,
+                        ai,
+                        ai_unavailable,
                     });
                     true
                 }
@@ -2266,6 +2949,9 @@ mod windows_exports {
                 };
                 activation.as_mut().and_then(|active| {
                     active.focus_epoch = active.focus_epoch.wrapping_add(1);
+                    if let Some(ai) = active.ai.as_mut() {
+                        ai.invalidate();
+                    }
                     active.foreground = foreground.as_bool();
                     active.shift.pressed = None;
                     if foreground.as_bool() {
@@ -2438,6 +3124,9 @@ mod windows_exports {
                 else {
                     return Ok(FALSE);
                 };
+                if let Some(ai) = active.ai.as_mut() {
+                    ai.invalidate();
+                }
                 let was_pressed = active.shift.pressed.is_some();
                 active.shift.down(
                     shift,
@@ -2603,6 +3292,487 @@ mod windows_exports {
             GUID_PROP_INPUTSCOPE, TS_STATUS,
         };
 
+        // Isolated ACP owner: never advises ITfContextOwner or changes the desktop.
+        mod acp_scope_bridge {
+            use super::*;
+            use windows::core::{PCWSTR, PWSTR};
+            use windows::Win32::Foundation::E_NOTIMPL;
+            use windows::Win32::System::Com::{IDataObject, FORMATETC};
+            use windows::Win32::UI::TextServices::*;
+
+            #[implement(ITextStoreACP)]
+            struct Store {
+                sink: RefCell<Option<ITextStoreACPSink>>,
+                locked: Cell<bool>,
+                requested: Cell<bool>,
+                value: VARIANT,
+                trace: Rc<RefCell<Vec<&'static str>>>,
+            }
+            impl ITextStoreACP_Impl for Store_Impl {
+                fn AdviseSink(
+                    &self,
+                    _: *const GUID,
+                    sink: Option<&IUnknown>,
+                    _: u32,
+                ) -> Result<()> {
+                    *self.sink.borrow_mut() = Some(sink.ok_or(Error::from(E_POINTER))?.cast()?);
+                    Ok(())
+                }
+                fn UnadviseSink(&self, _: Option<&IUnknown>) -> Result<()> {
+                    self.sink.borrow_mut().take();
+                    Ok(())
+                }
+                fn RequestLock(&self, flags: u32) -> Result<HRESULT> {
+                    self.trace.borrow_mut().push("lock");
+                    if self.locked.replace(true) {
+                        return Ok(TS_E_SYNCHRONOUS);
+                    }
+                    let sink = self
+                        .sink
+                        .borrow()
+                        .clone()
+                        .ok_or(Error::from(E_UNEXPECTED))?;
+                    let result = unsafe { sink.OnLockGranted(TEXT_STORE_LOCK_FLAGS(flags)) };
+                    self.locked.set(false);
+                    Ok(result.err().map_or(S_OK, |e| e.code()))
+                }
+                fn GetStatus(&self) -> Result<TS_STATUS> {
+                    Ok(TS_STATUS::default())
+                }
+                fn QueryInsert(
+                    &self,
+                    start: i32,
+                    end: i32,
+                    _: u32,
+                    a: *mut i32,
+                    b: *mut i32,
+                ) -> Result<()> {
+                    unsafe {
+                        *a = start;
+                        *b = end;
+                    }
+                    Ok(())
+                }
+                fn GetSelection(
+                    &self,
+                    _: u32,
+                    count: u32,
+                    selection: *mut TS_SELECTION_ACP,
+                    fetched: *mut u32,
+                ) -> Result<()> {
+                    self.trace.borrow_mut().push("selection");
+                    if !self.locked.get() {
+                        return Err(TS_E_NOLOCK.into());
+                    }
+                    unsafe {
+                        *fetched = u32::from(count > 0);
+                        if count > 0 {
+                            *selection = TS_SELECTION_ACP {
+                                acpStart: 0,
+                                acpEnd: 0,
+                                style: TS_SELECTIONSTYLE {
+                                    ase: TS_AE_END,
+                                    fInterimChar: FALSE,
+                                },
+                            };
+                        }
+                    }
+                    Ok(())
+                }
+                fn SetSelection(&self, _: u32, _: *const TS_SELECTION_ACP) -> Result<()> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn GetText(
+                    &self,
+                    start: i32,
+                    end: i32,
+                    text: PWSTR,
+                    capacity: u32,
+                    copied: *mut u32,
+                    runs: *mut TS_RUNINFO,
+                    run_capacity: u32,
+                    run_count: *mut u32,
+                    next: *mut i32,
+                ) -> Result<()> {
+                    if !self.locked.get() {
+                        return Err(TS_E_NOLOCK.into());
+                    }
+                    let count = u32::from(start == 0 && end != 0).min(capacity);
+                    unsafe {
+                        if !copied.is_null() {
+                            *copied = count;
+                        }
+                        if count > 0 {
+                            *text.0 = b'x' as u16;
+                        }
+                        if !next.is_null() {
+                            *next = start + count as i32;
+                        }
+                        if !run_count.is_null() {
+                            *run_count = u32::from(run_capacity > 0 && count > 0);
+                        }
+                        if run_capacity > 0 && count > 0 {
+                            *runs = TS_RUNINFO {
+                                uCount: count,
+                                r#type: TS_RT_PLAIN,
+                            };
+                        }
+                    }
+                    Ok(())
+                }
+                fn SetText(
+                    &self,
+                    _: u32,
+                    _: i32,
+                    _: i32,
+                    _: &PCWSTR,
+                    _: u32,
+                ) -> Result<TS_TEXTCHANGE> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn GetFormattedText(&self, _: i32, _: i32) -> Result<IDataObject> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn GetEmbedded(&self, _: i32, _: *const GUID, _: *const GUID) -> Result<IUnknown> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn QueryInsertEmbedded(&self, _: *const GUID, _: *const FORMATETC) -> Result<BOOL> {
+                    Ok(FALSE)
+                }
+                fn InsertEmbedded(
+                    &self,
+                    _: u32,
+                    _: i32,
+                    _: i32,
+                    _: Option<&IDataObject>,
+                ) -> Result<TS_TEXTCHANGE> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn InsertTextAtSelection(
+                    &self,
+                    _: u32,
+                    _: &PCWSTR,
+                    _: u32,
+                    _: *mut i32,
+                    _: *mut i32,
+                    _: *mut TS_TEXTCHANGE,
+                ) -> Result<()> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn InsertEmbeddedAtSelection(
+                    &self,
+                    _: u32,
+                    _: Option<&IDataObject>,
+                    _: *mut i32,
+                    _: *mut i32,
+                    _: *mut TS_TEXTCHANGE,
+                ) -> Result<()> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn RequestSupportedAttrs(
+                    &self,
+                    _: u32,
+                    count: u32,
+                    attrs: *const GUID,
+                ) -> Result<()> {
+                    self.trace.borrow_mut().push("supported");
+                    self.requested.set(false);
+                    if count > 0 && attrs.is_null() {
+                        return Err(E_POINTER.into());
+                    }
+                    for index in 0..count as usize {
+                        if unsafe { *attrs.add(index) } == GUID_PROP_INPUTSCOPE {
+                            self.requested.set(true);
+                        }
+                    }
+                    Ok(())
+                }
+                // Chromium main ui/base/ime/win/tsf_text_store.cc: no document attrs.
+                fn RequestAttrsAtPosition(
+                    &self,
+                    _: i32,
+                    _: u32,
+                    _: *const GUID,
+                    _: u32,
+                ) -> Result<()> {
+                    self.trace.borrow_mut().push("position");
+                    Ok(())
+                }
+                fn RequestAttrsTransitioningAtPosition(
+                    &self,
+                    _: i32,
+                    _: u32,
+                    _: *const GUID,
+                    _: u32,
+                ) -> Result<()> {
+                    self.trace.borrow_mut().push("transition");
+                    Ok(())
+                }
+                fn FindNextAttrTransition(
+                    &self,
+                    _: i32,
+                    _: i32,
+                    _: u32,
+                    _: *const GUID,
+                    _: u32,
+                    next: *mut i32,
+                    found: *mut BOOL,
+                    offset: *mut i32,
+                ) -> Result<()> {
+                    unsafe {
+                        *next = 0;
+                        *found = FALSE;
+                        *offset = 0;
+                    }
+                    Ok(())
+                }
+                fn RetrieveRequestedAttrs(
+                    &self,
+                    count: u32,
+                    attrs: *mut TS_ATTRVAL,
+                    fetched: *mut u32,
+                ) -> Result<()> {
+                    self.trace.borrow_mut().push("retrieve");
+                    unsafe {
+                        *fetched = 0;
+                        if count > 0 && self.requested.replace(false) {
+                            attrs.write(TS_ATTRVAL {
+                                idAttr: GUID_PROP_INPUTSCOPE,
+                                dwOverlapId: 0,
+                                varValue: std::mem::ManuallyDrop::new(self.value.clone()),
+                            });
+                            *fetched = 1;
+                        }
+                    }
+                    Ok(())
+                }
+                fn GetEndACP(&self) -> Result<i32> {
+                    Ok(1)
+                }
+                fn GetActiveView(&self) -> Result<u32> {
+                    Ok(0)
+                }
+                fn GetACPFromPoint(&self, _: u32, _: *const POINT, _: u32) -> Result<i32> {
+                    Err(E_NOTIMPL.into())
+                }
+                fn GetTextExt(
+                    &self,
+                    _: u32,
+                    _: i32,
+                    _: i32,
+                    rect: *mut RECT,
+                    clipped: *mut BOOL,
+                ) -> Result<()> {
+                    unsafe {
+                        *rect = RECT {
+                            left: 0,
+                            top: 0,
+                            right: 100,
+                            bottom: 20,
+                        };
+                        *clipped = FALSE;
+                    }
+                    Ok(())
+                }
+                fn GetScreenExt(&self, _: u32) -> Result<RECT> {
+                    Ok(RECT {
+                        left: 0,
+                        top: 0,
+                        right: 100,
+                        bottom: 20,
+                    })
+                }
+                fn GetWnd(&self, _: u32) -> Result<windows::Win32::Foundation::HWND> {
+                    Ok(Default::default())
+                }
+            }
+
+            #[implement(ITfEditSession)]
+            struct Probe {
+                context: ITfContext,
+                expected: Option<Vec<i32>>,
+                trace: Rc<RefCell<Vec<&'static str>>>,
+                ran: Rc<Cell<bool>>,
+            }
+            impl ITfEditSession_Impl for Probe_Impl {
+                fn DoEditSession(&self, cookie: u32) -> Result<()> {
+                    self.ran.set(true);
+                    unsafe {
+                        let mut selection = [TF_SELECTION::default()];
+                        let mut fetched = 0;
+                        let selected = self.context.GetSelection(
+                            cookie,
+                            u32::MAX,
+                            &mut selection,
+                            &mut fetched,
+                        );
+                        eprintln!("ACP selection={selected:?} fetched={fetched}");
+                        selected?;
+                        assert_eq!(fetched, 1);
+                        let range = std::mem::ManuallyDrop::take(&mut selection[0].range)
+                            .ok_or(Error::from(E_UNEXPECTED))?;
+                        for app in [true, false] {
+                            let value = if app {
+                                self.context
+                                    .GetAppProperty(&GUID_PROP_INPUTSCOPE)
+                                    .and_then(|p| p.GetValue(cookie, &range))
+                            } else {
+                                self.context
+                                    .GetProperty(&GUID_PROP_INPUTSCOPE)
+                                    .and_then(|p| p.GetValue(cookie, &range))
+                            };
+                            eprintln!(
+                                "ACP app={app} value={value:?} trace={:?}",
+                                self.trace.borrow()
+                            );
+                            if !app {
+                                // Observed native document channel result; do not confuse this
+                                // with the successful application-attribute bridge above.
+                                assert_eq!(
+                                    value.unwrap_err().code(),
+                                    windows::Win32::Foundation::E_FAIL
+                                );
+                                continue;
+                            }
+                            let value = value?;
+                            let decoded = IUnknown::try_from(&value)
+                                .and_then(|v| v.cast::<ITfInputScope>())
+                                .and_then(|scope| {
+                                    let mut data = ptr::null_mut();
+                                    let mut count = 0;
+                                    scope.GetInputScopes(&mut data, &mut count)?;
+                                    let values = if count == 0 {
+                                        vec![]
+                                    } else {
+                                        std::slice::from_raw_parts(data, count as usize)
+                                            .iter()
+                                            .map(|v| v.0)
+                                            .collect()
+                                    };
+                                    windows::Win32::System::Com::CoTaskMemFree(Some(data.cast()));
+                                    Ok(values)
+                                });
+                            eprintln!("ACP app={app} scopes={decoded:?}");
+                            match &self.expected {
+                                Some(expected) => assert_eq!(&decoded?, expected),
+                                None => assert!(
+                                    decoded.is_err(),
+                                    "VT_EMPTY must not decode as input scope"
+                                ),
+                            }
+                        }
+                        let allowed = scope_allows_learning(&self.context, cookie);
+                        eprintln!("ACP production_scope_allows_learning={allowed}");
+                        let expected_learning = self.expected.as_ref().is_some_and(|s| {
+                            !s.is_empty() && s.iter().all(|s| learning_scope_value_is_safe(*s))
+                        });
+                        assert_eq!(allowed, expected_learning);
+                        let expected_ai = match &self.expected {
+                            None => Err(ScopeBlockReason::Undeclared),
+                            Some(s) if s.is_empty() => Err(ScopeBlockReason::Empty),
+                            Some(s) => scope_policy(
+                                &s.iter().copied().map(InputScope).collect::<Vec<_>>(),
+                                ScopePolicy::Ai,
+                            ),
+                        };
+                        assert_eq!(
+                            check_scope(&self.context, cookie, ScopePolicy::Ai),
+                            expected_ai
+                        );
+                    }
+                    Ok(())
+                }
+            }
+
+            #[test]
+            fn native_acp_scope_bridge_chromium_isolated() {
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                    .ok()
+                    .unwrap();
+                let _apartment = Apartment;
+                for scopes in [
+                    Some(vec![IS_DEFAULT.0]),
+                    Some(vec![IS_SEARCH.0]),
+                    Some(vec![IS_SEARCH_INCREMENTAL.0]),
+                    Some(vec![IS_CHINESE_HALFWIDTH.0]),
+                    Some(vec![IS_CHINESE_FULLWIDTH.0]),
+                    Some(vec![IS_NATIVE_SCRIPT.0]),
+                    Some(vec![IS_TEXT.0]),
+                    Some(vec![IS_CHAT.0]),
+                    Some(vec![IS_CHAT_WITHOUT_EMOJI.0]),
+                    Some(vec![31]),
+                    Some(vec![61]),
+                    Some(vec![63]),
+                    Some(vec![64]),
+                    Some(vec![65]),
+                    Some(vec![66]),
+                    Some(vec![0, 31]),
+                    Some(vec![999, 61]),
+                    Some(vec![999]),
+                    Some(vec![]),
+                    None,
+                ] {
+                    eprintln!("ACP case={scopes:?}");
+                    let trace = Rc::new(RefCell::new(Vec::new()));
+                    let value = scopes.as_ref().map_or_else(VARIANT::default, |s| {
+                        let scope: IUnknown = TestScope(s.clone()).into();
+                        VARIANT::from(scope)
+                    });
+                    let store: IUnknown = Store {
+                        sink: RefCell::new(None),
+                        locked: Cell::new(false),
+                        requested: Cell::new(false),
+                        value,
+                        trace: trace.clone(),
+                    }
+                    .into();
+                    // Do not use with_owner: its ITfContextOwner advice is a different bridge.
+                    let manager: ITfThreadMgr = unsafe {
+                        CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
+                    }
+                    .unwrap();
+                    let client = unsafe { manager.Activate() }.unwrap();
+                    let document = unsafe { manager.CreateDocumentMgr() }.unwrap();
+                    let mut context = None;
+                    let mut cookie = 0;
+                    unsafe { document.CreateContext(client, 0, &store, &mut context, &mut cookie) }
+                        .unwrap();
+                    let context = context.unwrap();
+                    let host = NativeDocument {
+                        manager,
+                        document,
+                        context,
+                        client,
+                        owner_cookie: None,
+                    };
+                    unsafe { host.document.Push(&host.context) }.unwrap();
+                    unsafe { host.manager.SetFocus(&host.document) }.unwrap();
+                    let ran = Rc::new(Cell::new(false));
+                    let session: ITfEditSession = Probe {
+                        context: host.context.clone(),
+                        expected: scopes,
+                        trace: trace.clone(),
+                        ran: ran.clone(),
+                    }
+                    .into();
+                    let result = unsafe {
+                        host.context
+                            .RequestEditSession(client, &session, TF_ES_SYNC | TF_ES_READ)
+                    };
+                    eprintln!(
+                        "ACP request={result:?} ran={} trace={:?}",
+                        ran.get(),
+                        trace.borrow()
+                    );
+                    result.unwrap().ok().unwrap();
+                    assert!(ran.get(), "real TSF edit callback must run");
+                    assert!(trace.borrow().contains(&"supported"));
+                    assert!(trace.borrow().contains(&"retrieve"));
+                    assert!(trace.borrow().contains(&"selection"));
+                }
+            }
+        }
+
         #[implement(ITfInputScope)]
         struct TestScope(Vec<i32>);
 
@@ -2637,9 +3807,113 @@ mod windows_exports {
             }
         }
 
+        #[implement(ITfInputScope)]
+        struct BrokenScope {
+            returned_count: u32,
+            allocate: bool,
+            fail: bool,
+        }
+        impl ITfInputScope_Impl for BrokenScope_Impl {
+            fn GetInputScopes(&self, values: *mut *mut InputScope, count: *mut u32) -> Result<()> {
+                unsafe {
+                    *count = self.returned_count;
+                    // Only one initialized item: production must never slice an oversized
+                    // or failed response, but must free even these hostile out parameters.
+                    *values = if self.allocate {
+                        let p = windows::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of::<
+                            InputScope,
+                        >(
+                        ))
+                        .cast::<InputScope>();
+                        if p.is_null() {
+                            return Err(E_UNEXPECTED.into());
+                        }
+                        p.write(InputScope(0));
+                        p
+                    } else {
+                        ptr::null_mut()
+                    };
+                }
+                if self.fail {
+                    Err(E_UNEXPECTED.into())
+                } else {
+                    Ok(())
+                }
+            }
+            fn GetPhrase(&self, _: *mut *mut BSTR, _: *mut u32) -> Result<()> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetRegularExpression(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetSRGS(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+            fn GetXML(&self) -> Result<BSTR> {
+                Err(E_UNEXPECTED.into())
+            }
+        }
+
+        #[test]
+        fn native_ai_scope_invalid_com_responses() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            let mut cases = vec![
+                (VARIANT::from(42i32), ScopeBlockReason::InvalidValue),
+                (VARIANT::default(), ScopeBlockReason::Undeclared),
+            ];
+            let unknown: IUnknown = ClassFactory::new().into();
+            cases.push((VARIANT::from(unknown), ScopeBlockReason::Interface));
+            // A correctly tagged null IUnknown is not a scope interface.
+            let mut raw = *VARIANT::default().as_raw();
+            raw.Anonymous.Anonymous.vt = 13;
+            cases.push((
+                unsafe { VARIANT::from_raw(raw) },
+                ScopeBlockReason::InvalidValue,
+            ));
+            for (count, allocate, fail, reason) in [
+                (1, true, true, ScopeBlockReason::Read),
+                (257, true, true, ScopeBlockReason::Read),
+                (257, true, false, ScopeBlockReason::InvalidList),
+                (1, false, false, ScopeBlockReason::InvalidList),
+                (0, true, false, ScopeBlockReason::Empty),
+                (0, false, false, ScopeBlockReason::Empty),
+            ] {
+                let scope: IUnknown = BrokenScope {
+                    returned_count: count,
+                    allocate,
+                    fail,
+                }
+                .into();
+                cases.push((VARIANT::from(scope), reason));
+            }
+            for (value, reason) in cases {
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(value),
+                    calls: calls.clone(),
+                    fail: false,
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (_service, shared) = ai_fixture(&host, &capture, &calls);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    AiStatus::ScopeBlocked(reason)
+                );
+                assert!(capture.requests.borrow().is_empty());
+                drop(shared.borrow_mut().take());
+            }
+        }
+
         #[implement(ITfContextOwner)]
         struct ScopeOwner {
-            value: VARIANT,
+            value: RefCell<VARIANT>,
             calls: Rc<Cell<u32>>,
             fail: bool,
         }
@@ -2683,7 +3957,7 @@ mod windows_exports {
                 if self.fail {
                     return Err(E_UNEXPECTED.into());
                 }
-                Ok(self.value.clone())
+                Ok(self.value.borrow().clone())
             }
         }
 
@@ -2773,7 +4047,7 @@ mod windows_exports {
                 });
                 let calls = Rc::new(Cell::new(0));
                 let owner: IUnknown = ScopeOwner {
-                    value,
+                    value: RefCell::new(value),
                     fail,
                     calls: calls.clone(),
                 }
@@ -2811,6 +4085,8 @@ mod windows_exports {
                     learning: Some(LearningWorker::start(store, data.generation).unwrap()),
                     _learning_registration: None,
                     local_data_error: false,
+                    ai: None,
+                    ai_unavailable: AiStatus::Unavailable,
                 });
                 let sink: ITfKeyEventSink = service.cast().unwrap();
                 for key in b"YINGSHE2" {
@@ -2861,7 +4137,7 @@ mod windows_exports {
             let calls = Rc::new(Cell::new(0));
             let scope: IUnknown = TestScope(vec![0]).into();
             let owner: IUnknown = ScopeOwner {
-                value: VARIANT::from(scope),
+                value: RefCell::new(VARIANT::from(scope)),
                 calls: calls.clone(),
                 fail: false,
             }
@@ -2941,7 +4217,7 @@ mod windows_exports {
                 unsafe { sink.OnKeyDown(context, WPARAM(key as usize), LPARAM(0)) }
                     .unwrap()
                     .as_bool(),
-                "native TSF key must apply successfully"
+                "native TSF key {key:#x} must apply successfully"
             );
         }
 
@@ -3014,6 +4290,756 @@ mod windows_exports {
             }
         }
 
+        #[derive(Default)]
+        struct CapturedAi {
+            requests: RefCell<Vec<Request>>,
+            response: RefCell<Option<Response>>,
+            stopped: Cell<bool>,
+        }
+
+        struct CapturingTransport {
+            capture: Rc<CapturedAi>,
+            scope_calls: Rc<Cell<u32>>,
+        }
+
+        impl AiTransport for CapturingTransport {
+            fn submit(&self, request: Request) -> bool {
+                assert!(
+                    self.scope_calls.get() > 0,
+                    "submit requires a real scope query"
+                );
+                self.capture.requests.borrow_mut().push(request);
+                true
+            }
+            fn try_result(&self) -> Option<Response> {
+                self.capture.response.borrow_mut().take()
+            }
+            fn shutdown(&mut self) {
+                self.capture.stopped.set(true);
+            }
+        }
+
+        fn ai_fixture(
+            host: &NativeDocument,
+            capture: &Rc<CapturedAi>,
+            calls: &Rc<Cell<u32>>,
+        ) -> (ITfTextInputProcessor, SharedActivation) {
+            let service: ITfTextInputProcessor = TextService::new().into();
+            let implementation =
+                unsafe { <ITfTextInputProcessor as AsImpl<TextService>>::as_impl(&service) };
+            let shared = implementation.activation.clone();
+            let generation = Rc::new(Cell::new(0));
+            let events = ThreadEvents::subscribe(&host.manager, generation.clone()).unwrap();
+            *shared.borrow_mut() = Some(Activation {
+                thread_manager: host.manager.clone(),
+                keystroke_manager: host.manager.cast().unwrap(),
+                client_id: host.client,
+                contexts: HashMap::new(),
+                token: next_activation_token(),
+                owner_thread: std::thread::current().id(),
+                focus_epoch: 0,
+                foreground: true,
+                shown_context: None,
+                processing: false,
+                english: false,
+                shift: ShiftGesture::default(),
+                context_generation: generation,
+                _thread_events: Some(events),
+                settings: Settings::default(),
+                lexicon: Lexicon::from_tsv("jin'tian'xin'qing\t今天新情\t100").unwrap(),
+                rankings: Arc::new(Vec::new()),
+                adaptive_ranking_enabled: true,
+                learning: None,
+                _learning_registration: None,
+                local_data_error: false,
+                ai: Some(AiScheduler::new(Box::new(CapturingTransport {
+                    capture: capture.clone(),
+                    scope_calls: calls.clone(),
+                }))),
+                ai_unavailable: AiStatus::Unavailable,
+            });
+            let sink: ITfKeyEventSink = service.cast().unwrap();
+            for key in b"JINTIANXINQING" {
+                send_key(&sink, &host.context, *key);
+            }
+            {
+                let mut state = shared.borrow_mut();
+                let active = state.as_mut().unwrap();
+                // No window is required for this owned document fixture.
+                active.shown_context = Some(context_key(&host.context));
+                let ai = active.ai.as_mut().unwrap();
+                ai.last_input = Instant::now() - Duration::from_millis(300);
+                assert!(!ai.attempted);
+            }
+            (service, shared)
+        }
+
+        fn tick_ai(shared: &SharedActivation) {
+            let (token, owner) = {
+                let state = shared.borrow();
+                let active = state.as_ref().unwrap();
+                (active.token, active.owner_thread)
+            };
+            ai_idle(shared, token, owner);
+        }
+
+        fn pump_ai(shared: &SharedActivation) {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let reading = shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .ai
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.reading);
+                if !reading {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "TSF did not deliver the asynchronous read session"
+                );
+                let mut message = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        fn captured_reply(capture: &CapturedAi) {
+            let id = capture.requests.borrow().last().unwrap().id;
+            *capture.response.borrow_mut() = Some(Response {
+                id,
+                corrected: Some("今天心情".into()),
+            });
+        }
+
+        #[test]
+        fn native_ai_real_timer_reports_scope_no_suggestion_and_slow_result() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for case in 0..3 {
+                let scope: IUnknown = TestScope(vec![if case == 0 { 31 } else { 0 }]).into();
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (_service, shared) = ai_fixture(&host, &capture, &calls);
+                let (token, thread) = {
+                    let state = shared.borrow();
+                    let active = state.as_ref().unwrap();
+                    (active.token, active.owner_thread)
+                };
+                struct PopupGuard(ActivationToken, ThreadId);
+                impl Drop for PopupGuard {
+                    fn drop(&mut self) {
+                        close_thread_popup(self.0, self.1);
+                    }
+                }
+                let mut popup = CandidatePopupWindow::new().unwrap();
+                let weak = Rc::downgrade(&shared);
+                popup
+                    .set_idle_sink(Some(Rc::new(move || {
+                        if let Some(shared) = weak.upgrade() {
+                            ai_idle(&shared, token, thread);
+                        }
+                    })))
+                    .unwrap();
+                assert!(register_thread_popup(token, popup));
+                let _popup_guard = PopupGuard(token, thread);
+                let before = read_document(&host, None);
+                let mut replied = false;
+                let expected = [
+                    AiStatus::ScopeBlocked(ScopeBlockReason::Sensitive),
+                    AiStatus::NoSuggestion,
+                    AiStatus::Suggested,
+                ][case];
+                let deadline = Instant::now() + Duration::from_secs(3);
+                // This loop dispatches real WM_TIMER messages; it never calls tick_ai.
+                while ai_status(shared.borrow().as_ref().unwrap()) != expected {
+                    assert!(Instant::now() < deadline, "timer status case {case}");
+                    let mut message = MSG::default();
+                    unsafe {
+                        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                            let _ = TranslateMessage(&message);
+                            DispatchMessageW(&message);
+                        }
+                    }
+                    if case != 0 && !replied && !capture.requests.borrow().is_empty() {
+                        if case == 2 {
+                            shared
+                                .borrow_mut()
+                                .as_mut()
+                                .unwrap()
+                                .ai
+                                .as_mut()
+                                .unwrap()
+                                .pending
+                                .as_mut()
+                                .unwrap()
+                                .dispatched = Some(Instant::now() - Duration::from_millis(1200));
+                            captured_reply(&capture);
+                        } else {
+                            *capture.response.borrow_mut() = Some(Response {
+                                id: capture.requests.borrow().last().unwrap().id,
+                                corrected: None,
+                            });
+                        }
+                        replied = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(capture.requests.borrow().len(), usize::from(case != 0));
+                assert_eq!(
+                    read_document(&host, None),
+                    before,
+                    "timer never writes preedit"
+                );
+                if case == 2 {
+                    assert!(shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .contexts
+                        .get(&context_key(&host.context))
+                        .unwrap()
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates[1]
+                        .is_ai());
+                }
+                shared
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .ai
+                    .as_mut()
+                    .unwrap()
+                    .input();
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    AiStatus::Waiting
+                );
+                if case == 1 {
+                    shared
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .ai
+                        .as_mut()
+                        .unwrap()
+                        .last_input =
+                        Instant::now() - Duration::from_millis(crate::ai::DEBOUNCE_MS + 1);
+                    tick_ai(&shared);
+                    pump_ai(&shared);
+                    {
+                        let mut state = shared.borrow_mut();
+                        let pending = state
+                            .as_mut()
+                            .unwrap()
+                            .ai
+                            .as_mut()
+                            .unwrap()
+                            .pending
+                            .as_mut()
+                            .unwrap();
+                        // Model an accepted read session that has not delivered
+                        // its cookie: no source is retained or sent by that gate.
+                        pending.dispatched = None;
+                        pending.input = None;
+                        pending.reading = true;
+                        pending.queued = Instant::now()
+                            - Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS + 1);
+                    }
+                    tick_ai(&shared);
+                    assert_eq!(
+                        ai_status(shared.borrow().as_ref().unwrap()),
+                        AiStatus::EditFailed
+                    );
+                    assert!(shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .ai
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .is_none());
+                }
+                shared
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .settings
+                    .ai_correction_enabled = false;
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    AiStatus::Disabled
+                );
+                shared
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .settings
+                    .ai_correction_enabled = true;
+                shared.borrow_mut().as_mut().unwrap().ai = None;
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    AiStatus::Unavailable
+                );
+                drop(shared.borrow_mut().take());
+            }
+        }
+
+        #[test]
+        fn native_ai_late_read_callbacks_enforce_their_own_deadlines() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for publication in [false, true] {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (_service, shared) = ai_fixture(&host, &capture, &calls);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                let ticket = {
+                    let mut state = shared.borrow_mut();
+                    let pending = state
+                        .as_mut()
+                        .unwrap()
+                        .ai
+                        .as_mut()
+                        .unwrap()
+                        .pending
+                        .as_mut()
+                        .unwrap();
+                    let past =
+                        Instant::now() - Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS + 1);
+                    pending.reading = true;
+                    if publication {
+                        pending.dispatched = Some(past);
+                    } else {
+                        pending.queued = past;
+                        pending.dispatched = None;
+                        pending.input = None;
+                    }
+                    pending.ticket.clone()
+                };
+                capture.requests.borrow_mut().clear();
+                let session: ITfEditSession = AiReadSession {
+                    activation: Rc::downgrade(&shared),
+                    ticket: ticket.clone(),
+                    context: host.context.clone(),
+                    manager: host.manager.clone(),
+                    response: publication.then(|| Response {
+                        id: ticket.id,
+                        corrected: Some("今天心情".into()),
+                    }),
+                    _registration: ObjectRegistration::new(),
+                }
+                .into();
+                let hr = unsafe {
+                    host.context
+                        .RequestEditSession(host.client, &session, TF_ES_ASYNC | TF_ES_READ)
+                }
+                .unwrap();
+                assert!(hr.is_ok());
+                pump_ai(&shared); // No timer tick can clean pending first.
+                assert!(capture.requests.borrow().is_empty());
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    if publication {
+                        AiStatus::Failed
+                    } else {
+                        AiStatus::EditFailed
+                    }
+                );
+                assert!(shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .ai
+                    .as_ref()
+                    .unwrap()
+                    .pending
+                    .is_none());
+                assert_eq!(
+                    shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .contexts
+                        .get(&context_key(&host.context))
+                        .unwrap()
+                        .popup_model
+                        .snapshot()
+                        .unwrap()
+                        .candidates
+                        .len(),
+                    1
+                );
+                drop(shared.borrow_mut().take());
+            }
+        }
+
+        #[test]
+        fn native_ai_read_scope_matrix_and_source() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            use windows::Win32::UI::TextServices::*;
+            use ScopeBlockReason::*;
+            for (scopes, fail, expected_reason) in [
+                (Some(vec![IS_DEFAULT.0]), false, None),
+                (Some(vec![IS_TEXT.0]), false, None),
+                (Some(vec![IS_CHAT.0]), false, None),
+                (Some(vec![IS_SEARCH.0]), false, None),
+                (Some(vec![IS_SEARCH_INCREMENTAL.0]), false, None),
+                (Some(vec![IS_CHINESE_HALFWIDTH.0]), false, None),
+                (Some(vec![IS_CHINESE_FULLWIDTH.0]), false, None),
+                (Some(vec![IS_NATIVE_SCRIPT.0]), false, None),
+                (Some(vec![IS_CHAT_WITHOUT_EMOJI.0]), false, None),
+                (Some(vec![0, 57, 58]), false, None),
+                (Some(vec![31]), false, Some(Sensitive)),
+                (Some(vec![61]), false, Some(Sensitive)),
+                (Some(vec![63]), false, Some(Sensitive)),
+                (Some(vec![64]), false, Some(Sensitive)),
+                (Some(vec![65]), false, Some(Sensitive)),
+                (Some(vec![66]), false, Some(Sensitive)),
+                (Some(vec![0, 31]), false, Some(Sensitive)),
+                (Some(vec![999, 61]), false, Some(Sensitive)),
+                (Some(vec![999]), false, Some(Unsupported)),
+                (Some(vec![]), false, Some(Empty)),
+                (None, false, Some(Undeclared)),
+                (Some(vec![0]), true, Some(Value)),
+            ] {
+                let allowed = expected_reason.is_none();
+                let value = scopes.map_or_else(VARIANT::default, |s| {
+                    let scope: IUnknown = TestScope(s).into();
+                    VARIANT::from(scope)
+                });
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(value),
+                    fail,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (service, shared) = ai_fixture(&host, &capture, &calls);
+                assert!(capture.requests.borrow().is_empty());
+                assert_eq!(calls.get(), 0);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert!(calls.get() > 0);
+                assert_eq!(capture.requests.borrow().len(), usize::from(allowed));
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    if allowed {
+                        AiStatus::Checking
+                    } else {
+                        AiStatus::ScopeBlocked(expected_reason.unwrap())
+                    }
+                );
+                if allowed {
+                    assert_eq!(capture.requests.borrow()[0].text, "今天新情");
+                    let raw = shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .contexts
+                        .get(&context_key(&host.context))
+                        .unwrap()
+                        .router
+                        .ai_input()
+                        .unwrap()
+                        .raw;
+                    assert_eq!(raw, "jintianxinqing");
+                }
+                let active = shared.borrow_mut().take();
+                drop(active);
+                assert!(capture.stopped.get());
+                drop(service);
+            }
+        }
+
+        #[test]
+        fn native_ai_publication_rechecks_privacy_and_selects_without_learning() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for sensitive in [true, false] {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (service, shared) = ai_fixture(&host, &capture, &calls);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert_eq!(capture.requests.borrow().len(), 1);
+                let before = read_document(&host, None);
+                let previous_calls = calls.get();
+                if sensitive {
+                    let scope: IUnknown = TestScope(vec![31]).into();
+                    let owner_interface: ITfContextOwner = owner.cast().unwrap();
+                    let implementation = unsafe {
+                        <ITfContextOwner as AsImpl<ScopeOwner>>::as_impl(&owner_interface)
+                    };
+                    *implementation.value.borrow_mut() = VARIANT::from(scope);
+                }
+                captured_reply(&capture);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert!(calls.get() > previous_calls);
+                assert_eq!(
+                    read_document(&host, None),
+                    before,
+                    "AI must not write preedit"
+                );
+                let snapshot = shared
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .contexts
+                    .get(&context_key(&host.context))
+                    .unwrap()
+                    .popup_model
+                    .snapshot()
+                    .unwrap()
+                    .clone();
+                assert_eq!(snapshot.candidates.len(), if sensitive { 1 } else { 2 });
+                assert_eq!(
+                    ai_status(shared.borrow().as_ref().unwrap()),
+                    if sensitive {
+                        AiStatus::ScopeBlocked(ScopeBlockReason::Sensitive)
+                    } else {
+                        AiStatus::Suggested
+                    }
+                );
+                if !sensitive {
+                    captured_reply(&capture);
+                    tick_ai(&shared);
+                    pump_ai(&shared);
+                    assert_eq!(
+                        shared
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .contexts
+                            .get(&context_key(&host.context))
+                            .unwrap()
+                            .popup_model
+                            .snapshot()
+                            .unwrap()
+                            .revision,
+                        snapshot.revision,
+                        "a duplicate result must not republish"
+                    );
+                    let sink: ITfKeyEventSink = service.cast().unwrap();
+                    send_key(&sink, &host.context, b'2');
+                    assert_eq!(read_document(&host, None), "今天心情");
+                    let state = shared.borrow();
+                    let active = state.as_ref().unwrap();
+                    assert!(active.rankings.is_empty());
+                    assert!(active
+                        .contexts
+                        .get(&context_key(&host.context))
+                        .unwrap()
+                        .router
+                        .pending_promotions()
+                        .is_empty());
+                }
+                drop(shared.borrow_mut().take());
+                drop(service);
+            }
+        }
+
+        #[test]
+        fn native_ai_stale_tickets_and_deadline() {
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            for case in 0..9 {
+                let scope: IUnknown = TestScope(vec![0]).into();
+                let calls = Rc::new(Cell::new(0));
+                let owner: IUnknown = ScopeOwner {
+                    value: RefCell::new(VARIANT::from(scope)),
+                    fail: false,
+                    calls: calls.clone(),
+                }
+                .into();
+                let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                let capture = Rc::new(CapturedAi::default());
+                let (service, shared) = ai_fixture(&host, &capture, &calls);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert_eq!(capture.requests.borrow().len(), 1);
+                captured_reply(&capture);
+                match case {
+                    0 => {
+                        let sink: ITfKeyEventSink = service.cast().unwrap();
+                        send_key(&sink, &host.context, 0x1b); // cancel
+                    }
+                    1 => {
+                        let sink: ITfKeyEventSink = service.cast().unwrap();
+                        send_key(&sink, &host.context, b'N');
+                    }
+                    2 | 8 => {
+                        // SetFocus(NULL) can succeed while TSF still reports
+                        // the previous document. Empty that owned document
+                        // to establish an observable missing top context.
+                        // Detach notifications to exercise timer-side cleanup.
+                        let events = shared.borrow_mut().as_mut().unwrap()._thread_events.take();
+                        drop(events);
+                        unsafe { host.manager.SetFocus(None::<&ITfDocumentMgr>) }.unwrap();
+                        unsafe { host.document.Pop(TF_POPF_ALL) }.unwrap();
+                        assert!(
+                            focused_context_key(&host.manager).is_none(),
+                            "the focused empty document must have no top context"
+                        );
+                        if case == 8 {
+                            *capture.response.borrow_mut() = None;
+                        }
+                    }
+                    3 => {
+                        let mut state = shared.borrow_mut();
+                        let ai = state.as_mut().unwrap().ai.as_mut().unwrap();
+                        ai.pending.as_mut().unwrap().dispatched = Some(
+                            Instant::now()
+                                - Duration::from_millis(crate::ai::RESULT_TIMEOUT_MS + 1),
+                        );
+                    }
+                    4 => {
+                        let mut state = shared.borrow_mut();
+                        let entry = state
+                            .as_mut()
+                            .unwrap()
+                            .contexts
+                            .get_mut(&context_key(&host.context))
+                            .unwrap();
+                        let update = entry.router.set_candidate_width(Some(480));
+                        entry.popup_model.apply_update(&update);
+                    }
+                    5 => {
+                        let generation =
+                            shared.borrow().as_ref().unwrap().context_generation.clone();
+                        let before = generation.get();
+                        unsafe {
+                            host.document.Pop(TF_POPF_ALL).unwrap();
+                            host.document.Push(&host.context).unwrap();
+                        }
+                        assert!(
+                            generation.get() > before,
+                            "real Push/Pop must invalidate the ticket"
+                        );
+                    }
+                    6 => {
+                        let mut response = capture.response.borrow_mut();
+                        response.as_mut().unwrap().id += 1;
+                    }
+                    7 => {
+                        let sink: ITfKeyEventSink = service.cast().unwrap();
+                        let _ = unsafe {
+                            sink.OnKeyDown(&host.context, WPARAM(VK_SHIFT.0 as usize), LPARAM(0))
+                        }
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert!(
+                    shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .ai
+                        .as_ref()
+                        .unwrap()
+                        .pending
+                        .is_none(),
+                    "stale case {case} must release its pending source"
+                );
+                assert!(
+                    shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .contexts
+                        .values()
+                        .all(|entry| {
+                            entry
+                                .popup_model
+                                .snapshot()
+                                .map_or(true, |s| s.candidates.iter().all(|c| c.text != "今天心情"))
+                        }),
+                    "stale case {case}"
+                );
+                // A duplicate response cannot publish after the rejected result.
+                captured_reply(&capture);
+                tick_ai(&shared);
+                pump_ai(&shared);
+                assert!(
+                    shared
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .contexts
+                        .values()
+                        .all(|entry| {
+                            entry
+                                .popup_model
+                                .snapshot()
+                                .map_or(true, |s| s.candidates.iter().all(|c| c.text != "今天心情"))
+                        }),
+                    "duplicate stale case {case}"
+                );
+                drop(shared.borrow_mut().take());
+                drop(service);
+            }
+        }
+
         #[test]
         fn native_shift_commits_original_spelling_and_switches_only_after_success() {
             unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
@@ -3046,6 +5072,8 @@ mod windows_exports {
                 learning: None,
                 _learning_registration: None,
                 local_data_error: false,
+                ai: None,
+                ai_unavailable: AiStatus::Unavailable,
             });
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let down = |key| {
@@ -3282,6 +5310,8 @@ mod windows_exports {
                 learning: None,
                 _learning_registration: None,
                 local_data_error: false,
+                ai: None,
+                ai_unavailable: AiStatus::Unavailable,
             });
             let sink: ITfKeyEventSink = service.cast().unwrap();
             let tested =
@@ -3403,6 +5433,43 @@ mod windows_exports {
             assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好nh");
             send_key(&sink, &host.context, b' ');
             assert_eq!(read_document(&host, None), "你好你好shi你𠀀你好你好");
+            // Real TSF writes, not global keyboard injection: punctuation works
+            // while idle and confirms the complete composition before appending.
+            let prefix = read_document(&host, None);
+            send_key(&sink, &host.context, 0xBC);
+            assert_eq!(read_document(&host, None), format!("{prefix}，"));
+            for key in b"NIHAO" {
+                send_key(&sink, &host.context, *key);
+            }
+            send_key(&sink, &host.context, 0xBE);
+            assert_eq!(read_document(&host, None), format!("{prefix}，你好。"));
+            for _ in 0..2 {
+                assert!(
+                    unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0xDE), LPARAM(0)) }
+                        .unwrap()
+                        .as_bool()
+                );
+            }
+            send_key(&sink, &host.context, 0xDE);
+            send_key(&sink, &host.context, 0xDE);
+            assert_eq!(read_document(&host, None), format!("{prefix}，你好。‘’"));
+            implementation
+                .activation
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .english = true;
+            assert!(
+                !unsafe { sink.OnTestKeyDown(&host.context, WPARAM(0xBC), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert!(
+                !unsafe { sink.OnKeyDown(&host.context, WPARAM(0xBC), LPARAM(0)) }
+                    .unwrap()
+                    .as_bool()
+            );
+            assert_eq!(read_document(&host, None), format!("{prefix}，你好。‘’"));
             implementation.activation.borrow_mut().take();
         }
     }

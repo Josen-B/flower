@@ -1,7 +1,7 @@
 [package]
 name = "flower"
 description = "Offline Pinyin input method for Windows"
-version = "0.4.4"
+version = "0.4.10"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,9 @@ crate-type = ["cdylib", "rlib"]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+sha2 = "0.10"
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic"] }
+ort-sys = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-core = "0.58"
@@ -25,11 +28,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
     "Win32_System_SystemInformation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_UI_HiDpi",
+    "Win32_UI_Controls",
     "Win32_UI_Shell",
     "Win32_UI_TextServices",
     "Win32_UI_Input_KeyboardAndMouse",

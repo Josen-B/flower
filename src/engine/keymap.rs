@@ -20,9 +20,21 @@ pub const VK_DOWN: u32 = 0x28;
 /// passed through by the TSF layer.
 pub fn map_windows_virtual_key(virtual_key: u32, modifiers: Modifiers) -> Option<KeyEvent> {
     let key = match virtual_key {
+        0x30..=0x39 if modifiers.shift => {
+            Key::Char(b")!@#$%^&*("[(virtual_key - 0x30) as usize] as char)
+        }
         0x30..=0x39 => Key::Char((b'0' + (virtual_key - 0x30) as u8) as char),
         0x41..=0x5A => Key::Char((b'a' + (virtual_key - 0x41) as u8) as char),
-        0xDE if !modifiers.shift => Key::Char('\''),
+        0xDE => Key::Char(if modifiers.shift { '"' } else { '\'' }),
+        0xBA => Key::Char(if modifiers.shift { ':' } else { ';' }),
+        0xBC => Key::Char(if modifiers.shift { '<' } else { ',' }),
+        0xBE => Key::Char(if modifiers.shift { '>' } else { '.' }),
+        0xBF => Key::Char(if modifiers.shift { '?' } else { '/' }),
+        0xC0 => Key::Char(if modifiers.shift { '~' } else { '`' }),
+        0xDB => Key::Char(if modifiers.shift { '{' } else { '[' }),
+        0xDC => Key::Char(if modifiers.shift { '|' } else { '\\' }),
+        0xDD => Key::Char(if modifiers.shift { '}' } else { ']' }),
+        0xBD if modifiers.shift => Key::Char('_'),
         0xBB | 0x6B => Key::PageDown,            // =/+ and numpad +
         0xBD if !modifiers.shift => Key::PageUp, // - but not _
         0x6D => Key::PageUp,                     // numpad -
