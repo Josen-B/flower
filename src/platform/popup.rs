@@ -68,13 +68,14 @@ mod windows_impl {
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W, InvalidateRect, MonitorFromRect,
-        MonitorFromWindow, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, BITMAPINFO,
-        BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT,
-        COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_PITCH,
-        DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL,
-        HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, TRANSPARENT,
+        GetDC, GetMonitorInfoW, GetSysColor, GetTextExtentPoint32W, IntersectClipRect,
+        InvalidateRect, MonitorFromRect, MonitorFromWindow, ReleaseDC, RestoreDC, SaveDC,
+        SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+        COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT,
+        HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+        TRANSPARENT,
     };
     use windows::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -116,6 +117,12 @@ mod windows_impl {
         candidates: CandidatePopupLayout,
         size: PopupSize,
         status: Option<PopupRect>,
+        lines: Vec<Vec<String>>,
+        full_rows: Vec<PopupRect>,
+        viewport: PopupRect,
+        line_height: i32,
+        scroll: i32,
+        max_scroll: i32,
     }
 
     impl PopupLayout {
@@ -136,6 +143,62 @@ mod windows_impl {
                 dpi,
                 PopupSize::new(bounds.width, (height - status_height).max(1)),
             );
+            let line_height = scaled(30, dpi).max(1);
+            let padding = scaled(8, dpi);
+            let mut lines = Vec::new();
+            // This DC is owned only for measurement, never used to capture pixels.
+            let dc = MeasureDc::new();
+            let font = dc.as_ref().and_then(|dc| PaintFont::new(dc.0, dpi));
+            let measure = |text: &str| {
+                font.as_ref()
+                    .and_then(|_| measured_width(dc.as_ref()?.0, text))
+            };
+            let labels: Vec<String> = snapshot
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{}. {}", i + 1, c.display_text()))
+                .collect();
+            let vertical = labels.len() != candidates.candidates.len()
+                || labels
+                    .iter()
+                    .zip(&candidates.candidates)
+                    .any(|(text, row)| {
+                        measure(text).map_or(true, |w| w > row.width() - scaled(6, dpi))
+                    });
+            if vertical && font.is_some() {
+                let width = bounds.width.max(1).min(scaled(560, dpi));
+                let available = (width - padding * 2 - scaled(6, dpi)).max(0);
+                candidates.candidates.clear();
+                let mut top = padding;
+                for label in &labels {
+                    let wrapped = wrap_candidate_text(label, available, &measure);
+                    let bottom =
+                        top.saturating_add(line_height.saturating_mul(wrapped.len() as i32));
+                    candidates.candidates.push(PopupRect::new(
+                        padding,
+                        top,
+                        (width - padding).max(padding),
+                        bottom,
+                    ));
+                    lines.push(wrapped);
+                    top = bottom;
+                }
+                candidates.size = PopupSize::new(
+                    width,
+                    top.saturating_add(padding)
+                        .min((height - status_height).max(0)),
+                );
+            } else if font.is_some() {
+                lines = labels.into_iter().map(|s| vec![s]).collect();
+            } else {
+                // Font/measurement failure must not leave selectable unseen text.
+                candidates.candidates.clear();
+            }
+            if candidates.size.height < padding * 2 + line_height {
+                candidates.candidates.clear();
+                lines.clear();
+            }
             // CandidatePopupLayout requires a positive bound; at a one-pixel
             // work area the status owns that pixel and no candidate can fit.
             if height <= status_height {
@@ -152,12 +215,97 @@ mod windows_impl {
             );
             let status =
                 status.map(|_| PopupRect::new(0, candidates.size.height, size.width, size.height));
-            Self {
+            let full_rows = candidates.candidates.clone();
+            let viewport = PopupRect::new(
+                0,
+                padding.min(candidates.size.height),
+                size.width,
+                (candidates.size.height - padding).max(padding.min(candidates.size.height)),
+            );
+            let max_scroll = full_rows
+                .last()
+                .map_or(0, |r| (r.bottom - viewport.bottom).max(0));
+            let mut result = Self {
                 candidates,
                 size,
                 status,
+                lines,
+                full_rows,
+                viewport,
+                line_height,
+                scroll: 0,
+                max_scroll,
+            };
+            let offset = snapshot
+                .highlighted
+                .and_then(|i| result.full_rows.get(i))
+                .map_or(0, |r| {
+                    if r.height() > viewport.height() {
+                        r.top - viewport.top
+                    } else {
+                        (r.bottom - viewport.bottom).max(0)
+                    }
+                });
+            result.set_scroll(offset);
+            result
+        }
+
+        fn set_scroll(&mut self, offset: i32) {
+            self.scroll = offset.clamp(0, self.max_scroll);
+            self.candidates.candidates = self
+                .full_rows
+                .iter()
+                .map(|r| {
+                    PopupRect::new(
+                        r.left,
+                        (r.top - self.scroll).max(self.viewport.top),
+                        r.right,
+                        (r.bottom - self.scroll).min(self.viewport.bottom),
+                    )
+                })
+                .collect();
+        }
+    }
+
+    struct MeasureDc(HDC);
+    impl MeasureDc {
+        fn new() -> Option<Self> {
+            // SAFETY: Screen DC is acquired without reading its contents.
+            let dc = unsafe { GetDC(HWND::default()) };
+            (!dc.is_invalid()).then_some(Self(dc))
+        }
+    }
+    impl Drop for MeasureDc {
+        fn drop(&mut self) {
+            // SAFETY: Release exactly the DC acquired by GetDC.
+            unsafe {
+                ReleaseDC(HWND::default(), self.0);
             }
         }
+    }
+
+    fn wrap_candidate_text(
+        text: &str,
+        available: i32,
+        measure: &impl Fn(&str) -> Option<i32>,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for ch in text.chars() {
+            if measure(&ch.to_string()).map_or(true, |w| w > available || w < 0) {
+                return Vec::new();
+            }
+            let mut next = line.clone();
+            next.push(ch);
+            if !line.is_empty() && measure(&next).map_or(true, |w| w > available) {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
     }
 
     /// Owns only the temporary built-in hidden window, never the real popup.
@@ -213,7 +361,19 @@ mod windows_impl {
 
     pub(crate) type PopupActionSink = Rc<dyn Fn(CandidatePopupAction) + 'static>;
 
+    struct PresentedCandidates {
+        snapshot: CandidatePopupSnapshot,
+        dpi: u32,
+        status: Option<AiStatus>,
+        offset: Option<i32>,
+        client: PopupRect,
+        window: PopupRect,
+        candidates: CandidatePopupLayout,
+    }
+
     struct PopupState {
+        presented: Option<PresentedCandidates>,
+        scroll_offset: Option<i32>,
         snapshot: Option<CandidatePopupSnapshot>,
         ai_status: Option<AiStatus>,
         last_caret: Option<PopupRect>,
@@ -378,6 +538,8 @@ mod windows_impl {
             let class_lease = ClassLease::acquire(instance, cursor)?;
 
             let state = Box::new(RefCell::new(PopupState {
+                presented: None,
+                scroll_offset: None,
                 snapshot: None,
                 ai_status: None,
                 last_caret: None,
@@ -463,6 +625,7 @@ mod windows_impl {
                 }
                 let added = state.ai_status.is_none();
                 state.ai_status = Some(status);
+                state.presented = None;
                 (added, state.last_caret)
             };
             // Only the first status changes geometry. Never show a hidden popup.
@@ -566,23 +729,27 @@ mod windows_impl {
                 .try_borrow()
                 .map_err(|_| state_busy_error())?
                 .ai_status;
-            let natural =
-                PopupLayout::new(snapshot, dpi, PopupSize::new(i32::MAX, i32::MAX), status).size;
-
             // SAFETY: The window is live. Resizing does not activate it, and a
             // null insert-after handle is ignored because SWP_NOZORDER is set.
-            unsafe {
-                SetWindowPos(
-                    self.hwnd,
-                    HWND::default(),
-                    0,
-                    0,
-                    natural.width,
-                    natural.height,
-                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-                )
+            if !self.is_visible() {
+                let natural =
+                    PopupLayout::new(snapshot, dpi, PopupSize::new(i32::MAX, i32::MAX), status)
+                        .size;
+                // Hidden creation can use the natural size. A visible refresh is
+                // resized only by show_at's work-area-bounded placement below.
+                unsafe {
+                    SetWindowPos(
+                        self.hwnd,
+                        HWND::default(),
+                        0,
+                        0,
+                        natural.width,
+                        natural.height,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                }
+                .map_err(|error| PopupError::win32("resize", error))?;
             }
-            .map_err(|error| PopupError::win32("resize", error))?;
 
             {
                 let mut state = self
@@ -591,6 +758,10 @@ mod windows_impl {
                     .ok_or(PopupError::Destroyed)?
                     .try_borrow_mut()
                     .map_err(|_| state_busy_error())?;
+                if state.snapshot.as_ref() != Some(snapshot) {
+                    state.scroll_offset = None;
+                    state.presented = None;
+                }
                 state.snapshot = Some(snapshot.clone());
                 state.dpi = dpi;
                 state.pending_actions.clear();
@@ -1017,6 +1188,54 @@ mod windows_impl {
                 unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
             }
             WM_LBUTTONDOWN => LRESULT(0),
+            windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGED => {
+                if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
+                    if let Ok(mut state) = state.try_borrow_mut() {
+                        state.presented = None;
+                    }
+                }
+                // SAFETY: Forward our live window's position change.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+                let mut client = RECT::default();
+                // SAFETY: Live window and writable rectangle.
+                if unsafe { GetClientRect(hwnd, &mut client) }.is_ok() {
+                    let data = unsafe { popup_state_pointer(hwnd).as_ref() }
+                        .and_then(|s| s.try_borrow().ok())
+                        .and_then(|s| {
+                            s.snapshot
+                                .clone()
+                                .map(|snapshot| (snapshot, s.dpi, s.ai_status, s.scroll_offset))
+                        });
+                    if let Some((snapshot, dpi, status, offset)) = data {
+                        let mut layout = PopupLayout::new(
+                            &snapshot,
+                            dpi,
+                            PopupSize::new(client.right, client.bottom),
+                            status,
+                        );
+                        if let Some(offset) = offset {
+                            layout.set_scroll(offset);
+                        }
+                        let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
+                        layout.set_scroll(
+                            layout
+                                .scroll
+                                .saturating_sub(delta * layout.line_height / 120),
+                        );
+                        if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
+                            if let Ok(mut state) = state.try_borrow_mut() {
+                                state.scroll_offset = Some(layout.scroll);
+                                state.presented = None;
+                            }
+                        }
+                        // SAFETY: Invalidating our own nonactivating window only.
+                        let _ = unsafe { InvalidateRect(hwnd, None, TRUE) };
+                    }
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
                 let point = point_from_lparam(lparam);
                 if let Some(action) = popup_action_at(hwnd, point) {
@@ -1060,6 +1279,8 @@ mod windows_impl {
                     unsafe { popup_state_pointer(hwnd).as_ref() }.and_then(|state| {
                         if let Ok(mut state) = state.try_borrow_mut() {
                             state.dpi = new_dpi.max(1);
+                            state.scroll_offset = None;
+                            state.presented = None;
                             state
                                 .snapshot
                                 .clone()
@@ -1188,8 +1409,14 @@ mod windows_impl {
 
     fn popup_action_at(hwnd: HWND, point: PopupPoint) -> Option<CandidatePopupAction> {
         let mut client = RECT::default();
+        let mut window = RECT::default();
         // SAFETY: `hwnd` is live and `client` is valid writable storage.
         if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+            return None;
+        }
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window) }
+            .is_err()
+        {
             return None;
         }
 
@@ -1197,17 +1424,18 @@ mod windows_impl {
         // RefCell retained by the owning Rust struct.
         let state = unsafe { popup_state_pointer(hwnd).as_ref()? };
         let state = state.try_borrow().ok()?;
-        let snapshot = state.snapshot.as_ref()?;
-        let layout = PopupLayout::new(
-            snapshot,
-            state.dpi,
-            PopupSize::new(client.right - client.left, client.bottom - client.top),
-            state.ai_status,
-        );
-
-        // Win32 must not be called while the RefCell borrow is held. The layout
-        // and hit test are pure Rust operations.
-        layout.candidates.hit_test(snapshot, point)
+        let frame = state.presented.as_ref()?;
+        if state.snapshot.as_ref() != Some(&frame.snapshot)
+            || state.dpi != frame.dpi
+            || state.ai_status != frame.status
+            || state.scroll_offset != frame.offset
+            || rect_from_windows(client) != frame.client
+            || rect_from_windows(window) != frame.window
+        {
+            return None;
+        }
+        // Only geometry from an actually presented frame authorizes mouse input.
+        frame.candidates.hit_test(&frame.snapshot, point)
     }
 
     fn queue_popup_action(hwnd: HWND, action: CandidatePopupAction) -> bool {
@@ -1326,6 +1554,7 @@ mod windows_impl {
         hwnd: HWND,
         render_data: Option<&(CandidatePopupSnapshot, u32, Theme, Option<AiStatus>)>,
     ) {
+        clear_presented_candidates(hwnd);
         let mut paint = PAINTSTRUCT::default();
         // SAFETY: `hwnd` is live and `paint` is valid writable storage.
         let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -1339,9 +1568,34 @@ mod windows_impl {
         let mut client = RECT::default();
         // SAFETY: `hwnd` is live and `client` is valid writable storage.
         if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
-            client = fallback;
+            fill_rect(hdc, &fallback, COLORREF(system_popup_palette().background));
+            return;
         }
+        paint_popup_contents(hwnd, hdc, client, render_data);
+    }
 
+    fn clear_presented_candidates(hwnd: HWND) {
+        if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
+            if let Ok(mut state) = state.try_borrow_mut() {
+                state.presented = None;
+            }
+        }
+    }
+
+    // Shared by WM_PAINT and offscreen failure tests with a real popup state.
+    fn paint_popup_contents(
+        hwnd: HWND,
+        hdc: HDC,
+        client: RECT,
+        render_data: Option<&(CandidatePopupSnapshot, u32, Theme, Option<AiStatus>)>,
+    ) {
+        clear_presented_candidates(hwnd);
+        let mut window = RECT::default();
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window) }
+            .is_err()
+        {
+            return;
+        }
         let Some((snapshot, dpi, theme, status)) = render_data else {
             fill_rect(hdc, &client, COLORREF(system_popup_palette().background));
             return;
@@ -1358,51 +1612,20 @@ mod windows_impl {
             SetBkMode(hdc, TRANSPARENT);
         }
 
-        let layout = PopupLayout::new(
+        let mut layout = PopupLayout::new(
             snapshot,
             dpi,
             PopupSize::new(client.right - client.left, client.bottom - client.top),
             *status,
         );
-        for (index, (row, candidate)) in layout
-            .candidates
-            .candidates
-            .iter()
-            .zip(snapshot.candidates.iter())
-            .enumerate()
-        {
-            let mut row_rect = windows_rect(*row);
-            let line = format!("{}. {}", index + 1, candidate.display_text());
-            let (line, width) = fitted_candidate_text(hdc, &line, row.width());
-            let highlighted = snapshot.highlighted == Some(index);
-            if highlighted {
-                let highlight = candidate_highlight_rect(*row, width, dpi);
-                let painted = fill_candidate_highlight(
-                    hdc,
-                    &highlight,
-                    dpi,
-                    COLORREF(palette.highlight),
-                    COLORREF(palette.background),
-                );
-                set_text_color(
-                    hdc,
-                    COLORREF(if painted {
-                        palette.highlight_text
-                    } else {
-                        palette.text
-                    }),
-                );
-            } else {
-                set_text_color(hdc, COLORREF(palette.text));
-            }
-
-            draw_text(
-                hdc,
-                &line,
-                &mut row_rect,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-            );
+        let offset = unsafe { popup_state_pointer(hwnd).as_ref() }
+            .and_then(|s| s.try_borrow().ok())
+            .and_then(|s| s.scroll_offset);
+        if let Some(offset) = offset {
+            layout.set_scroll(offset);
         }
+        let presented =
+            font.is_some() && paint_candidate_body(hdc, snapshot, dpi, palette, &layout);
 
         if let (Some(status), Some(rect)) = (status, layout.status) {
             let padding = scaled(8, dpi).min(rect.width() / 2).max(0);
@@ -1422,7 +1645,179 @@ mod windows_impl {
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
             );
         }
+        if presented {
+            if let Some(state) = unsafe { popup_state_pointer(hwnd).as_ref() } {
+                if let Ok(mut state) = state.try_borrow_mut() {
+                    if state.snapshot.as_ref() == Some(snapshot)
+                        && state.dpi == dpi
+                        && state.ai_status == *status
+                        && state.scroll_offset == offset
+                    {
+                        state.presented = Some(PresentedCandidates {
+                            snapshot: snapshot.clone(),
+                            dpi,
+                            status: *status,
+                            offset,
+                            client: rect_from_windows(client),
+                            window: rect_from_windows(window),
+                            candidates: layout.candidates,
+                        });
+                    }
+                }
+            }
+        }
         drop(font);
+    }
+
+    fn paint_candidate_body(
+        hdc: HDC,
+        snapshot: &CandidatePopupSnapshot,
+        dpi: u32,
+        palette: PopupPalette,
+        layout: &PopupLayout,
+    ) -> bool {
+        // Clip both text and highlight before painting the separately owned status.
+        let saved = save_candidate_dc(hdc);
+        if saved == 0 {
+            return false;
+        }
+        let clipped = clip_candidate_dc(hdc, layout.viewport);
+        // ERROR means no clipping guarantee. NULLREGION is a valid empty frame,
+        // but likewise cannot authorize any candidate mouse target.
+        if clipped == 0 || clipped == 1 {
+            let _ = unsafe { RestoreDC(hdc, saved) };
+            return false;
+        }
+        for (index, (row, lines)) in layout.full_rows.iter().zip(&layout.lines).enumerate() {
+            let row = PopupRect::new(
+                row.left,
+                row.top - layout.scroll,
+                row.right,
+                row.bottom - layout.scroll,
+            );
+            if row.bottom <= layout.viewport.top || row.top >= layout.viewport.bottom {
+                continue;
+            }
+            let width = lines
+                .iter()
+                .filter_map(|s| measured_width(hdc, s))
+                .max()
+                .unwrap_or(0);
+            let highlighted = snapshot.highlighted == Some(index);
+            if highlighted {
+                let visible = PopupRect::new(
+                    row.left,
+                    row.top.max(layout.viewport.top),
+                    row.right,
+                    row.bottom.min(layout.viewport.bottom),
+                );
+                let highlight = candidate_highlight_rect(visible, width, dpi);
+                let painted = fill_candidate_highlight(
+                    hdc,
+                    &highlight,
+                    dpi,
+                    COLORREF(palette.highlight),
+                    COLORREF(palette.background),
+                );
+                set_text_color(
+                    hdc,
+                    COLORREF(if painted {
+                        palette.highlight_text
+                    } else {
+                        palette.text
+                    }),
+                );
+            } else {
+                set_text_color(hdc, COLORREF(palette.text));
+            }
+
+            for (line_index, line) in lines.iter().enumerate() {
+                let top = row.top + line_index as i32 * layout.line_height;
+                let mut line_rect = windows_rect(PopupRect::new(
+                    row.left,
+                    top,
+                    row.right,
+                    (top + layout.line_height).min(row.bottom),
+                ));
+                draw_text(
+                    hdc,
+                    line,
+                    &mut line_rect,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                );
+            }
+        }
+        let _ = unsafe { RestoreDC(hdc, saved) };
+        if layout.max_scroll > 0 {
+            // A slim track and thumb advertise internal scrolling without engine paging.
+            let track = PopupRect::new(
+                (layout.size.width - scaled(3, dpi)).max(0),
+                layout.viewport.top,
+                layout.size.width,
+                layout.viewport.bottom,
+            );
+            fill_rect(hdc, &windows_rect(track), COLORREF(palette.background));
+            let thumb_height = (track.height() / 4).max(1);
+            let top = track.top
+                + ((i64::from(track.height() - thumb_height) * i64::from(layout.scroll))
+                    / i64::from(layout.max_scroll)) as i32;
+            fill_rect(
+                hdc,
+                &windows_rect(PopupRect::new(
+                    track.left,
+                    top,
+                    track.right,
+                    top + thumb_height,
+                )),
+                COLORREF(palette.highlight),
+            );
+        }
+        true
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static CANDIDATE_CLIP_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    }
+
+    fn save_candidate_dc(hdc: HDC) -> i32 {
+        #[cfg(test)]
+        if CANDIDATE_CLIP_FAULT.with(|fault| fault.get() == 1) {
+            return 0;
+        }
+        // SAFETY: The caller owns a live paint or memory DC.
+        unsafe { SaveDC(hdc) }
+    }
+
+    fn clip_candidate_dc(hdc: HDC, viewport: PopupRect) -> i32 {
+        #[cfg(test)]
+        match CANDIDATE_CLIP_FAULT.with(|fault| fault.get()) {
+            2 => {
+                // Simulate an error after a DC mutation to verify restoration.
+                unsafe {
+                    IntersectClipRect(hdc, 0, 0, 1, 1);
+                }
+                return 0;
+            }
+            3 => {
+                unsafe {
+                    IntersectClipRect(hdc, 0, 0, 0, 0);
+                }
+                return 1;
+            }
+            _ => {}
+        }
+        // SAFETY: The DC is live and SaveDC succeeded.
+        unsafe {
+            IntersectClipRect(
+                hdc,
+                viewport.left,
+                viewport.top,
+                viewport.right,
+                viewport.bottom,
+            )
+        }
+        .0
     }
 
     // Uses the currently selected paint font, not the engine's paging estimate.
@@ -1723,6 +2118,615 @@ mod windows_impl {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, DeleteDC, GetPixel, HBITMAP,
         };
+
+        struct FrameSurface {
+            dc: HDC,
+            bitmap: HBITMAP,
+            previous: HGDIOBJ,
+            client: RECT,
+        }
+
+        impl FrameSurface {
+            fn new(hwnd: HWND) -> Self {
+                let mut client = RECT::default();
+                unsafe {
+                    GetClientRect(hwnd, &mut client).unwrap();
+                }
+                let dc = unsafe { CreateCompatibleDC(None) };
+                assert!(!dc.is_invalid());
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: client.right,
+                        biHeight: -client.bottom,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let bitmap =
+                    unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                        .unwrap();
+                let previous = unsafe { SelectObject(dc, bitmap) };
+                Self {
+                    dc,
+                    bitmap,
+                    previous,
+                    client,
+                }
+            }
+
+            fn paint(&self, hwnd: HWND) {
+                let data = popup_render_data(hwnd);
+                // Exactly the production contents path, including presented-frame
+                // invalidation/publication through the real HWND's PopupState.
+                paint_popup_contents(hwnd, self.dc, self.client, data.as_ref());
+            }
+        }
+
+        impl Drop for FrameSurface {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SelectObject(self.dc, self.previous);
+                    let _ = DeleteObject(self.bitmap);
+                    let _ = DeleteDC(self.dc);
+                }
+            }
+        }
+
+        fn paint_native_test_frame(hwnd: HWND) {
+            FrameSurface::new(hwnd).paint(hwnd);
+        }
+
+        #[test]
+        fn clip_failures_disable_real_state_hits_until_successful_frame() {
+            use windows::Win32::Graphics::Gdi::{GdiFlush, GetClipBox};
+            struct ResetFault;
+            impl Drop for ResetFault {
+                fn drop(&mut self) {
+                    CANDIDATE_CLIP_FAULT.with(|fault| fault.set(0));
+                }
+            }
+            let _reset = ResetFault;
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let mut snapshot = long_snapshot();
+            popup.update(&snapshot).unwrap();
+            popup.set_ai_status(AiStatus::Waiting).unwrap();
+            popup.set_theme(Theme::Light).unwrap();
+            unsafe {
+                SetWindowPos(
+                    popup.hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    240,
+                    160,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            // A partial first row is deliberately scrolled across the viewport edge.
+            popup.state.as_ref().unwrap().borrow_mut().scroll_offset = Some(11);
+            let surface = FrameSurface::new(popup.hwnd);
+            let point = PopupPoint { x: 8, y: 10 };
+            assert_eq!(popup_action_at(popup.hwnd, point), None);
+            surface.paint(popup.hwnd);
+            assert!(matches!(
+                popup_action_at(popup.hwnd, point),
+                Some(CandidatePopupAction::Select { .. })
+            ));
+            let mut expected_status = Vec::new();
+            for fault in [1, 2, 3] {
+                CANDIDATE_CLIP_FAULT.with(|value| value.set(fault));
+                let mut before = RECT::default();
+                unsafe {
+                    GetClipBox(surface.dc, &mut before);
+                }
+                surface.paint(popup.hwnd);
+                assert!(unsafe { GdiFlush() }.as_bool());
+                let mut after = RECT::default();
+                unsafe {
+                    GetClipBox(surface.dc, &mut after);
+                }
+                assert_eq!(rect_from_windows(before), rect_from_windows(after));
+                assert!(
+                    popup.state.as_ref().unwrap().borrow().presented.is_none(),
+                    "fault {fault}"
+                );
+                for y in 0..138 {
+                    for x in 0..240 {
+                        assert_eq!(
+                            unsafe { GetPixel(surface.dc, x, y) }.0,
+                            0xffffff,
+                            "fault {fault}: candidate pixels cannot escape or remain visible"
+                        );
+                        assert_eq!(popup_action_at(popup.hwnd, PopupPoint { x, y }), None);
+                    }
+                }
+                let mut status_pixels = Vec::new();
+                for y in 138..160 {
+                    for x in 0..240 {
+                        status_pixels.push(unsafe { GetPixel(surface.dc, x, y) }.0);
+                        assert_eq!(popup_action_at(popup.hwnd, PopupPoint { x, y }), None);
+                    }
+                }
+                assert!(
+                    status_pixels.iter().any(|p| *p != 0xffffff),
+                    "status still drawn after restoring DC"
+                );
+                if fault == 1 {
+                    expected_status = status_pixels;
+                } else {
+                    assert_eq!(
+                        status_pixels, expected_status,
+                        "no status pollution at fault {fault}"
+                    );
+                }
+                CANDIDATE_CLIP_FAULT.with(|value| value.set(0));
+                surface.paint(popup.hwnd);
+                assert!(matches!(
+                    popup_action_at(popup.hwnd, point),
+                    Some(CandidatePopupAction::Select {
+                        revision: 71,
+                        page: 3,
+                        index: 0
+                    })
+                ));
+            }
+            // A successful old frame cannot authorize a new identity or geometry,
+            // even if the geometry is subsequently restored to its old dimensions.
+            snapshot.revision += 1;
+            popup.update(&snapshot).unwrap();
+            assert_eq!(popup_action_at(popup.hwnd, point), None);
+            let surface = FrameSurface::new(popup.hwnd);
+            surface.paint(popup.hwnd);
+            assert!(popup_action_at(popup.hwnd, point).is_some());
+            for width in [241, surface.client.right] {
+                unsafe {
+                    SetWindowPos(
+                        popup.hwnd,
+                        HWND::default(),
+                        0,
+                        0,
+                        width,
+                        surface.client.bottom,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    )
+                    .unwrap();
+                }
+                assert_eq!(popup_action_at(popup.hwnd, point), None);
+            }
+            surface.paint(popup.hwnd);
+            assert!(popup_action_at(popup.hwnd, point).is_some());
+            popup.destroy().unwrap();
+        }
+
+        fn long_snapshot() -> CandidatePopupSnapshot {
+            CandidatePopupSnapshot {
+                revision: 71,
+                preedit: "chang".into(),
+                candidates: vec![
+                    crate::engine::Candidate::new(
+                        "完整候选文字需要显示直到最后一个尾字".repeat(4),
+                        "",
+                    ),
+                    crate::engine::Candidate::new(
+                        "中英English😀𠮷混合".repeat(7),
+                        crate::ai::AI_COMMENT,
+                    ),
+                    crate::engine::Candidate::new("短", ""),
+                ],
+                highlighted: Some(0),
+                page: 3,
+                page_count: 9,
+            }
+        }
+
+        #[test]
+        fn long_candidates_gdi_wrap_preserves_tail_scalar_and_ai_marker() {
+            let snapshot = long_snapshot();
+            for dpi in [96, 144, 192, 480] {
+                let dc = MeasureDc::new().unwrap();
+                let _font = PaintFont::new(dc.0, dpi).unwrap();
+                for logical_width in [160, 560] {
+                    let bounds = PopupSize::new(scaled(logical_width, dpi), scaled(2400, dpi));
+                    let layout = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
+                    assert_eq!(layout.full_rows.len(), snapshot.candidates.len());
+                    assert!(layout.lines[0].len() > 1);
+                    for (i, lines) in layout.lines.iter().enumerate() {
+                        let full = format!("{}. {}", i + 1, snapshot.candidates[i].display_text());
+                        assert_eq!(lines.concat(), full, "no lost tail or inserted ellipsis");
+                        assert_eq!(
+                            lines.len() as i32 * layout.line_height,
+                            layout.full_rows[i].height()
+                        );
+                        for line in lines {
+                            assert!(
+                                measured_width(dc.0, line).unwrap()
+                                    <= layout.full_rows[i].width() - scaled(6, dpi)
+                            );
+                        }
+                        assert!(lines
+                            .iter()
+                            .skip(1)
+                            .all(|s| !s.starts_with(&format!("{}. ", i + 1))));
+                    }
+                    assert!(layout.lines[0].last().unwrap().ends_with('字'));
+                    assert!(layout.lines[1].concat().ends_with("✓ AI"));
+                    for (index, row) in layout.candidates.candidates.iter().enumerate() {
+                        for y in row.top..row.bottom {
+                            assert_eq!(
+                                layout
+                                    .candidates
+                                    .hit_test(&snapshot, PopupPoint { x: row.left, y }),
+                                Some(CandidatePopupAction::Select {
+                                    revision: 71,
+                                    page: 3,
+                                    index
+                                })
+                            );
+                        }
+                    }
+                    let status = layout.status.unwrap();
+                    assert_eq!(
+                        layout.candidates.hit_test(
+                            &snapshot,
+                            PopupPoint {
+                                x: 20,
+                                y: status.top
+                            }
+                        ),
+                        None
+                    );
+                    assert!(
+                        layout.size.width <= bounds.width && layout.size.height <= bounds.height
+                    );
+                    let caret = PopupRect::new(999, 899, 1000, 900);
+                    let work = PopupRect::new(0, 0, bounds.width, bounds.height);
+                    let placed = position_candidate_popup(caret, layout.size, work).unwrap();
+                    assert!(placed.left >= 0 && placed.top >= 0);
+                    assert!(placed.right <= work.right && placed.bottom <= work.bottom);
+                }
+            }
+        }
+
+        #[test]
+        fn internal_scroll_reaches_every_line_without_changing_snapshot_or_status() {
+            let mut snapshot = long_snapshot();
+            let original = snapshot.clone();
+            for dpi in [96, 144, 192, 480] {
+                let bounds = PopupSize::new(scaled(240, dpi), scaled(160, dpi));
+                let mut layout = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
+                assert!(layout.max_scroll > 0);
+                for (index, row) in layout.full_rows.clone().iter().enumerate() {
+                    for y in (row.top..row.bottom).step_by(layout.line_height as usize) {
+                        layout.set_scroll(y - layout.viewport.top);
+                        let visible_y = y - layout.scroll;
+                        assert!(
+                            visible_y >= layout.viewport.top && visible_y < layout.viewport.bottom
+                        );
+                        assert_eq!(
+                            layout.candidates.hit_test(
+                                &snapshot,
+                                PopupPoint {
+                                    x: row.left,
+                                    y: visible_y
+                                }
+                            ),
+                            Some(CandidatePopupAction::Select {
+                                revision: 71,
+                                page: 3,
+                                index
+                            })
+                        );
+                    }
+                }
+                layout.set_scroll(i32::MAX);
+                assert_eq!(layout.scroll, layout.max_scroll);
+                assert_eq!(
+                    layout.candidates.hit_test(
+                        &snapshot,
+                        PopupPoint {
+                            x: 10,
+                            y: layout.status.unwrap().top
+                        }
+                    ),
+                    None
+                );
+                assert_eq!(snapshot, original);
+                snapshot.highlighted = Some(2);
+                let highlighted = PopupLayout::new(&snapshot, dpi, bounds, Some(AiStatus::Waiting));
+                let row = highlighted.candidates.candidates[2];
+                assert_eq!(row.height(), highlighted.line_height);
+                snapshot.highlighted = original.highlighted;
+                for height in [1, 7, 20, 40] {
+                    let tiny = PopupLayout::new(
+                        &snapshot,
+                        dpi,
+                        PopupSize::new(20, height),
+                        Some(AiStatus::Waiting),
+                    );
+                    assert!(tiny.candidates.candidates.is_empty());
+                    assert_eq!(
+                        tiny.candidates
+                            .hit_test(&snapshot, PopupPoint { x: 1, y: 1 }),
+                        None
+                    );
+                    assert!(tiny.size.width <= 20 && tiny.size.height <= height);
+                }
+            }
+        }
+
+        #[test]
+        fn native_wheel_and_hit_testing_share_scroll_without_engine_page_change() {
+            use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_MOUSEWHEEL};
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let snapshot = long_snapshot();
+            popup.update(&snapshot).unwrap();
+            popup.set_ai_status(AiStatus::Waiting).unwrap();
+            unsafe {
+                SetWindowPos(
+                    popup.hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    240,
+                    160,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .unwrap();
+            }
+            let mut layout = PopupLayout::new(
+                &snapshot,
+                96,
+                PopupSize::new(240, 160),
+                Some(AiStatus::Waiting),
+            );
+            assert_eq!(layout.scroll, 0);
+            unsafe {
+                SendMessageW(
+                    popup.hwnd,
+                    WM_MOUSEWHEEL,
+                    WPARAM(((-120i16) as u16 as usize) << 16),
+                    LPARAM(0),
+                );
+            }
+            let state = popup.state.as_ref().unwrap().borrow();
+            assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+            let offset = state.scroll_offset.unwrap();
+            assert_eq!(offset, layout.line_height);
+            drop(state);
+            layout.set_scroll(offset);
+            assert_eq!(
+                popup_action_at(popup.hwnd, PopupPoint { x: 8, y: 10 }),
+                None
+            );
+            paint_native_test_frame(popup.hwnd);
+            for y in layout.viewport.top..layout.viewport.bottom {
+                let point = PopupPoint {
+                    x: scaled(8, 96),
+                    y,
+                };
+                assert_eq!(
+                    popup_action_at(popup.hwnd, point),
+                    layout.candidates.hit_test(&snapshot, point)
+                );
+            }
+            assert_eq!(
+                popup_action_at(popup.hwnd, PopupPoint { x: 20, y: 150 }),
+                None
+            );
+            let mut next = snapshot.clone();
+            next.highlighted = Some(2);
+            popup.update(&next).unwrap();
+            assert!(popup
+                .state
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .scroll_offset
+                .is_none());
+            popup.destroy().unwrap();
+        }
+
+        #[test]
+        fn native_visible_refresh_and_highlight_remain_in_work_area() {
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+            let mut popup = CandidatePopupWindow::new().unwrap();
+            let mut snapshot = long_snapshot();
+            snapshot.candidates = (0..9).map(|_| snapshot.candidates[0].clone()).collect();
+            popup.update(&snapshot).unwrap();
+            popup.set_ai_status(AiStatus::Waiting).unwrap();
+            popup.show_at(PopupRect::new(10, 10, 11, 30)).unwrap();
+            snapshot.highlighted = Some(8);
+            snapshot.revision += 1;
+            popup.update(&snapshot).unwrap();
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(popup.hwnd, &mut rect).unwrap();
+            }
+            let work = monitor_work_area(rect_from_windows(rect)).unwrap();
+            assert!(rect.left >= work.left && rect.top >= work.top);
+            assert!(rect.right <= work.right && rect.bottom <= work.bottom);
+            let state = popup.state.as_ref().unwrap().borrow();
+            let layout = PopupLayout::new(
+                &snapshot,
+                state.dpi,
+                PopupSize::new(rect.right - rect.left, rect.bottom - rect.top),
+                state.ai_status,
+            );
+            drop(state);
+            let row = layout.candidates.candidates[8];
+            assert!(row.height() > 0);
+            paint_native_test_frame(popup.hwnd);
+            assert_eq!(
+                popup_action_at(
+                    popup.hwnd,
+                    PopupPoint {
+                        x: row.left,
+                        y: row.top
+                    }
+                ),
+                Some(CandidatePopupAction::Select {
+                    revision: snapshot.revision,
+                    page: 3,
+                    index: 8
+                })
+            );
+            popup.destroy().unwrap();
+        }
+
+        #[test]
+        fn offscreen_production_body_paints_last_glyph_without_status_pollution() {
+            use windows::Win32::Graphics::Gdi::GdiFlush;
+            struct Surface {
+                dc: HDC,
+                bitmap: HBITMAP,
+                previous: HGDIOBJ,
+            }
+            impl Drop for Surface {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = SelectObject(self.dc, self.previous);
+                        let _ = DeleteObject(self.bitmap);
+                        let _ = DeleteDC(self.dc);
+                    }
+                }
+            }
+            let mut snapshot = long_snapshot();
+            snapshot.highlighted = None;
+            for dpi in [96, 144, 192, 480] {
+                let layout = PopupLayout::new(
+                    &snapshot,
+                    dpi,
+                    PopupSize::new(scaled(560, dpi), scaled(1600, dpi)),
+                    Some(AiStatus::Waiting),
+                );
+                assert_eq!(layout.max_scroll, 0);
+                let width = layout.size.width;
+                let height = layout.size.height;
+                let dc = unsafe { CreateCompatibleDC(None) };
+                assert!(!dc.is_invalid());
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: width,
+                        biHeight: -height,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits = std::ptr::null_mut();
+                let bitmap =
+                    unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+                        .unwrap();
+                let previous = unsafe { SelectObject(dc, bitmap) };
+                let _surface = Surface {
+                    dc,
+                    bitmap,
+                    previous,
+                };
+                let _font = PaintFont::new(dc, dpi).unwrap();
+                unsafe {
+                    SetBkMode(dc, TRANSPARENT);
+                }
+                fill_rect(
+                    dc,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    COLORREF(0xffffff),
+                );
+                paint_candidate_body(dc, &snapshot, dpi, super::super::LIGHT_PALETTE, &layout);
+                assert!(unsafe { GdiFlush() }.as_bool());
+                // The final Chinese scalar is not merely retained in a string: it has ink
+                // in its measured final-glyph box on the production offscreen drawing.
+                let line = layout.lines[0].last().unwrap();
+                let (tail, _) = line.char_indices().last().unwrap();
+                let x = layout.full_rows[0].left + measured_width(dc, &line[..tail]).unwrap();
+                let right = layout.full_rows[0].left + measured_width(dc, line).unwrap();
+                let bottom = layout.full_rows[0].bottom;
+                let mut ink = 0;
+                for y in bottom - layout.line_height..bottom {
+                    for x in x..right {
+                        if unsafe { GetPixel(dc, x, y) }.0 != 0xffffff {
+                            ink += 1;
+                        }
+                    }
+                }
+                assert!(ink > 0, "last glyph has visible pixels at {dpi} DPI");
+                let status = layout.status.unwrap();
+                for y in status.top..status.bottom {
+                    for x in 0..width {
+                        assert_eq!(unsafe { GetPixel(dc, x, y) }.0, 0xffffff);
+                    }
+                }
+                let save_bitmap = |suffix: &str| {
+                    let Some(directory) = std::env::var_os("FLOWER_POPUP_TEST_ARTIFACTS") else {
+                        return;
+                    };
+                    let path = std::path::PathBuf::from(directory);
+                    std::fs::create_dir_all(&path).unwrap();
+                    let pixels = unsafe {
+                        std::slice::from_raw_parts(bits.cast::<u8>(), (width * height * 4) as usize)
+                    };
+                    let mut bmp = Vec::new();
+                    bmp.extend_from_slice(b"BM");
+                    bmp.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+                    bmp.extend_from_slice(&[0; 4]);
+                    bmp.extend_from_slice(&54u32.to_le_bytes());
+                    bmp.extend_from_slice(&40u32.to_le_bytes());
+                    bmp.extend_from_slice(&width.to_le_bytes());
+                    bmp.extend_from_slice(&(-height).to_le_bytes());
+                    bmp.extend_from_slice(&1u16.to_le_bytes());
+                    bmp.extend_from_slice(&32u16.to_le_bytes());
+                    bmp.extend_from_slice(&[0; 24]);
+                    bmp.extend_from_slice(pixels);
+                    std::fs::write(path.join(format!("long-candidates-{dpi}{suffix}.bmp")), bmp)
+                        .unwrap();
+                };
+                save_bitmap("");
+                let mut selected = snapshot.clone();
+                selected.highlighted = Some(0);
+                fill_rect(
+                    dc,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    COLORREF(0xffffff),
+                );
+                paint_candidate_body(dc, &selected, dpi, super::super::LIGHT_PALETTE, &layout);
+                assert!(unsafe { GdiFlush() }.as_bool());
+                let max_width = layout.lines[0]
+                    .iter()
+                    .map(|s| measured_width(dc, s).unwrap())
+                    .max()
+                    .unwrap();
+                let x = layout.full_rows[0].left + max_width + scaled(3, dpi);
+                for line in 0..layout.lines[0].len() {
+                    let y = layout.full_rows[0].top
+                        + line as i32 * layout.line_height
+                        + layout.line_height / 2;
+                    assert_eq!(
+                        unsafe { GetPixel(dc, x, y) },
+                        COLORREF(super::super::LIGHT_PALETTE.highlight)
+                    );
+                }
+                save_bitmap("-highlight");
+            }
+        }
 
         #[test]
         fn ai_status_layout_preserves_candidates_and_excludes_status_hits() {

@@ -49,6 +49,29 @@ fn unchanged_and_confident_single_substitution() {
 }
 
 #[test]
+fn uncertain_or_non_han_prediction_does_not_veto_another_confident_correction() {
+    let text = "今天新情很好";
+    let (mut vocab, ids, mut logits) = fixture(text);
+    let shape = [1, 8, V as i64];
+    vocab[500] = "心".into();
+    logits[3 * V + ids[2] as usize] = 0.0;
+    logits[3 * V + 500] = 20.0;
+    vocab[501] = "明".into();
+    logits[V + ids[0] as usize] = 19.0;
+    logits[V + 501] = 20.0;
+    assert_eq!(
+        inference::filter_logits(text, &ids, &vocab, &shape, &logits).unwrap(),
+        Some("今天心情很好".into())
+    );
+    vocab[501] = "##明".into();
+    logits[V + ids[0] as usize] = 0.0;
+    assert_eq!(
+        inference::filter_logits(text, &ids, &vocab, &shape, &logits).unwrap(),
+        Some("今天心情很好".into())
+    );
+}
+
+#[test]
 fn rejects_bad_shape_nonfinite_tokens_and_excess_changes() {
     let text = "今天新情很好";
     let (mut vocab, ids, mut logits) = fixture(text);

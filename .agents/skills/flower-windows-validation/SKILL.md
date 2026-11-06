@@ -71,7 +71,7 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 用真实WM_TIMER消息泵驱动隔离TSF异步读会话，分别证明私密范围0请求、None响应状态、超过旧1秒但在新预算内可发布；手动调用idle不能代替timer投递证据。真实AiClient+管道人工1.2秒响应可验证期限与取消join，但不冒充真实模型或浏览器验收。
 - 固定模型及ORT必须对照源码内嵌可信manifest，不接受用户bundle自签清单；核对九文件完整大小/摘要、词表特殊ID和许可来源。原生DLL显式绝对路径加载与限制依赖搜索不替代生产安装目录及祖先ACL保护。TSF DLL不引用ORT推理模块；额外运行库仅在AI私有白名单中。
 - 源快照、request id、期限、epoch、revision、焦点/context generation都要覆盖；无回包也必须主动失效并清理源文本。真实TSF `SetFocus(None)` 成功不保证平台查询立即无top context，fixture要断言实际状态；保留原动作和预期，不以降低断言掩盖环境差异。后台shutdown需取消完成并join后才释放DLL计数。
-- 模型质量用预先固定的正确句和错句分组，保存raw输出与过滤结果，分别报误改、漏报和金标命中；不要为演示降低阈值或把小样本当泛化准确率。转换仓库无独立许可、训练数据未审计等限制必须随最终包的共同README携带，源码旁说明不足以证明随包告知。
+- 模型质量用预先固定的正确句和错句分组，保存raw输出与过滤结果，分别报误改、漏报、部分纠正和完整金标命中；不要为演示降低阈值或把小样本当泛化准确率。若整句被一处低置信拟替换连带否决，先以同批真实logits比较逐字保留原字与整句否决，再决定策略；0.4.11保持0.98/4并逐字保留，降至0.95/3出现他/她误改反例。模型直输正例和builtin拼音→实际首候选→AI插入须分别证明，忽略测试必须实际命中。转换仓库无独立许可、训练数据未审计等限制必须随最终包的共同README携带，源码旁说明不足以证明随包告知。
 - 0.4.7起只构建内置AI的标准文件名，CLI和实际构建API都必须显式提供资产，不能回退base；内部variant=ai、AI可用记录、九文件固定摘要和安装器source ZIP关联仍须完整验证。旧0.4.6两变体的只读兼容不等于允许新构建生成普通包，历史制品不可覆盖。新依赖许可证若不识别，按实际完整正文增加窄识别与失败用例，不能凭SPDX/文件名绕过；ISC须包括授权、通知保留、无担保及责任排除，原始字节仍随包。
 - AI正向验收须从真实内置词库的 `ai_input()` 源文本经固定模型，明确assert非None金标、注入、选择及不学习；允许所有输入None的探针不证明纠错可见。模型纠正文已有普通候选时应按契约复用并标记来源，不能去重后静默丢弃；遍历全部页检查无重复，标记仅在显示路径。普通词条fixture和单独模型probe不能替代这项信号。
 - 中文标点需证明无预编辑时的真实TSF插入，而不仅是引擎产生commit。无composition不可访问composition范围；用当前写cookie的InsertTextAtSelection及强类型flags直接插入并移光标。覆盖组词确认再追加、尾部raw保留、引号OnTest预测不改变方向、快捷键/英文直通和原翻页键；不注入全局键或读取用户文档。
@@ -98,6 +98,11 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - `isolated_user_copy_` 五项测试默认忽略，必须使用本 Thread 的 `FLOWER_INSTALL_PATH_TEST_SCRATCH` 显式运行 `cargo test --lib isolated_user_copy_ -- --ignored`。只操作独占新建 fixture；提升进程在 I/O 前应明确失败，不以空 return 假通过。假 EXE 只当数据，不执行，不需要真实安装。
 - GetTextExt 无布局、clipped 和无效 RECT 是不同情况；有效 caret 可零宽但须正高度。编辑会话内优先文字位置，其次关联 view HWND 的 GUI caret，最后可用有效 viewport 边缘作粗锚，不能称精确 caret。焦点/token/revision 门禁不放宽；popup 普通 Z 序提升且 NOACTIVATE，非 TOPMOST。
 - 横向候选布局与绘制/命中同源，不画拼音头部或 comment；页大小可达99，不能沿用32项截断。极小区域整页退化无鼠标区域，保留键盘语义。截图/隔离几何测试均不替代 Edge 实机证据。
+
+## 长候选与原生兼容增量
+
+- 0.4.11长候选按实际PaintFont/GDI字宽在Unicode标量边界换行，窗口内部滚动不改引擎页；必须验证末字实际像素、AI显示标记、滚动命中、状态行隔离和可见刷新工作区限界。SaveDC/IntersectClipRect失败须停止候选绘制并恢复DC；鼠标命中只由成功呈现且快照/DPI/状态/滚动/客户区/窗口几何仍匹配的帧授权，不能重建不可见候选选择区。故障注入与真实HWND生产state验证可覆盖这一分支，无需重跑无关词库/持久化套件。
+- 原生AI兼容边界以design/long-candidates-and-ai-compatibility.md为准，需遵守用户已明确授权的隐私取舍；不能把同进程类名或非密码style单独当安全声明。当前实现限定四类声明缺失/失败并组合焦点/context view、PID/TID、原生类、style和类过程密码字符检查；明确敏感仍拒，本地学习不回退。SendMessageTimeout在同消息队列会忽略超时，跨线程超时夹具不能证明同线程生产有界；GetClassLongPtrW/CallWindowProcW只读类过程检查须验证绕过应用子类拦截后仍读取真实掩码，不宣称可抢占任意宿主/系统代码。
 
 ## 用户词典发布前进程终止回归
 

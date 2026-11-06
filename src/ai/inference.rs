@@ -155,12 +155,14 @@ pub fn filter_logits(
         }
         let denominator: f64 = row.iter().map(|&v| ((v as f64) - max as f64).exp()).sum();
         if 1.0 / denominator < 0.98 || max - row[ids[position] as usize] < 4.0 {
-            return Ok(None);
+            corrected.push(original);
+            continue;
         }
         let mut chars = vocab[best].chars();
         let c = chars.next().ok_or("AI output invalid")?;
         if chars.next().is_some() || !('\u{4e00}'..='\u{9fff}').contains(&c) {
-            return Ok(None);
+            corrected.push(original);
+            continue;
         }
         corrected.push(c);
     }

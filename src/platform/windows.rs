@@ -1356,6 +1356,7 @@ mod windows_exports {
             learning_scope_value_is_safe(s.0)
                 || matches!(policy, ScopePolicy::Ai)
                     && [
+                        IS_FILE_FILENAME,
                         IS_SEARCH,
                         IS_SEARCH_INCREMENTAL,
                         IS_CHINESE_HALFWIDTH,
@@ -1381,7 +1382,12 @@ mod windows_exports {
             assert!(!learning_scope_value_is_safe(scope));
         }
         use windows::Win32::UI::TextServices::InputScope;
-        for scope in [0, 50, 52, 53, 54, 55, 57, 58, 68] {
+        assert_eq!(
+            scope_policy(&[InputScope(3)], ScopePolicy::Learning),
+            Err(ScopeBlockReason::Unsupported)
+        );
+        assert!(!learning_scope_value_is_safe(3));
+        for scope in [0, 3, 50, 52, 53, 54, 55, 57, 58, 68] {
             assert_eq!(scope_policy(&[InputScope(scope)], ScopePolicy::Ai), Ok(()));
         }
         assert_eq!(
@@ -1399,6 +1405,126 @@ mod windows_exports {
     }
 
     fn check_scope(
+        context: &ITfContext,
+        cookie: u32,
+        policy: ScopePolicy,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        let result = application_scope(context, cookie, policy);
+        match result {
+            Err(reason)
+                if native_scope_fallback_allowed(policy, reason) && native_edit_scope(context) =>
+            {
+                Ok(())
+            }
+            _ => result,
+        }
+    }
+
+    fn native_scope_fallback_allowed(policy: ScopePolicy, reason: ScopeBlockReason) -> bool {
+        matches!(policy, ScopePolicy::Ai)
+            && matches!(
+                reason,
+                ScopeBlockReason::Property
+                    | ScopeBlockReason::Value
+                    | ScopeBlockReason::Undeclared
+                    | ScopeBlockReason::Empty
+            )
+    }
+
+    fn native_edit_scope(context: &ITfContext) -> bool {
+        // Called only on the edit-session thread, never cached between sending
+        // and publication. No document text or window title is inspected.
+        unsafe {
+            let Ok(view) = context.GetActiveView() else {
+                return false;
+            };
+            let Ok(window) = view.GetWnd() else {
+                return false;
+            };
+            native_edit_window(window, || {
+                context.GetActiveView().and_then(|v| v.GetWnd()).ok()
+            })
+        }
+    }
+
+    unsafe fn native_edit_window(
+        window: windows::Win32::Foundation::HWND,
+        current_view: impl Fn() -> Option<windows::Win32::Foundation::HWND>,
+    ) -> bool {
+        use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
+        use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let focus = GetFocus();
+        let identity = || {
+            let owned = |hwnd| {
+                let mut process = 0;
+                IsWindow(hwnd).as_bool()
+                    && GetWindowThreadProcessId(hwnd, Some(&mut process)) == GetCurrentThreadId()
+                    && process == GetCurrentProcessId()
+            };
+            owned(window)
+                && owned(focus)
+                && GetFocus() == focus
+                && (window == focus || IsChild(window, focus).as_bool())
+        };
+        if !identity() {
+            return false;
+        }
+        let attributes = || {
+            let mut class = [0u16; 128];
+            let count = GetClassNameW(focus, &mut class);
+            if count <= 0 {
+                return false;
+            }
+            let class = String::from_utf16_lossy(&class[..count as usize]);
+            if ![
+                "Edit",
+                "RichEdit20A",
+                "RichEdit20W",
+                "RICHEDIT50A",
+                "RICHEDIT50W",
+                "RichEditD2DPT",
+            ]
+            .iter()
+            .any(|name| class.eq_ignore_ascii_case(name))
+            {
+                return false;
+            }
+            SetLastError(WIN32_ERROR(0));
+            let style = GetWindowLongW(focus, GWL_STYLE);
+            if style == 0 && GetLastError() != WIN32_ERROR(0) {
+                return false;
+            }
+            style as u32 & (0x20 | 0x800 | WS_DISABLED.0) == 0
+        };
+        if !attributes() {
+            return false;
+        }
+        let password_clear = native_password_clear(focus);
+        // Querying the view can call application COM code; recheck identity and
+        // attributes after it, as well as after the native class procedure.
+        password_clear && current_view() == Some(window) && identity() && attributes()
+    }
+
+    unsafe fn native_password_clear(focus: windows::Win32::Foundation::HWND) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CallWindowProcW, GetClassLongPtrW, GCLP_WNDPROC, WNDPROC,
+        };
+        let procedure = GetClassLongPtrW(focus, GCLP_WNDPROC);
+        if procedure == 0 {
+            return false;
+        }
+        // The caller has checked the native class and current-thread ownership.
+        // Use CallWindowProcW (not a direct function-pointer call), since Win32
+        // may return a special internal procedure value. Bypass per-window
+        // application subclass code for this read-only integer query. This
+        // relies on the standard class procedure, not a hard real-time timeout.
+        let procedure = std::mem::transmute::<usize, WNDPROC>(procedure);
+        CallWindowProcW(procedure, focus, 0xD2, WPARAM(0), LPARAM(0)).0 == 0
+    }
+
+    fn application_scope(
         context: &ITfContext,
         cookie: u32,
         policy: ScopePolicy,
@@ -3292,7 +3418,262 @@ mod windows_exports {
             GUID_PROP_INPUTSCOPE, TS_STATUS,
         };
 
+        thread_local! {
+            static COMPAT_VIEW: Cell<windows::Win32::Foundation::HWND> = const {
+                Cell::new(windows::Win32::Foundation::HWND(ptr::null_mut()))
+            };
+        }
+
+        #[implement(ITfEditSession)]
+        struct CompatScopeSession {
+            context: ITfContext,
+            expected: std::result::Result<(), ScopeBlockReason>,
+        }
+
+        impl ITfEditSession_Impl for CompatScopeSession_Impl {
+            fn DoEditSession(&self, cookie: u32) -> Result<()> {
+                assert!(native_edit_scope(&self.context));
+                assert_eq!(
+                    check_scope(&self.context, cookie, ScopePolicy::Ai),
+                    self.expected
+                );
+                assert!(!scope_allows_learning(&self.context, cookie));
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn native_compat_context_view_edit_and_richedit() {
+            use windows::core::{w, PCWSTR};
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .unwrap();
+            let _apartment = Apartment;
+            unsafe {
+                let module =
+                    windows::Win32::System::LibraryLoader::LoadLibraryW(w!("Msftedit.dll"))
+                        .unwrap();
+                for class in [w!("Edit"), w!("RICHEDIT50W")] {
+                    let window = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        class,
+                        PCWSTR::null(),
+                        WS_POPUP,
+                        0,
+                        0,
+                        100,
+                        30,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let previous = GetFocus();
+                    let _ = SetFocus(window);
+                    COMPAT_VIEW.with(|v| v.set(window));
+                    for private in [false, true] {
+                        let value = if private {
+                            let scope: IUnknown = TestScope(vec![61]).into();
+                            VARIANT::from(scope)
+                        } else {
+                            VARIANT::default()
+                        };
+                        let owner: IUnknown = ScopeOwner {
+                            value: RefCell::new(value),
+                            calls: Rc::new(Cell::new(0)),
+                            fail: false,
+                        }
+                        .into();
+                        let host = NativeDocument::with_owner(Some(&owner)).unwrap();
+                        let session: ITfEditSession = CompatScopeSession {
+                            context: host.context.clone(),
+                            expected: if private {
+                                Err(ScopeBlockReason::Sensitive)
+                            } else {
+                                Ok(())
+                            },
+                        }
+                        .into();
+                        host.context
+                            .RequestEditSession(host.client, &session, TF_ES_SYNC | TF_ES_READWRITE)
+                            .unwrap()
+                            .ok()
+                            .unwrap();
+                    }
+                    COMPAT_VIEW.with(|v| v.set(Default::default()));
+                    let _ = SetFocus(previous);
+                    DestroyWindow(window).unwrap();
+                }
+                windows::Win32::Foundation::FreeLibrary(module).unwrap();
+            }
+        }
+
         // Isolated ACP owner: never advises ITfContextOwner or changes the desktop.
+        #[test]
+        fn native_compat_class_query_bypasses_window_subclass() {
+            use windows::core::w;
+            use windows::Win32::Foundation::{HWND, LRESULT};
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            thread_local! {
+                static QUERY_CALLS: Cell<u32> = const { Cell::new(0) };
+                static ORIGINAL: Cell<WNDPROC> = const { Cell::new(None) };
+            }
+            unsafe extern "system" fn subclass(
+                window: HWND,
+                message: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                if message == 0xD2 {
+                    QUERY_CALLS.with(|v| v.set(v.get() + 1));
+                    return LRESULT('*' as isize);
+                }
+                CallWindowProcW(ORIGINAL.with(Cell::get), window, message, wparam, lparam)
+            }
+            unsafe {
+                let module =
+                    windows::Win32::System::LibraryLoader::LoadLibraryW(w!("Msftedit.dll"))
+                        .unwrap();
+                assert!(!native_password_clear(HWND::default()));
+                for class in [w!("Edit"), w!("RICHEDIT50W")] {
+                    let window = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        class,
+                        w!(""),
+                        WS_POPUP,
+                        0,
+                        0,
+                        100,
+                        30,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    let previous = GetFocus();
+                    let _ = SetFocus(window);
+                    let original =
+                        SetWindowLongPtrW(window, GWLP_WNDPROC, subclass as *const () as isize);
+                    assert_ne!(original, 0);
+                    ORIGINAL.with(|v| v.set(std::mem::transmute::<isize, WNDPROC>(original)));
+                    // Positive control: normal message dispatch hits the
+                    // subclass and observes its deliberately false mask.
+                    QUERY_CALLS.with(|v| v.set(0));
+                    assert_ne!(SendMessageW(window, 0xD2, WPARAM(0), LPARAM(0)).0, 0);
+                    assert_eq!(QUERY_CALLS.with(Cell::get), 1);
+                    QUERY_CALLS.with(|v| v.set(0));
+                    assert!(native_password_clear(window));
+                    assert!(native_edit_window(window, || Some(window)));
+                    assert_eq!(QUERY_CALLS.with(Cell::get), 0);
+                    SendMessageW(window, 0xCC, WPARAM('*' as usize), LPARAM(0));
+                    assert!(!native_password_clear(window));
+                    assert!(!native_edit_window(window, || Some(window)));
+                    assert_eq!(QUERY_CALLS.with(Cell::get), 0);
+                    SetWindowLongPtrW(window, GWLP_WNDPROC, original);
+                    ORIGINAL.with(|v| v.set(None));
+                    let _ = SetFocus(previous);
+                    DestroyWindow(window).unwrap();
+                    assert!(!native_password_clear(window));
+                }
+                windows::Win32::Foundation::FreeLibrary(module).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_compat_edit_window_and_policy() {
+            use windows::core::w;
+            use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            unsafe {
+                let edit = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("Edit"),
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    100,
+                    30,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let previous = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+                let _ = SetFocus(edit);
+                assert_eq!(
+                    windows::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
+                    edit
+                );
+                assert!(native_edit_window(edit, || Some(edit)));
+                assert!(!native_edit_window(edit, || None));
+                assert!(!native_edit_window(Default::default(), || Some(edit)));
+                assert!(!native_password_clear(windows::Win32::Foundation::HWND(
+                    1usize as *mut c_void,
+                )));
+                let other = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("Static"),
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    100,
+                    30,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert!(!native_edit_window(other, || Some(other)));
+                let _ = SetFocus(other);
+                assert!(!native_edit_window(other, || Some(other)));
+                let _ = SetFocus(edit);
+                DestroyWindow(other).unwrap();
+                for style in [0x20, 0x800, WS_DISABLED.0] {
+                    SetWindowLongW(edit, GWL_STYLE, (WS_POPUP.0 | style) as i32);
+                    assert!(!native_edit_window(edit, || Some(edit)));
+                }
+                SetWindowLongW(edit, GWL_STYLE, WS_POPUP.0 as i32);
+                SendMessageW(edit, 0xCC, WPARAM('*' as usize), LPARAM(0));
+                assert!(!native_edit_window(edit, || Some(edit)));
+                SendMessageW(edit, 0xCC, WPARAM(0), LPARAM(0));
+                assert!(native_edit_window(edit, || Some(edit)));
+                let _ = SetFocus(previous);
+                DestroyWindow(edit).unwrap();
+            }
+            for reason in [
+                ScopeBlockReason::Property,
+                ScopeBlockReason::Value,
+                ScopeBlockReason::Undeclared,
+                ScopeBlockReason::Empty,
+            ] {
+                assert!(native_scope_fallback_allowed(ScopePolicy::Ai, reason));
+                assert!(!native_scope_fallback_allowed(
+                    ScopePolicy::Learning,
+                    reason
+                ));
+            }
+            for reason in [
+                ScopeBlockReason::Sensitive,
+                ScopeBlockReason::Unsupported,
+                ScopeBlockReason::InvalidValue,
+                ScopeBlockReason::Interface,
+                ScopeBlockReason::Read,
+                ScopeBlockReason::InvalidList,
+                ScopeBlockReason::Selection,
+            ] {
+                assert!(!native_scope_fallback_allowed(ScopePolicy::Ai, reason));
+            }
+        }
+
         mod acp_scope_bridge {
             use super::*;
             use windows::core::{PCWSTR, PWSTR};
@@ -3947,7 +4328,7 @@ mod windows_exports {
                 Ok(TS_STATUS::default())
             }
             fn GetWnd(&self) -> Result<windows::Win32::Foundation::HWND> {
-                Ok(windows::Win32::Foundation::HWND::default())
+                Ok(COMPAT_VIEW.with(Cell::get))
             }
             fn GetAttribute(&self, guid: *const GUID) -> Result<VARIANT> {
                 if unsafe { *guid } != GUID_PROP_INPUTSCOPE {
