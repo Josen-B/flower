@@ -632,7 +632,17 @@ mod windows_exports {
                 clear_ai_pending(&shared, &this.ticket);
                 return Ok(());
             }
-            if let Err(reason) = check_scope(&this.context, cookie, ScopePolicy::Ai) {
+            let allow_undeclared = shared.try_borrow().ok().and_then(|state| {
+                state
+                    .as_ref()
+                    .map(|a| a.settings.ai_undeclared_scope_compatibility)
+            });
+            let Some(allow_undeclared) = allow_undeclared else {
+                clear_ai_pending(&shared, &this.ticket);
+                return Ok(());
+            };
+            // Release the activation borrow before calling application COM code.
+            if let Err(reason) = check_ai_scope(&this.context, cookie, allow_undeclared) {
                 set_ai_status(&shared, &this.ticket, AiStatus::ScopeBlocked(reason));
                 clear_ai_pending(&shared, &this.ticket);
                 refresh_ai_status(&shared, this.ticket.token, this.ticket.owner);
@@ -1510,6 +1520,33 @@ mod windows_exports {
         )
     }
 
+    fn check_ai_scope(
+        context: &ITfContext,
+        cookie: u32,
+        allow_undeclared: bool,
+    ) -> std::result::Result<(), ScopeBlockReason> {
+        let result = check_scope(context, cookie, ScopePolicy::Ai);
+        if allow_undeclared
+            && matches!(
+                result,
+                Err(ScopeBlockReason::Undeclared | ScopeBlockReason::Empty)
+            )
+        {
+            unsafe {
+                if let Ok(window) = context.GetActiveView().and_then(|view| view.GetWnd()) {
+                    if checked_edit_window(
+                        window,
+                        || context.GetActiveView().and_then(|view| view.GetWnd()).ok(),
+                        true,
+                    ) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn native_edit_scope(context: &ITfContext) -> bool {
         // Called only on the edit-session thread, never cached between sending
         // and publication. No document text or window title is inspected.
@@ -1529,6 +1566,14 @@ mod windows_exports {
     unsafe fn native_edit_window(
         window: windows::Win32::Foundation::HWND,
         current_view: impl Fn() -> Option<windows::Win32::Foundation::HWND>,
+    ) -> bool {
+        checked_edit_window(window, current_view, false)
+    }
+
+    unsafe fn checked_edit_window(
+        window: windows::Win32::Foundation::HWND,
+        current_view: impl Fn() -> Option<windows::Win32::Foundation::HWND>,
+        allow_custom: bool,
     ) -> bool {
         use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR};
         use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
@@ -1550,24 +1595,28 @@ mod windows_exports {
         if !identity() {
             return false;
         }
-        let attributes = || {
+        let native_class = || {
             let mut class = [0u16; 128];
             let count = GetClassNameW(focus, &mut class);
             if count <= 0 {
-                return false;
+                return None;
             }
             let class = String::from_utf16_lossy(&class[..count as usize]);
-            if ![
-                "Edit",
-                "RichEdit20A",
-                "RichEdit20W",
-                "RICHEDIT50A",
-                "RICHEDIT50W",
-                "RichEditD2DPT",
-            ]
-            .iter()
-            .any(|name| class.eq_ignore_ascii_case(name))
-            {
+            Some(
+                [
+                    "Edit",
+                    "RichEdit20A",
+                    "RichEdit20W",
+                    "RICHEDIT50A",
+                    "RICHEDIT50W",
+                    "RichEditD2DPT",
+                ]
+                .iter()
+                .any(|name| class.eq_ignore_ascii_case(name)),
+            )
+        };
+        let attributes = || {
+            if !matches!(native_class(), Some(native) if native || allow_custom) {
                 return false;
             }
             SetLastError(WIN32_ERROR(0));
@@ -1580,7 +1629,11 @@ mod windows_exports {
         if !attributes() {
             return false;
         }
-        let password_clear = native_password_clear(focus);
+        let password_clear = match native_class() {
+            Some(true) => native_password_clear(focus),
+            Some(false) => allow_custom,
+            None => false,
+        };
         // Querying the view can call application COM code; recheck identity and
         // attributes after it, as well as after the native class procedure.
         password_clear && current_view() == Some(window) && identity() && attributes()
@@ -3575,6 +3628,7 @@ mod windows_exports {
 
     #[cfg(test)]
     mod native_tests {
+        include!("compatibility_tests.rs");
         use super::*;
         // Native fixtures are known-good COM contexts; production callers must
         // propagate QueryInterface failure instead of using this assertion.

@@ -5,6 +5,8 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 # Flower Windows 验证
 
+当前0.4.15未声明范围默认兼容以 `design/default-ai-scope-compatibility.md` 为准；用户已明确选择默认开启AI及兼容S04/S08，可关闭兼容恢复严格路径。只允许既定窗口/focus身份及style检查通过的缺声明场景，不扩普通学习，不将Sensitive/Unsupported/损坏接口错误转为安全。下文历史“未知一律拒绝”的AI表述不覆盖此新合同；自定义敏感框未声明且无标准密码标记可能无法识别，须随设置及README告知。发送与发布两次只读检查、原生password mask和自定义控件不发消息的边界仍要分别证明。
+
 先读 `docs/distribution.md`、`docs/windows-validation.md` 和当前 `design/mixed-input-and-installation.md`，分页与调序见 `design/adaptive-candidates.md`，旧版补充见 `design/input-and-installation.md`。历史设计文件若已不存在，不按旧摘要恢复；以当前源码和实际宿主事实为准，不将历史通过记录当成本次版本通过。
 
 ## 环境与构建

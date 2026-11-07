@@ -192,6 +192,7 @@ const DICTIONARY_STATUS_ID: i32 = 110;
 const AI_CORRECTION_ID: i32 = 111;
 const AI_CORRECTION_HINT_ID: i32 = 112;
 const LEARNING_HINT_ID: i32 = 113;
+const AI_SCOPE_COMPATIBILITY_ID: i32 = 114;
 const SAVE_BUTTON_ID: i32 = IDOK.0;
 const CANCEL_BUTTON_ID: i32 = IDCANCEL.0;
 
@@ -520,6 +521,7 @@ struct SettingsControls {
     domain_enabled: HWND,
     dictionary_status: HWND,
     ai_correction: HWND,
+    ai_scope_compatibility: HWND,
     ai_correction_hint: HWND,
     learning_hint: HWND,
     headings: [HWND; 6],
@@ -805,12 +807,30 @@ fn initialize_controls(hwnd: HWND, state: &RefCell<SettingsUiState>) -> Result<(
     )?;
     update_controls(state, |controls| controls.ai_correction = ai_correction)?;
     set_checked(ai_correction, settings.ai_correction_enabled);
+    let ai_scope_compatibility = create_control(
+        hwnd,
+        instance,
+        windows::core::w!("BUTTON"),
+        windows::core::w!("兼容未声明范围的应用"),
+        WS_CHILD.0
+            | WS_VISIBLE.0
+            | WS_TABSTOP.0
+            | windows::Win32::UI::WindowsAndMessaging::BS_AUTOCHECKBOX as u32,
+        AI_SCOPE_COMPATIBILITY_ID,
+    )?;
+    update_controls(state, |controls| {
+        controls.ai_scope_compatibility = ai_scope_compatibility
+    })?;
+    set_checked(
+        ai_scope_compatibility,
+        settings.ai_undeclared_scope_compatibility,
+    );
     let ai_correction_hint = create_control(
         hwnd,
         instance,
         windows::core::w!("STATIC"),
         windows::core::w!(
-            "保存后，切走再切回 Flower 生效。\n首次加载最多 5 秒，状态见候选窗。\n\n范围未知或私密时不会送入模型。\n可用空白记事本对照验证。\nAI 候选须手动选择，不回改已上屏文字。"
+            "离线检查，首次加载最多5秒。\n仅处理未提交候选，不读取正文。\n自定义私密框未声明时可能无法识别。\n可关闭兼容恢复严格限制。\n保存后切换生效，AI建议须手动选择。"
         ),
         WS_CHILD.0 | WS_VISIBLE.0,
         AI_CORRECTION_HINT_ID,
@@ -1039,7 +1059,8 @@ fn control_layout(c: SettingsControls) -> Vec<(HWND, [i32; 4])> {
         (c.labels[2], [48, 252, 292, 24]),
         (c.theme_combo, [48, 284, 292, 128]),
         (c.ai_correction, [412, 168, 300, 28]),
-        (c.ai_correction_hint, [412, 204, 300, 144]),
+        (c.ai_scope_compatibility, [412, 204, 300, 28]),
+        (c.ai_correction_hint, [412, 240, 300, 108]),
         (c.learning, [48, 432, 300, 28]),
         (c.learning_hint, [48, 472, 300, 64]),
         (c.clear_learning, [48, 548, 180, 36]),
@@ -1087,6 +1108,7 @@ fn replace_font(state: &RefCell<SettingsUiState>, dpi: u32) -> Result<(), Window
         controls.domain_enabled,
         controls.dictionary_status,
         controls.ai_correction,
+        controls.ai_scope_compatibility,
         controls.ai_correction_hint,
         controls.learning_hint,
     ] {
@@ -1533,6 +1555,7 @@ fn read_form(state: &RefCell<SettingsUiState>) -> Result<Settings, String> {
         candidate_page_size: page_size,
         theme,
         ai_correction_enabled: is_checked(controls.ai_correction),
+        ai_undeclared_scope_compatibility: is_checked(controls.ai_scope_compatibility),
     };
     settings
         .validate()
@@ -1856,6 +1879,12 @@ mod tests {
         assert_eq!(scaled(24, 144), 36);
         assert_eq!(scaled(24, 0), 24);
         assert_eq!(scaled(24, 960), 120);
+        let hint = control_layout(SettingsControls::default())
+            .into_iter()
+            .map(|(_, rect)| rect)
+            .find(|rect| rect[0] == 412 && rect[1] == 240)
+            .unwrap();
+        assert!(hint[1] + hint[3] <= CARDS[1][1] + CARDS[1][3] - 4);
     }
 
     #[test]
@@ -2034,6 +2063,13 @@ mod tests {
         assert!(preview.state.borrow().domain_names.is_empty());
         assert!(!directory.join("settings.json").exists());
         assert!(!directory.join("dictionary.json").exists());
+        let compatibility = preview.state.borrow().controls.ai_scope_compatibility;
+        assert!(is_checked(compatibility));
+        set_checked(compatibility, false);
+        let strict = read_form(preview.state.as_ref()).unwrap();
+        assert!(!strict.ai_undeclared_scope_compatibility);
+        assert!(strict.ai_correction_enabled);
+        set_checked(compatibility, true);
         let original_font_count = preview.state.borrow().fonts.len();
         replace_font(preview.state.as_ref(), dpi).unwrap();
         assert_eq!(preview.state.borrow().fonts.len(), original_font_count);

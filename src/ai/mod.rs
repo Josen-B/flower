@@ -73,6 +73,11 @@ pub enum AiStatus {
 }
 
 impl AiStatus {
+    /// Use the version compiled into the active DLL, not the settings executable.
+    pub fn display_label(self) -> String {
+        format!("Flower {} · {}", env!("CARGO_PKG_VERSION"), self.label())
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Disabled => "AI 已关闭：在 Flower 设置中开启",
@@ -237,6 +242,19 @@ pub fn valid_correction(source: &str, corrected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn displayed_status_includes_active_binary_version_without_losing_reason() {
+        for status in [
+            AiStatus::Disabled,
+            AiStatus::NoSuggestion,
+            AiStatus::ScopeBlocked(ScopeBlockReason::Undeclared),
+        ] {
+            let text = status.display_label();
+            assert!(text.starts_with(&format!("Flower {} · ", env!("CARGO_PKG_VERSION"))));
+            assert!(text.ends_with(status.label()));
+        }
+    }
+
     #[test]
     fn correction_bounds_reject_rewrites_and_non_han() {
         assert!(valid_correction("今天新情很好", "今天心情很好"));

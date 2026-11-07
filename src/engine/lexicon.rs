@@ -339,7 +339,7 @@ impl Lexicon {
         let mut initials: HashMap<String, Vec<LexiconEntry>> = HashMap::new();
         for entry in entries.values().flatten() {
             let syllables: Vec<_> = entry.reading.split('\'').collect();
-            if syllables.len() < 2 || syllables.len() != entry.text.chars().count() {
+            if syllables.len() != entry.text.chars().count() {
                 continue;
             }
             let key: String = syllables.iter().map(|s| s.as_bytes()[0] as char).collect();
@@ -356,7 +356,9 @@ impl Lexicon {
     }
 
     fn initial_choices_limited(&self, raw: &str, limit: usize) -> Vec<super::decoder::Choice> {
-        if raw.contains('\'') {
+        // Single-character initials belong only to the standalone input entry,
+        // never to the multi-syllable graph or whole-word abbreviation lane.
+        if raw.len() < 2 || raw.contains('\'') {
             return Vec::new();
         }
         self.initials
@@ -365,6 +367,23 @@ impl Lexicon {
             .flatten()
             .take(limit)
             .map(|entry| entry.choice(raw.len()))
+            .collect()
+    }
+
+    pub(crate) fn single_initial_choices(&self, raw: &str) -> Vec<super::decoder::Choice> {
+        if raw.len() != 1 || !raw.as_bytes()[0].is_ascii_lowercase() {
+            return Vec::new();
+        }
+        self.initials
+            .get(raw)
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let mut choice = entry.choice(1);
+                choice.abbreviated = usize::from(entry.reading.len() > 1);
+                choice.penalize_abbreviations();
+                choice
+            })
             .collect()
     }
 

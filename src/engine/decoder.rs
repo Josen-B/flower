@@ -173,6 +173,19 @@ fn decode_lanes(
         return Vec::new();
     }
     let mut output = lexicon.exact_choices(raw);
+    if raw.len() == 1 {
+        let mut seen: HashSet<_> = output
+            .iter()
+            .map(|choice| choice.candidate.text.clone())
+            .collect();
+        output.extend(
+            lexicon
+                .single_initial_choices(raw)
+                .into_iter()
+                .filter(|choice| seen.insert(choice.candidate.text.clone())),
+        );
+        return output;
+    }
     let mut whole_mixed = Vec::new();
     let mut graph: Vec<Vec<Path>> = vec![Vec::new(); raw.len() + 1];
     graph[0].push(Path {
@@ -413,6 +426,7 @@ mod tests {
             assert!(new.len() <= old.len() + BEAM, "{raw}");
             let whole = lexicon.exact_choices(raw).len()
                 + lexicon.initial_choices(raw).len()
+                + lexicon.single_initial_choices(raw).len()
                 + lexicon
                     .mixed_prefix_choices(raw, &mut 0, MIXED_DECODE_BUDGET)
                     .iter()

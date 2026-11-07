@@ -29,6 +29,7 @@ pub struct Settings {
     pub candidate_page_size: usize,
     pub theme: Theme,
     pub ai_correction_enabled: bool,
+    pub ai_undeclared_scope_compatibility: bool,
 }
 
 impl Default for Settings {
@@ -37,6 +38,7 @@ impl Default for Settings {
             candidate_page_size: DEFAULT_CANDIDATE_PAGE_SIZE,
             theme: Theme::System,
             ai_correction_enabled: true,
+            ai_undeclared_scope_compatibility: true,
         }
     }
 }
@@ -321,6 +323,7 @@ mod tests {
         assert_eq!(settings.candidate_page_size, 9);
         assert_eq!(settings.theme, Theme::System);
         assert!(settings.ai_correction_enabled);
+        assert!(settings.ai_undeclared_scope_compatibility);
         assert!(settings.validate().is_ok());
     }
 
@@ -329,13 +332,16 @@ mod tests {
         let old: Settings =
             serde_json::from_str(r#"{"candidate_page_size":7,"theme":"dark"}"#).unwrap();
         assert!(old.ai_correction_enabled);
+        assert!(old.ai_undeclared_scope_compatibility);
         let opted_out = Settings {
             ai_correction_enabled: false,
+            ai_undeclared_scope_compatibility: false,
             ..old
         };
         let restored: Settings =
             serde_json::from_str(&serde_json::to_string(&opted_out).unwrap()).unwrap();
         assert!(!restored.ai_correction_enabled);
+        assert!(!restored.ai_undeclared_scope_compatibility);
         assert_eq!(restored.candidate_page_size, 7);
         assert_eq!(restored.theme, Theme::Dark);
     }
@@ -364,6 +370,7 @@ mod tests {
             candidate_page_size: 7,
             theme: Theme::Dark,
             ai_correction_enabled: false,
+            ai_undeclared_scope_compatibility: false,
         };
         store.save(&settings).expect("save settings");
         assert_eq!(store.load().expect("load settings"), settings);
@@ -372,6 +379,7 @@ mod tests {
             candidate_page_size: 19,
             theme: Theme::Light,
             ai_correction_enabled: true,
+            ai_undeclared_scope_compatibility: true,
         };
         store.save(&replacement).expect("replace settings");
         assert_eq!(store.load().expect("load replacement"), replacement);
@@ -392,6 +400,7 @@ mod tests {
             candidate_page_size: 9,
             theme: Theme::System,
             ai_correction_enabled: false,
+            ai_undeclared_scope_compatibility: false,
         };
         store.save(&original).expect("save original settings");
         let original_json = fs::read(store.path()).expect("read original JSON");
@@ -400,6 +409,7 @@ mod tests {
             candidate_page_size: 0,
             theme: Theme::Dark,
             ai_correction_enabled: false,
+            ai_undeclared_scope_compatibility: false,
         };
         assert!(matches!(
             settings.validate(),
@@ -437,6 +447,7 @@ mod tests {
             candidate_page_size: 21,
             theme: Theme::Dark,
             ai_correction_enabled: false,
+            ai_undeclared_scope_compatibility: false,
         };
         store.save(&settings).expect("create directory and save");
         assert_eq!(store.load().expect("load settings"), settings);
