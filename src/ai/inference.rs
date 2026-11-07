@@ -2,13 +2,18 @@
 #[path = "assets.rs"]
 mod assets;
 
+use flower::ai::{
+    eligible_request, spelling_change_span, Request, Response, SPELLING_CANDIDATES,
+    SPELLING_MODEL_CALLS, SPELLING_TIMEOUT_MS,
+};
 use flower::ai::{eligible_text, valid_correction};
+use flower::engine::{Lexicon, SpellingIndex};
 use ort::{
     session::Session,
     tensor::TensorElementType,
     value::{Tensor, ValueType},
 };
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, ops::Range, path::Path, time::Instant};
 
 const VOCAB_SIZE: usize = 21128;
 fn failed(_: impl std::fmt::Display) -> String {
@@ -19,6 +24,7 @@ pub struct Corrector {
     session: Session,
     vocab: Vec<String>,
     ids: HashMap<char, i64>,
+    spelling: SpellingIndex,
 }
 
 impl Corrector {
@@ -31,6 +37,7 @@ impl Corrector {
             || vocab[100] != "[UNK]"
             || vocab[101] != "[CLS]"
             || vocab[102] != "[SEP]"
+            || vocab[103] != "[MASK]"
         {
             return Err("AI vocabulary invalid".into());
         }
@@ -87,6 +94,7 @@ impl Corrector {
             session,
             vocab,
             ids,
+            spelling: SpellingIndex::new(&Lexicon::builtin().map_err(failed)?),
         })
     }
 
@@ -94,14 +102,33 @@ impl Corrector {
         if !eligible_text(text) {
             return Err("AI input ineligible".into());
         }
-        let mut ids = vec![101i64];
+        let ids = self.encode(text)?;
+        let logits = self.raw_logits(&ids)?;
+        filter_logits(
+            text,
+            &ids[1..ids.len() - 1],
+            &self.vocab,
+            &[1, ids.len() as i64, VOCAB_SIZE as i64],
+            &logits,
+        )
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<i64>, String> {
+        let mut ids = vec![101];
         for c in text.chars() {
             ids.push(*self.ids.get(&c).ok_or("AI character unsupported")?);
         }
         ids.push(102);
+        Ok(ids)
+    }
+
+    fn raw_logits(&mut self, ids: &[i64]) -> Result<Vec<f32>, String> {
         let len = ids.len();
+        if ids.iter().any(|&id| !(0..VOCAB_SIZE as i64).contains(&id)) {
+            return Err("AI input invalid".into());
+        }
         let input =
-            Tensor::from_array(([1usize, len], ids.clone().into_boxed_slice())).map_err(failed)?;
+            Tensor::from_array(([1usize, len], ids.to_vec().into_boxed_slice())).map_err(failed)?;
         let mask = Tensor::from_array(([1usize, len], vec![1i64; len].into_boxed_slice()))
             .map_err(failed)?;
         let types = Tensor::from_array(([1usize, len], vec![0i64; len].into_boxed_slice()))
@@ -118,8 +145,192 @@ impl Corrector {
         let (shape, logits) = outputs["logits"]
             .try_extract_raw_tensor::<f32>()
             .map_err(failed)?;
-        filter_logits(text, &ids[1..len - 1], &self.vocab, shape, logits)
+        if shape != [1, len as i64, VOCAB_SIZE as i64]
+            || logits.len() != len * VOCAB_SIZE
+            || logits.iter().any(|v| !v.is_finite())
+        {
+            return Err("AI output invalid".into());
+        }
+        Ok(logits.to_vec())
     }
+
+    pub fn correct_request(&mut self, request: &Request) -> Result<Response, String> {
+        if !eligible_request(request) {
+            return Err("AI input ineligible".into());
+        }
+        let start = Instant::now();
+        let mut response = Response {
+            id: request.id,
+            corrected: None,
+            reading: String::new(),
+        };
+        // Reuse this unmasked forward for both the unchanged CSC and spelling gates.
+        let source = self.encode(&request.text)?;
+        let logits = self.raw_logits(&source)?;
+        let mut budget = Budget { start, calls: 1 };
+        response.corrected = filter_logits(
+            &request.text,
+            &source[1..source.len() - 1],
+            &self.vocab,
+            &[1, source.len() as i64, VOCAB_SIZE as i64],
+            &logits,
+        )?;
+        if response.corrected.is_some() || request.raw.is_empty() {
+            return Ok(response);
+        }
+        let candidates: Vec<_> = self
+            .spelling
+            .candidates(&request.raw, 8)
+            .into_iter()
+            .filter_map(|c| {
+                spelling_change_span(
+                    &request.raw,
+                    &request.text,
+                    &request.reading,
+                    &c.text,
+                    &c.reading,
+                )
+                .map(|span| (c, span))
+            })
+            .take(SPELLING_CANDIDATES)
+            .collect();
+        let mut best: Option<(f64, f64)> = None;
+        for (candidate, (old, new)) in candidates {
+            if !budget.available() {
+                break;
+            }
+            let uncertainty = if old.is_empty() {
+                let p = old.start.min(source.len() - 3);
+                log_probability(row(&logits, p), source[p + 1] as usize).exp()
+            } else {
+                old.clone()
+                    .map(|p| log_probability(row(&logits, p), source[p + 1] as usize).exp())
+                    .sum::<f64>()
+                    / old.len() as f64
+            };
+            #[cfg(test)]
+            eprintln!(
+                "candidate={} source_p={uncertainty:.6} calls={} ms={}",
+                candidate.text,
+                budget.calls,
+                budget.start.elapsed().as_millis()
+            );
+            if uncertainty >= 0.90 {
+                continue;
+            }
+            let target = self.encode(&candidate.text)?;
+            let old_window = window(old.clone(), source.len() - 2);
+            let new_window = window(new.clone(), target.len() - 2);
+            let mut confidence = 1.0f64;
+            let mut target_score = 0.0;
+            let mut accepted = true;
+            for p in new_window.clone() {
+                let Some(masked) = self.masked(&target, p, &mut budget)? else {
+                    accepted = false;
+                    break;
+                };
+                let r = row(&masked, p);
+                let lp = log_probability(r, target[p + 1] as usize);
+                target_score += lp;
+                let changed = if new.is_empty() {
+                    p == new.start.min(target.len() - 3)
+                } else {
+                    new.contains(&p) && (old.len() != new.len() || source[p + 1] != target[p + 1])
+                };
+                if changed {
+                    #[cfg(test)]
+                    eprintln!(
+                        "mask position={p} p={:.6} replacement_margin={:?}",
+                        lp.exp(),
+                        (old.len() == new.len())
+                            .then(|| r[target[p + 1] as usize] - r[source[p + 1] as usize])
+                    );
+                    confidence = confidence.min(lp.exp());
+                    if lp.exp() < 0.95
+                        || (old.len() == new.len()
+                            && r[target[p + 1] as usize] - r[source[p + 1] as usize] < 4.0)
+                    {
+                        accepted = false;
+                        break;
+                    }
+                }
+            }
+            if !accepted {
+                continue;
+            }
+            let mut source_score = 0.0;
+            for p in old_window.clone() {
+                let Some(masked) = self.masked(&source, p, &mut budget)? else {
+                    accepted = false;
+                    break;
+                };
+                source_score += log_probability(row(&masked, p), source[p + 1] as usize);
+            }
+            if !accepted {
+                break;
+            }
+            let gain =
+                target_score / new_window.len() as f64 - source_score / old_window.len() as f64;
+            #[cfg(test)]
+            eprintln!(
+                "gain={gain:.6} confidence={confidence:.6} calls={} ms={}",
+                budget.calls,
+                budget.start.elapsed().as_millis()
+            );
+            if gain >= 1.0 && best.map_or(true, |b| gain > b.0 || (gain == b.0 && confidence > b.1))
+            {
+                best = Some((gain, confidence));
+                response.corrected = Some(candidate.text);
+                response.reading = candidate.reading;
+            }
+        }
+        Ok(response)
+    }
+
+    fn masked(
+        &mut self,
+        ids: &[i64],
+        position: usize,
+        budget: &mut Budget,
+    ) -> Result<Option<Vec<f32>>, String> {
+        if !budget.available() {
+            return Ok(None);
+        }
+        let mut ids = ids.to_vec();
+        ids[position + 1] = 103;
+        budget.calls += 1;
+        let logits = self.raw_logits(&ids)?;
+        // A forward itself is not preemptible; never accept evidence after deadline.
+        Ok((budget.start.elapsed().as_millis() < SPELLING_TIMEOUT_MS as u128).then_some(logits))
+    }
+}
+
+struct Budget {
+    start: Instant,
+    calls: usize,
+}
+impl Budget {
+    fn available(&self) -> bool {
+        self.calls < SPELLING_MODEL_CALLS
+            && self.start.elapsed().as_millis() < SPELLING_TIMEOUT_MS as u128
+    }
+}
+fn row(logits: &[f32], p: usize) -> &[f32] {
+    &logits[(p + 1) * VOCAB_SIZE..(p + 2) * VOCAB_SIZE]
+}
+fn log_probability(row: &[f32], id: usize) -> f64 {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    row[id] as f64
+        - max
+        - row
+            .iter()
+            .map(|&v| (v as f64 - max).exp())
+            .sum::<f64>()
+            .ln()
+}
+fn window(span: Range<usize>, len: usize) -> Range<usize> {
+    let start = span.start.saturating_sub(2);
+    start..(span.end + 2).min(len).min(start + 7)
 }
 
 /// Also usable by deterministic fixtures; it does not initialize ORT.
@@ -178,10 +389,37 @@ pub fn run_server() -> Result<(), String> {
     let bundle = exe.parent().ok_or("AI bundle unavailable")?.join("ai");
     let mut corrector = None;
     // serve binds the single-instance pipe before this closure can cold-load.
-    flower::ai::ipc::serve(move |text| {
+    flower::ai::ipc::serve_requests(move |request| {
         if corrector.is_none() {
             corrector = Some(Corrector::load(&bundle)?);
         }
-        corrector.as_mut().ok_or("AI unavailable")?.correct(text)
+        corrector
+            .as_mut()
+            .ok_or("AI unavailable")?
+            .correct_request(request)
     })
+}
+
+#[cfg(test)]
+mod spelling_unit_tests {
+    use super::*;
+
+    #[test]
+    fn budget_and_local_window_bounds() {
+        let budget = Budget {
+            start: Instant::now(),
+            calls: SPELLING_MODEL_CALLS,
+        };
+        assert!(!budget.available());
+        let expired = Budget {
+            start: Instant::now() - std::time::Duration::from_millis(SPELLING_TIMEOUT_MS),
+            calls: 0,
+        };
+        assert!(!expired.available());
+        assert_eq!(window(0..1, 7), 0..3);
+        assert_eq!(window(3..6, 10), 1..8);
+        assert_eq!(window(7..7, 7), 5..7);
+        let logits = [0.0, 0.0];
+        assert!((log_probability(&logits, 0).exp() - 0.5).abs() < 1e-9);
+    }
 }

@@ -8,10 +8,10 @@ pub trait CompositionHost {
     type Error;
 
     /// Starts a new composition with the supplied preedit text.
-    fn begin(&mut self, preedit: &str) -> Result<(), Self::Error>;
+    fn begin(&mut self, preedit: &str, caret_utf16: Option<usize>) -> Result<(), Self::Error>;
 
     /// Replaces the preedit text of the active composition.
-    fn replace(&mut self, preedit: &str) -> Result<(), Self::Error>;
+    fn replace(&mut self, preedit: &str, caret_utf16: Option<usize>) -> Result<(), Self::Error>;
 
     /// Commits text to the host document and ends the composition.
     fn commit(&mut self, text: &str) -> Result<(), Self::Error>;
@@ -72,9 +72,9 @@ impl CompositionController {
         }
 
         if self.active {
-            host.replace(&update.preedit)?;
+            host.replace(&update.preedit, update.preedit_caret_utf16)?;
         } else {
-            host.begin(&update.preedit)?;
+            host.begin(&update.preedit, update.preedit_caret_utf16)?;
             self.active = true;
         }
 
@@ -131,6 +131,7 @@ mod tests {
     struct FakeHost {
         events: Vec<HostEvent>,
         fail_on: Option<HostCall>,
+        caret_utf16: Option<usize>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -151,11 +152,17 @@ mod tests {
     impl CompositionHost for FakeHost {
         type Error = HostFailure;
 
-        fn begin(&mut self, preedit: &str) -> Result<(), Self::Error> {
+        fn begin(&mut self, preedit: &str, caret_utf16: Option<usize>) -> Result<(), Self::Error> {
+            self.caret_utf16 = caret_utf16;
             self.record(HostEvent::Begin(preedit.to_owned()))
         }
 
-        fn replace(&mut self, preedit: &str) -> Result<(), Self::Error> {
+        fn replace(
+            &mut self,
+            preedit: &str,
+            caret_utf16: Option<usize>,
+        ) -> Result<(), Self::Error> {
+            self.caret_utf16 = caret_utf16;
             self.record(HostEvent::Replace(preedit.to_owned()))
         }
 
@@ -174,6 +181,26 @@ mod tests {
             preedit: preedit.to_owned(),
             ..CompositionUpdate::default()
         }
+    }
+
+    #[test]
+    fn begin_and_replace_preserve_requested_utf16_caret() {
+        let mut controller = CompositionController::new();
+        let mut host = FakeHost::default();
+        let mut update = preedit_update("𠀀nihao");
+        update.preedit_caret_utf16 = Some(3);
+        controller.apply_update(&mut host, &update).unwrap();
+        assert_eq!(host.caret_utf16, Some(3));
+        update.preedit_caret_utf16 = Some(2);
+        controller.apply_update(&mut host, &update).unwrap();
+        assert_eq!(host.caret_utf16, Some(2));
+        assert_eq!(
+            host.events,
+            vec![
+                HostEvent::Begin("𠀀nihao".into()),
+                HostEvent::Replace("𠀀nihao".into()),
+            ]
+        );
     }
 
     fn commit_update(text: &str) -> CompositionUpdate {

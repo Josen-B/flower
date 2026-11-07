@@ -5,3 +5,5 @@ data/pinyin/everyday_phrases.tsv -text
 data/ai/** -text
 data/pinyin/coverage.json -text
 data/pinyin/phrases/** -text
+data/pinyin/categories/** -text
+data/pinyin/sources/thuocl/** -text

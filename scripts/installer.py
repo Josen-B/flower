@@ -24,7 +24,7 @@ else:
     import package as pack
 
 REPO = Path(__file__).resolve().parent.parent
-ROOT_FILES = frozenset({
+ROOT_FILES = pack.CATEGORY_FILES | frozenset({
     "flower.dll", "flower-register.exe", "flower-settings.exe", "README.md",
     "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", "Cargo.lock",
     "manifest.json", "SHA256SUMS", "data/pinyin/mvp_lexicon.tsv",
@@ -198,6 +198,8 @@ def verify_package(archive: Path) -> VerifiedPackage:
             raise InstallerError("DLL 缺少必需导出")
     if manifest.get("cargo_lock_sha256") != hashes["Cargo.lock"]:
         raise InstallerError("Cargo.lock 哈希与 manifest 不匹配")
+    if manifest.get("category_lexicons") != pack._verify_category_payload(payload, REPO):
+        raise InstallerError("manifest 分类词库记录不匹配")
     return VerifiedPackage(version, digest, payload, records, variant)
 
 

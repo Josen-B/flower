@@ -410,6 +410,7 @@ pub struct InstallationSnapshot {
     pub com: ResourceState,
     pub language_profile: ResourceState,
     pub keyboard_category: ResourceState,
+    pub ui_element_category: ResourceState,
 }
 
 impl InstallationSnapshot {
@@ -417,6 +418,7 @@ impl InstallationSnapshot {
         self.com.is_present()
             && self.language_profile.is_present()
             && self.keyboard_category.is_present()
+            && self.ui_element_category.is_present()
     }
 }
 
@@ -425,6 +427,7 @@ pub enum RegistrationResource {
     Com,
     LanguageProfile,
     KeyboardCategory,
+    UiElementCategory,
 }
 
 impl RegistrationResource {
@@ -433,6 +436,7 @@ impl RegistrationResource {
             Self::Com => snapshot.com,
             Self::LanguageProfile => snapshot.language_profile,
             Self::KeyboardCategory => snapshot.keyboard_category,
+            Self::UiElementCategory => snapshot.ui_element_category,
         }
     }
 
@@ -441,6 +445,7 @@ impl RegistrationResource {
             Self::Com => "COM 类注册",
             Self::LanguageProfile => "TSF 语言配置",
             Self::KeyboardCategory => "TSF 键盘分类",
+            Self::UiElementCategory => "TSF UIElement 能力分类",
         }
     }
 }
@@ -474,6 +479,7 @@ pub fn plan_registration(
         RegistrationResource::Com,
         RegistrationResource::LanguageProfile,
         RegistrationResource::KeyboardCategory,
+        RegistrationResource::UiElementCategory,
     ];
     if let Some(resource) = all
         .into_iter()
@@ -647,6 +653,7 @@ fn rollback_failed_installation<B: RegistrationBackend>(
 
     let mut cleanup_blocked = false;
     for resource in [
+        RegistrationResource::UiElementCategory,
         RegistrationResource::KeyboardCategory,
         RegistrationResource::LanguageProfile,
         RegistrationResource::Com,
@@ -696,6 +703,7 @@ pub fn execute_unregistration<B: RegistrationBackend>(
         RegistrationResource::Com,
         RegistrationResource::LanguageProfile,
         RegistrationResource::KeyboardCategory,
+        RegistrationResource::UiElementCategory,
     ];
     if let Some(resource) = all
         .into_iter()
@@ -708,6 +716,7 @@ pub fn execute_unregistration<B: RegistrationBackend>(
 
     let mut changed = false;
     for resource in [
+        RegistrationResource::UiElementCategory,
         RegistrationResource::KeyboardCategory,
         RegistrationResource::LanguageProfile,
         RegistrationResource::Com,

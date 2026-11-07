@@ -66,6 +66,8 @@ pub struct CompositionUpdate {
     pub handled: bool,
     /// Display preedit: confirmed Chinese prefix plus the still-unselected Pinyin.
     pub preedit: String,
+    /// Collapsed caret in UTF-16 units of preedit; None means the end.
+    pub preedit_caret_utf16: Option<usize>,
     /// Candidates on the current page only.
     pub candidates: Vec<Candidate>,
     /// Zero-based highlighted candidate on the current page.

@@ -78,10 +78,12 @@ Source: "{#EngineLicense}"; DestDir: "{app}\versions\{#BuildId}\licenses\install
 Name: "{commonprograms}\Flower\启动 Flower"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "enable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
 Name: "{commonprograms}\Flower\停用 Flower"; Filename: "{app}\versions\{#BuildId}\flower-register.exe"; Parameters: "disable"; IconFilename: "{app}\versions\{#BuildId}\flower-settings.exe"
 Name: "{commonprograms}\Flower\Flower 设置"; Filename: "{app}\versions\{#BuildId}\flower-settings.exe"
+Name: "{commonprograms}\Flower\关闭开机自启动"; Filename: "{app}\versions\{#BuildId}\flower-settings.exe"; Parameters: "--disable-startup"
 Name: "{commonprograms}\Flower\Flower 安装说明"; Filename: "{app}\versions\{#BuildId}\INSTALLER-README.txt"
 
 [Run]
 Filename: "{app}\versions\{#BuildId}\flower-settings.exe"; Parameters: "--start-input-method"; Description: "启动 Flower"; Flags: postinstall nowait skipifsilent runasoriginaluser; Check: CanStartFlower
+Filename: "{app}\versions\{#BuildId}\flower-settings.exe"; Parameters: "--enable-startup"; Description: "开机自启动"; Flags: postinstall unchecked skipifsilent runasoriginaluser; Check: CanStartFlower
 
 [Code]
 const
@@ -89,6 +91,7 @@ const
   ClassKey = 'Software\Classes\CLSID\{3D5B7CB1-96CB-4F44-A792-64304F6E7426}';
   TipKey = 'Software\Microsoft\CTF\TIP\{3D5B7CB1-96CB-4F44-A792-64304F6E7426}';
   KeyboardCategory = '{34745C63-B2F0-4784-8B67-5E12C8701A31}';
+  UIElementCategory = '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}';
   InstallerKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{1B8DAF2E-D5F7-49AC-A9BF-4713A0D57224}_is1';
 var
   RegistrationFailed: Boolean;
@@ -173,6 +176,8 @@ begin
   if HasSubkeys(TipKey + '\Category\Item\' + FlowerClass) then Exit;
   if RegKeyExists(HKLM64, TipKey + '\Category\Category\' +
     KeyboardCategory + '\' + FlowerClass) then Exit;
+  if RegKeyExists(HKLM64, TipKey + '\Category\Category\' +
+    UIElementCategory + '\' + FlowerClass) then Exit;
   if RegKeyExists(HKLM64, TipKey + '\LanguageProfile') then begin
     if not RegGetSubkeyNames(HKLM64, TipKey + '\LanguageProfile', Languages) then Exit;
     for I := 0 to GetArrayLength(Languages) - 1 do
@@ -238,7 +243,8 @@ begin
     '\LanguageProfile\0x00000804\{6C7782F4-5F59-42CF-8C29-F9A8D46F1B72}',
     'Description', Description) then Exit;
   Result := (Description = 'Flower') and RegKeyExists(HKLM64,
-    TipKey + '\Category\Category\' + KeyboardCategory + '\' + FlowerClass);
+    TipKey + '\Category\Category\' + KeyboardCategory + '\' + FlowerClass) and
+    RegKeyExists(HKLM64, TipKey + '\Category\Category\' + UIElementCategory + '\' + FlowerClass);
 end;
 
 function CanStartFlower: Boolean;
@@ -318,7 +324,7 @@ begin
     SuppressibleMsgBox(WizardForm.FinishedLabel.Caption, mbError, MB_OK, IDOK);
   end else
     WizardForm.FinishedLabel.Caption :=
-      'Flower 机器级注册已完成。勾选“启动 Flower”将为原始普通用户启用并打开设置；请按 Win+Space 手动选择 Flower。其他用户可从开始菜单启用。本测试版尚未通过实际输入验收。';
+      'Flower 机器级注册已完成。“启动 Flower”仅为原始普通用户启用后退出；“开机自启动”独立设置该用户登录时静默启用，不打开设置或更改默认输入法。请按 Win+Space 手动选择 Flower。本测试版尚未通过实际输入验收。';
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
@@ -349,7 +355,7 @@ begin
     Exit;
   end;
   if SuppressibleMsgBox(
-    '请确认每个用户已停用 Flower，并保存工作、退出所有使用过 Flower 的应用。卸载不会替其他账户停用；用户词典和设置均保留，不清理其他账户的输入配置。是否继续？',
+    '请确认每个用户已先运行“关闭开机自启动”再“停用 Flower”，并保存工作、退出所有使用过 Flower 的应用。卸载不会替任何账户清理自启动或停用；未关闭的项可能成为失效引用。用户词典和设置均保留。是否继续？',
     mbConfirmation, MB_YESNO, IDNO) <> IDYES then Exit;
   { Never execute a helper directly out of a tree whose ACL may have changed.
     Copy to Inno's private temporary directory, verify the copy, then inspect. }

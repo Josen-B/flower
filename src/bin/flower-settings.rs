@@ -4,6 +4,9 @@ use std::process::ExitCode;
 
 use flower::user_dictionary::DictionaryStore;
 
+#[path = "../startup.rs"]
+mod startup;
+
 #[cfg(target_os = "windows")]
 #[path = "../ai/inference.rs"]
 mod ai_inference;
@@ -14,6 +17,9 @@ const USAGE: &str = "Flower 设置程序
   flower-settings
   flower-settings --help
   flower-settings --start-input-method
+  flower-settings --startup-input-method
+  flower-settings --enable-startup
+  flower-settings --disable-startup
   flower-settings ai probe <bundle-directory>
   flower-settings dictionary status
   flower-settings dictionary import <path> [--domain <name>]
@@ -33,6 +39,9 @@ const USAGE: &str = "Flower 设置程序
 enum Command {
     Gui,
     StartInputMethod,
+    StartupInputMethod,
+    EnableStartup,
+    DisableStartup,
     AiServer,
     AiProbe(PathBuf),
     Help,
@@ -95,6 +104,9 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     match args {
         [] => Ok(Command::Gui),
         [arg] if arg == "--start-input-method" => Ok(Command::StartInputMethod),
+        [arg] if arg == "--startup-input-method" => Ok(Command::StartupInputMethod),
+        [arg] if arg == "--enable-startup" => Ok(Command::EnableStartup),
+        [arg] if arg == "--disable-startup" => Ok(Command::DisableStartup),
         [arg] if arg == "--ai-server" => Ok(Command::AiServer),
         [cmd, op, path] if cmd == "ai" && op == "probe" && !path.is_empty() => {
             Ok(Command::AiProbe(PathBuf::from(path)))
@@ -178,6 +190,24 @@ fn start_input_method() -> Result<(), String> {
 
 fn execute(command: Command) -> Result<(), String> {
     match command {
+        Command::StartupInputMethod | Command::EnableStartup | Command::DisableStartup => {
+            #[cfg(windows)]
+            {
+                require_non_elevated()?;
+                let path =
+                    flower::platform::registration::validate_current_settings_installation()?;
+                return match command {
+                    Command::StartupInputMethod => flower::platform::registration::enable()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    Command::EnableStartup => startup::set(&path, true),
+                    Command::DisableStartup => startup::set(&path, false),
+                    _ => unreachable!(),
+                };
+            }
+            #[cfg(not(windows))]
+            return Err("自启动仅支持 Windows。".into());
+        }
         Command::AiServer => {
             #[cfg(target_os = "windows")]
             {
@@ -203,8 +233,12 @@ fn execute(command: Command) -> Result<(), String> {
                 let corrected = ai_inference::probe(&bundle, input.trim_end_matches(['\r', '\n']))?;
                 println!(
                     "{}",
-                    serde_json::to_string(&flower::ai::Response { id: 0, corrected })
-                        .map_err(|_| "无法序列化测试结果。")?
+                    serde_json::to_string(&flower::ai::Response {
+                        id: 0,
+                        corrected,
+                        reading: String::new()
+                    })
+                    .map_err(|_| "无法序列化测试结果。")?
                 );
                 return Ok(());
             }
@@ -273,10 +307,18 @@ fn execute(command: Command) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let command = parse(&args);
-    let only_start = matches!(&command, Ok(Command::StartInputMethod));
+    // Even malformed login invocations must never show UI or print user paths.
+    let silent = args.iter().any(|arg| arg == "--startup-input-method");
+    let only_start = matches!(
+        &command,
+        Ok(Command::StartInputMethod | Command::EnableStartup | Command::DisableStartup)
+    );
     match command.and_then(execute) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if silent {
+                return ExitCode::FAILURE;
+            }
             eprintln!("Flower 设置程序失败：{error}\n\n{USAGE}");
             if only_start {
                 #[cfg(target_os = "windows")]
@@ -287,7 +329,7 @@ fn main() -> ExitCode {
                     };
                     MessageBoxW(
                         None,
-                        w!("Flower 启动或启用失败，设置窗口可能未能打开。请以普通用户身份从开始菜单运行“启用 Flower（当前用户）”并打开 Flower 设置重试；若已启用，可按 Win+Space 手动选择 Flower。"),
+                        w!("Flower 操作失败。请以普通用户身份运行，确认本次安装完整且没有其他安装的自启动项；未更改默认输入法。"),
                         w!("Flower 启动失败"),
                         MB_OK | MB_ICONERROR,
                     );
@@ -306,6 +348,16 @@ mod tests {
     }
     #[test]
     fn strict_arguments() {
+        for (flag, expected) in [
+            ("--startup-input-method", Command::StartupInputMethod),
+            ("--enable-startup", Command::EnableStartup),
+            ("--disable-startup", Command::DisableStartup),
+        ] {
+            assert_eq!(command(&[flag]).unwrap(), expected);
+            assert!(command(&[flag, "extra"]).is_err());
+            assert!(command(&[flag, "--help"]).is_err());
+            assert!(command(&[flag, flag]).is_err());
+        }
         assert_eq!(command(&[]).unwrap(), Command::Gui);
         assert_eq!(
             command(&["--start-input-method"]).unwrap(),

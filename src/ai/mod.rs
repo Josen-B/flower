@@ -12,6 +12,9 @@ pub const MAX_FRAME_BYTES: usize = 4096;
 pub const DEBOUNCE_MS: u64 = 250;
 pub const RESULT_TIMEOUT_MS: u64 = 5000;
 pub const SERVER_IDLE_SECONDS: u64 = 60;
+pub const SPELLING_MODEL_CALLS: usize = 32;
+pub const SPELLING_CANDIDATES: usize = 4;
+pub const SPELLING_TIMEOUT_MS: u64 = 3000;
 
 /// A fixed refusal reason; contains no document text, paths, or host metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +100,7 @@ impl AiStatus {
 pub struct AiInput {
     pub raw: String,
     pub source: String,
+    pub reading: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +108,10 @@ pub struct AiInput {
 pub struct Request {
     pub id: u64,
     pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reading: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +119,97 @@ pub struct Request {
 pub struct Response {
     pub id: u64,
     pub corrected: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reading: String,
+}
+
+/// Validate transport metadata without granting permission to inspect the host.
+pub fn eligible_request(request: &Request) -> bool {
+    eligible_text(&request.text)
+        && ((request.raw.is_empty() && request.reading.is_empty())
+            || (!request.raw.is_empty()
+                && request.raw.len() <= 128
+                && request
+                    .raw
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'\'')
+                && valid_reading(&request.reading, request.text.chars().count())))
+}
+
+fn valid_reading(reading: &str, characters: usize) -> bool {
+    !reading.is_empty()
+        && reading.len() <= 512
+        && reading.split('\'').count() == characters
+        && reading
+            .split('\'')
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase()))
+}
+
+pub fn valid_response(request: &Request, response: &Response) -> bool {
+    eligible_request(request)
+        && response.id == request.id
+        && match response.corrected.as_deref() {
+            None => response.reading.is_empty(),
+            Some(corrected) if response.reading.is_empty() => {
+                valid_correction(&request.text, corrected)
+            }
+            Some(corrected) => spelling_change_span(
+                &request.raw,
+                &request.text,
+                &request.reading,
+                corrected,
+                &response.reading,
+            )
+            .is_some(),
+        }
+}
+
+/// A spelling repair may change a small syllable span, never unrelated text.
+pub fn spelling_change_span(
+    raw: &str,
+    source: &str,
+    reading: &str,
+    corrected: &str,
+    corrected_reading: &str,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if source == corrected
+        || !eligible_text(source)
+        || !eligible_text(corrected)
+        || !valid_reading(reading, source.chars().count())
+        || !valid_reading(corrected_reading, corrected.chars().count())
+        || !crate::engine::single_spelling_edit(raw, corrected_reading)
+    {
+        return None;
+    }
+    let from: Vec<_> = reading.split('\'').collect();
+    let to: Vec<_> = corrected_reading.split('\'').collect();
+    let old: Vec<_> = source.chars().collect();
+    let new: Vec<_> = corrected.chars().collect();
+    let mut prefix = 0;
+    while prefix < from.len().min(to.len()) && from[prefix] == to[prefix] {
+        if old[prefix] != new[prefix] {
+            return None;
+        }
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < (from.len() - prefix).min(to.len() - prefix)
+        && from[from.len() - 1 - suffix] == to[to.len() - 1 - suffix]
+    {
+        if old[old.len() - 1 - suffix] != new[new.len() - 1 - suffix] {
+            return None;
+        }
+        suffix += 1;
+    }
+    let old_range = prefix..from.len() - suffix;
+    let new_range = prefix..to.len() - suffix;
+    if old_range.len().max(new_range.len()) > 3
+        || old.len().abs_diff(new.len()) > 2
+        || (old_range.is_empty() && new_range.is_empty())
+    {
+        return None;
+    }
+    Some((old_range, new_range))
 }
 
 pub fn eligible_text(text: &str) -> bool {

@@ -139,6 +139,7 @@ impl FakeRegistrationBackend {
             RegistrationResource::Com => &mut self.snapshot.com,
             RegistrationResource::LanguageProfile => &mut self.snapshot.language_profile,
             RegistrationResource::KeyboardCategory => &mut self.snapshot.keyboard_category,
+            RegistrationResource::UiElementCategory => &mut self.snapshot.ui_element_category,
         }
     }
 
@@ -201,6 +202,7 @@ fn missing() -> InstallationSnapshot {
         com: ResourceState::Missing,
         language_profile: ResourceState::Missing,
         keyboard_category: ResourceState::Missing,
+        ui_element_category: ResourceState::Missing,
     }
 }
 
@@ -209,6 +211,7 @@ fn complete() -> InstallationSnapshot {
         com: ResourceState::PresentOwned,
         language_profile: ResourceState::PresentOwned,
         keyboard_category: ResourceState::PresentOwned,
+        ui_element_category: ResourceState::PresentOwned,
     }
 }
 
@@ -227,6 +230,7 @@ fn register_is_idempotent_and_installs_identity_components_in_order() {
             RegistrationResource::Com,
             RegistrationResource::LanguageProfile,
             RegistrationResource::KeyboardCategory,
+            RegistrationResource::UiElementCategory,
         ]
     );
     assert!(backend.snapshot.is_complete());
@@ -235,7 +239,7 @@ fn register_is_idempotent_and_installs_identity_components_in_order() {
         execute_registration(&mut backend, dll),
         Ok(OperationOutcome::Unchanged)
     );
-    assert_eq!(backend.writes.len(), 3);
+    assert_eq!(backend.writes.len(), 4);
     assert!(backend.removals.is_empty());
 }
 
@@ -264,6 +268,7 @@ fn failed_register_rolls_back_only_items_created_by_this_run() {
         com: ResourceState::Missing,
         language_profile: ResourceState::Missing,
         keyboard_category: ResourceState::PresentOwned,
+        ui_element_category: ResourceState::Missing,
     };
     let mut backend = FakeRegistrationBackend::new(existing_category);
     backend.fail_install = Some(RegistrationResource::LanguageProfile);
@@ -275,6 +280,34 @@ fn failed_register_rolls_back_only_items_created_by_this_run() {
     assert_eq!(
         backend.snapshot.keyboard_category,
         ResourceState::PresentOwned
+    );
+}
+
+#[test]
+fn ui_element_is_independent_and_rollback_preserves_existing_resources() {
+    let old_keyboard_install = InstallationSnapshot {
+        ui_element_category: ResourceState::Missing,
+        ..complete()
+    };
+    assert!(!old_keyboard_install.is_complete());
+    assert_eq!(
+        plan_registration(old_keyboard_install).unwrap().actions,
+        vec![RegistrationResource::UiElementCategory]
+    );
+    let mut backend = FakeRegistrationBackend::new(old_keyboard_install);
+    backend.fail_install = Some(RegistrationResource::UiElementCategory);
+    backend.write_failed_install = true;
+    assert!(execute_registration(&mut backend, Path::new(r"C:\Flower\flower.dll")).is_err());
+    assert_eq!(
+        backend.removals,
+        vec![RegistrationResource::UiElementCategory]
+    );
+    assert_eq!(backend.snapshot, old_keyboard_install);
+    let mut conflict = old_keyboard_install;
+    conflict.ui_element_category = ResourceState::Conflict;
+    assert_eq!(
+        plan_registration(conflict).unwrap_err().resource,
+        RegistrationResource::UiElementCategory
     );
 }
 
@@ -379,6 +412,7 @@ fn unregister_removes_tsf_before_com_and_repeats_safely() {
     assert_eq!(
         backend.removals,
         vec![
+            RegistrationResource::UiElementCategory,
             RegistrationResource::KeyboardCategory,
             RegistrationResource::LanguageProfile,
             RegistrationResource::Com,
@@ -389,7 +423,7 @@ fn unregister_removes_tsf_before_com_and_repeats_safely() {
         execute_unregistration(&mut backend),
         Ok(OperationOutcome::Unchanged)
     );
-    assert_eq!(backend.removals.len(), 3);
+    assert_eq!(backend.removals.len(), 4);
 }
 
 #[test]
@@ -402,6 +436,7 @@ fn unregister_failure_preserves_com_for_retry() {
     assert_eq!(
         backend.removals,
         vec![
+            RegistrationResource::UiElementCategory,
             RegistrationResource::KeyboardCategory,
             RegistrationResource::LanguageProfile,
         ]

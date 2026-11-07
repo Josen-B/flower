@@ -3,6 +3,7 @@
 pub enum Key {
     Char(char),
     Backspace,
+    Delete,
     Enter,
     Space,
     Escape,

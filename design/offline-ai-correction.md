@@ -52,7 +52,9 @@
 - 只允许相同字符数的基本汉字替换；不输出特殊token/WordPiece/字母/空白；
   最多2字且不超过原句25%发生替换。原句相同返回无建议。
 - 每个替换位置softmax置信度≥0.98，且候选对原字logit差≥4；保守默认可根据
-  固定验证集证据收紧，不为追求演示而无证据放宽。不承诺自动语法润色或拼音容错。
+  固定验证集证据收紧，不为追求演示而无证据放宽。不承诺自动语法润色；
+  0.4.12新增的单次拼音编辑候选和独立模型门禁见 `pinyin-repair-and-ranking.md`，
+  不降低本段原汉字CSC门槛。
   0.4.11改为逐字保留：不达阈值或top1不是单个基本汉字的位置保留原字，
   不再连带否决同句其他高置信纠正；全局最多2字/25%限制继续在最终建议上执行。
   固定24错句/24次正确对照中，维持0.98/4可从6条完整命中增加到7条并修正2条的部分错字，
@@ -111,7 +113,8 @@ inference将该源记录编译进worker用于比对，package读取同一源记�
 - 在TSF线程的合法只读edit session中，复用 `GetAppProperty(GUID_PROP_INPUTSCOPE)`。
   0.4.10 的AI允许集合为明确声明的默认0、搜索50、增量搜索52、中文半角53、
   中文全角54、本地文字55、正文57、聊天58、无表情聊天68；这些文本类型均可形成
-  既有4–64字中文源句。仅扩充AI的已知文本类型，不改变本地学习的0/57/58集合。
+  既有4–64字中文源句。0.4.10当时只扩充AI集合；0.4.12普通学习范围统一及原生兼容
+  以 `pinyin-repair-and-ranking.md` 为准。
   密码31、private61、数字密码63、PIN64/65/66、其他类型、未知/空/失败及混合敏感全部拒绝。
   不更换属性通道、不把VT_EMPTY当默认0、不扩展读取正文范围或缓存前次安全结果。
   拒绝状态以固定枚举区分选区、应用属性、属性读取、未声明、无效值、接口、
@@ -121,7 +124,7 @@ inference将该源记录编译进worker用于比对，package读取同一源记�
   这项用户授权例外只对AI的Property/Value/Undeclared/Empty生效，必须重新验证
   同进程同线程焦点与context view关联、受支持原生类、style和原生类过程密码字符查询；
   不把类名或非密码style单独当许可，也不声称它能补出应用缺失的私密声明。
-  明确敏感、不支持、格式/接口/列表异常仍拒绝；本地学习不走该路径。
+  明确敏感、不支持、格式/接口/列表异常仍拒绝；0.4.12普通学习复用同一原生组合验证。
   Chromium风格ACP隔离测试与官方读取示例均支持当前GetAppProperty入口；
   该测试通过不能作为真实Edge/编辑器已恢复的证据。
   **检查通过后才构造并交给后台线程文本**，AI同意独立于本地学习开关。
@@ -155,17 +158,19 @@ inference将该源记录编译进worker用于比对，package读取同一源记�
 
 ## 实施接口和所有权
 
-- `src/ai/mod.rs`：根定义共有 `AiInput { raw, source }`、
-  `Request { id, text }`、`Response { id, corrected: Option<String> }`，
+- `src/ai/mod.rs`：根定义共有 `AiInput { raw, source, reading }`、
+  `Request { id, text, raw, reading }`、`Response { id, corrected: Option<String>, reading }`，
   `AI_COMMENT`、长度/帧/超时常量及校正输出验证。
 - `EngineRouter::ai_input() -> Option<AiInput>`；
   `apply_ai_candidate(&AiInput, &str) -> Option<CompositionUpdate>`；
+  拼音修复用 `apply_ai_spelling_candidate(&AiInput, &str, &str)` 重验raw/reading证明；
   根实施引擎身份、AI整句提交/不学习语义及真实分页。
 - `src/ai/ipc.rs`：独立实现本地broker/后台客户端，
   `AiClient::start(helper: PathBuf) -> Result<Self,String>`、
   `submit(Request) -> bool`、`try_result() -> Option<Response>`、`shutdown()`；
   不在submit/try_result做IO或阻塞；broker
-  `serve(correct: impl FnMut(&str)->Result<Option<String>,String>)`。
+  生产 `serve_requests(correct: impl FnMut(&Request)->Result<Response,String>)`；
+  保留原 `serve(correct: impl FnMut(&str)->Result<Option<String>,String>)` 兼容文本测试入口。
 - `src/ai/inference.rs`：仅由settings二进制包含，负责固定bundle校验、原生模型加载、
   logits过滤及 `run_server`/显式测试推理入口；不引用TSF/真实用户配置。
 - 根负责架构文档、共享接口、TSF/timer/CLI及GUI接线；可委派已定契约内

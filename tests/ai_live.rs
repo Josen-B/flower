@@ -42,15 +42,75 @@ fn real_packaged_ai_client_accepts_cold_result_and_joins() {
         std::thread::sleep(Duration::from_millis(5));
     }
     let mut client = AiClient::start(helper).unwrap();
-    for (id, source, expected) in [
-        (1, "请问现在那里上班", Some("请问现在哪里上班")),
-        (2, "今天心情很好", None),
+    let mut requests = Vec::new();
+    for raw in [
+        "xuanzaizainalishangban",
+        "xainzaizainalishangban",
+        "xinzaizainalishangban",
+        "xiaanzaizainalishangban",
+        "xianzaizainalishangban",
     ] {
-        let started = Instant::now();
-        let request = Request {
-            id,
-            text: source.into(),
+        use flower::engine::{EngineRouter, Key, KeyEvent};
+        let mut router = EngineRouter::new().unwrap();
+        router.set_candidate_width(Some(flower::engine::paging::DEFAULT_CANDIDATE_WIDTH));
+        for c in raw.chars() {
+            router.process_key(KeyEvent::plain(Key::Char(c))).unwrap();
+        }
+        let input = router
+            .ai_input()
+            .expect("actual complete builtin candidate");
+        let correct = raw == "xianzaizainalishangban";
+        let reading = if correct || raw == "xinzaizainalishangban" {
+            ""
+        } else {
+            "xian'zai'zai'na'li'shang'ban"
         };
+        requests.push((
+            Request {
+                id: requests.len() as u64 + 1,
+                text: input.source,
+                raw: input.raw,
+                reading: input.reading,
+            },
+            (!correct).then_some("现在在哪里上班"),
+            reading,
+        ));
+    }
+    for (id, source, raw, reading, expected, expected_reading) in [
+        (1, "请问现在那里上班", "", "", Some("请问现在哪里上班"), ""),
+        (
+            2,
+            "选在在哪里上班",
+            "xuanzaizainalishangban",
+            "xuan'zai'zai'na'li'shang'ban",
+            Some("现在在哪里上班"),
+            "xian'zai'zai'na'li'shang'ban",
+        ),
+        (
+            3,
+            "我们选在哪里见面",
+            "womenxuanzainalijianmian",
+            "wo'men'xuan'zai'na'li'jian'mian",
+            None,
+            "",
+        ),
+        (4, "今天心情很好", "", "", None, ""),
+    ] {
+        requests.push((
+            Request {
+                raw: raw.into(),
+                reading: reading.into(),
+                id: id + 5,
+                text: source.into(),
+            },
+            expected,
+            expected_reading,
+        ));
+    }
+    for (request, expected, expected_reading) in requests {
+        let started = Instant::now();
+        let id = request.id;
+        println!("production_client_request={request:?}");
         while !client.submit(request.clone()) {
             assert!(started.elapsed() < Duration::from_secs(1));
             std::thread::yield_now();
@@ -67,6 +127,7 @@ fn real_packaged_ai_client_accepts_cold_result_and_joins() {
         };
         assert_eq!(response.id, id);
         assert_eq!(response.corrected.as_deref(), expected);
+        assert_eq!(response.reading, expected_reading);
         println!(
             "production_client_request_{id}_ms={:.2}",
             started.elapsed().as_secs_f64() * 1000.0

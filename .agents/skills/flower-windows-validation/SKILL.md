@@ -27,6 +27,10 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## EXE 安装器
 
+- 瘦身先统计压缩后的文件贡献，再用同一完整payload隔离比较；展开文件或PE变小不代表最终solid安装器变小。保留模型、词库与许可的逐文件摘要，区分编译耗时、解压字典估计、实测安装和运行性能；没有实际收益时不发布名义上的瘦身包。
+- Inno压缩等级的名字不等于所有参数变化；核对实际字典/FastBytes/MatchFinder/Algorithm及安装解压内存成本。Rust profile实验须记录实际rustc参数，不能仅凭环境变量声称cdylib和EXE都启用LTO；固定负载交错比较，进程首次初始化不冒称磁盘冷启动。
+- 定制ORT精简需区分非minimal reduced-operator与minimal模型格式限制，原图op列表不能覆盖运行时融合内核。未核验C API、固定模型、图优化与CPU路径前不替换官方固定运行库，也不把未测体积作为可交付收益。
+
 - `scripts/installer.py` 使用 Inno Setup 6 包装已校验的 ZIP，输出 EXE、外部校验文件和不含本机路径的构建清单。可用 `--iscc` 指定编译器；安装目录可能由 Windows 已知文件夹重定向，优先实际卸载记录，不猜工具路径。
 - 新增安装器后运行 `scripts/test_installer.py` 的边界测试，并真实编译。编译后只读检查版本资源、图标、签名状态和交付哈希，不把编译成功当成实际安装或卸载通过。
 - 当前测试安装器保守拒绝已有注册，不做自动升级。提升进程只做机器注册；用户启用/停用由普通权限开始菜单入口执行。不要把管理员账户当作目标用户。
@@ -43,6 +47,10 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 独立 TSF 探针必须区分 host client、service client 和已存在接收器。客户端标识无效或重复 advise 的错误不等于真实宿主故障，不能据此改成异步或强行吞键。
 
 ## 隔离原生回归与目录安全
+
+- TSF context身份应查询规范IUnknown；同一ITfContext接口的物理地址不是通用COM身份。QI失败拒绝受影响操作，保留focus/epoch/generation及对象强引用，不能退回零key或去掉焦点门禁。回归同时覆盖同identity不同接口、不同对象和失败查询；OnTest仍只预测。
+- 原生预编辑caret用UTF-16计量，必须在同一编辑cookie中验证字符边界和实际移动量；不能按UTF-8字节设置含汉字前缀的选择，也不能落在代理对中间。分别验证begin/replace、内部插入/两种删除、预测不改真实选择和commit/cancel末尾语义。
+- 只读ACP scope夹具不能证明Chromium类宿主可写。至少用可写ITextStoreACP串生产按键、preedit和提交读回，独立覆盖锁及选择拒绝；宿主先写后拒选择不等于可回滚。UIless需Ex/UIElement完整协商，不能只登记能力GUID或把隔离直调回调当真实Activate/Advise与具体软件验收。
 
 - 可在 STA 中创建真实 ThreadMgr、DocumentMgr 和无外部 text store 的 Context，直接调用服务按键回调，再通过真实编辑会话读回新建文档。测试不得全局注入按键或触碰用户文档。绕过 Activate/Advise 的测试只证明编辑路径，不证明真实宿主激活。
 - StartComposition 必须传入生产使用的非空 composition sink；验证预编辑、提交后光标顺序、Escape 和终止后的干净恢复。模拟宿主强制终止用 ITfContextOwnerCompositionServices::TerminateComposition；发起方自己的 EndComposition 不保证回调同一个终止 sink。
@@ -104,6 +112,13 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 - 0.4.11长候选按实际PaintFont/GDI字宽在Unicode标量边界换行，窗口内部滚动不改引擎页；必须验证末字实际像素、AI显示标记、滚动命中、状态行隔离和可见刷新工作区限界。SaveDC/IntersectClipRect失败须停止候选绘制并恢复DC；鼠标命中只由成功呈现且快照/DPI/状态/滚动/客户区/窗口几何仍匹配的帧授权，不能重建不可见候选选择区。故障注入与真实HWND生产state验证可覆盖这一分支，无需重跑无关词库/持久化套件。
 - 原生AI兼容边界以design/long-candidates-and-ai-compatibility.md为准，需遵守用户已明确授权的隐私取舍；不能把同进程类名或非密码style单独当安全声明。当前实现限定四类声明缺失/失败并组合焦点/context view、PID/TID、原生类、style和类过程密码字符检查；明确敏感仍拒，本地学习不回退。SendMessageTimeout在同消息队列会忽略超时，跨线程超时夹具不能证明同线程生产有界；GetClassLongPtrW/CallWindowProcW只读类过程检查须验证绕过应用子类拦截后仍读取真实掩码，不宣称可抢占任意宿主/系统代码。
 
+## 拼音修复与通用选词记忆
+
+- 拼音误输验证须分开记录原始raw、真实builtin首候选/规范reading、生成器召回、模型放行、协议proof和最终提交；生成金标在候选中不等于AI已展示。用替换、交换、漏字、多字以及正确自然句对照，保留未达门槛的边界，不为演示降低原CSC阈值。新拼音路径可用独立组合证据，但发布端仍须校验编辑距离、局部音节/字数和未变前后缀，不能借修拼音顺便改其他同音字。
+- 原始拼音与reading的IPC扩展保持有界、身份及期限，旧空metadata路径要有兼容测试；真实包内AiClient/自有broker应包含新拼音正例、正确对照和旧CSC，退出只停止自己持有的进程。真实WM_TIMER只读session+fakeResponse证明接线，不能冒充真实模型或用户宿主端到端。隔离原生组合应串起真实按键、实际请求、生产管道/模型及最终提交，并区分快打、前缀响应完成后继续和前缀仍在途继续；旧None结果不得覆盖新完整句。即使该组合通过，用户已确认版本且重开宿主后仍失败，也不能推定旧DLL或宣称修复。可用固定公开句诊断脚本在实机记录后台响应/阶段/耗时、模块路径与磁盘摘要；不读取正文/词典，不把固定metadata等同TSF实际metadata，磁盘hash不等于已加载映像身份，复用后台不终止它，自有进程清理须核实退出。
+- 排名故障先判断事件生成、编辑成功、安全门禁、focus/context/claim、激活内同步和worker保存哪个环节断开。数字、候选动作、方向Enter/Space共用成功提交链；同context、跨context、Store重载分开验证。使用真实builtin歧义词且查身份/consumed，不给示例词硬加权；相邻前移与频率默认排序是不同层，AI建议及失败/取消/敏感输入不学习。0.4.12普通学习的类型/native兼容边界以design/pinyin-repair-and-ranking.md为准，历史“仅AI兼容/学习0、57、58”不可当当前规则。
+- 默认排名的人工使用prior必须有界且绑定规范词对，不伪称统计词频；保留简拼/混拼既有正例，不能靠扩大beam或预算掩盖退化。文字总频率不等于读音义项频率，多音词有合法次义时应保留来源，不能把罕用读音误报为错字或凭主观改源权重。
+
 ## 用户词典发布前进程终止回归
 
 - 可用隔离 `DictionaryStore::new` 指向本 Thread scratch 下词典，父进程持有目标的无 delete-sharing 只读句柄，让真实生产写入停留在原子发布前；不得使用真实用户词典或填满工作磁盘。
@@ -113,12 +128,22 @@ description: 在 Flower 仓库执行 Windows x64 原生构建、ZIP 验证、COM
 
 ## 运行期路径与原生设置视觉
 
+- Windows PowerShell 5.1的 `Split-Path`/`Join-Path` 也不能直接消费COM注册里的 `\\?\C:\...`，可能报drive为空。诊断工具须在provider操作前仅适配精确的verbatim本地盘符表示；保留原注册值用于报告，IPC身份仍取文件句柄返回的canonical路径。验证自动注册定位与显式helper两条入口，不能只用普通路径的 `-Helper` 探针替代自动定位；请求列表为空的初始化错误不算后台模型已测。
+
 - 注册canonical路径与GetModuleFileNameW可能保留 `\\?\C:\...`。AI初始化不能把它直接交给仅接受普通盘符的安装CLI语法检查；仅在运行期入口精确适配verbatim本地磁盘形式，再跑原祖先/整树/owner/DACL/reparse/hardlink检查。不要扩大CLI路径接受范围、盲目剥所有前缀或canonicalize后掩盖链接。纯规范化测试和可写fixture仍被拒绝的实际门禁测试分别记录，不把字符串转换当安全证明。
 - AI初始化失败应保留固定阶段原因：模块路径、路径形式、目录安全、缺helper/资产、client或timer；不要持久记录输入或本机路径，也不要把helper存在称模型运行就绪。
 - Win32设置可用原生卡片/多级字体/owner-draw主次按钮改善视觉，但不引入无真实行为的导航。DictionaryStore和SettingsStore须注入，预览及动作只用自有fixture，窗口截图来自自己HWND而非桌面；字典错误不重建覆盖。UI美化需保留立即保存/表单保存/清空确认的区别。
 - BS_OWNERDRAW不能与BS_DEFPUSHBUTTON互斥位硬或。生产键盘循环若先IsDialogMessageW，Enter可能抢先发IDOK，把聚焦关闭/危险动作变成保存；必须验证实际路由优先级、展开下拉Enter/Esc、Tab/ShiftTab/Space，不以静态布局或没有消息循环的截图fixture证明键盘正确。
 - visualstyles/PerMonitorV2/asInvoker的应用manifest仅附到flower-settings.exe，不附TSF DLL或改变宿主DPI；按需在GUI启动前InitCommonControlsEx。资源只读映射验证settings包含而其他PE没有这些声明，图标仍单独核验。测试进程截图不等于最终EXE的v6主题或实际多屏验收。
 - 快捷方式显示名变更不等于改EXE文件名、参数或权限。启动/停用仍普通用户enable/disable；只改新安装器声明，不自动删除真实用户旧快捷方式或更改注册。
+
+## 登录自启动与UIElement增量
+
+- 以 `design/startup-uiless-and-mixed-composition.md` 核对当前合同。登录项命令应绑定实际current_exe及完整受保护安装，不接受任意调用方路径；Run值的类型、UTF-16内容和唯一终止符均纳入所有权，未知同名值拒覆盖/删除。登录模式连非法参数组合也静默；包核验只运行无副作用负例，纯store成功不冒充真实登录。
+- Inno的ExecAsOriginalUser不支持卸载期，UninstallRun也不支持runasoriginaluser；提升卸载的HKCU不是原用户。按既定每用户先关闭/停用流程记录残留边界，不枚举其他hive或误删管理员账户项。
+- UIElement协商须覆盖Begin的pbShow和后续Show，拒显同时约束候选、AI状态行、caret刷新和旧鼠标帧；保留隐藏HWND供原timer，不将拒显等价为禁用AI。生命周期COM调用放在RefCell可变借用之外，测试Begin期间停用/重激活及旧元素失效。
+- 新能力类别作为独立注册资源验证冲突、补装、写后失败回滚、卸载逆序和installer孤立项检测；keyboard-only旧安装不得因补能力失败被清掉旧资源。只登记真实实现的能力，不用协议隔离通过外推微信/WPS现场。
+- 解码排序改变后，先以真实builtin→请求→模型核对原生测试固定source是否过期；若只更新测试预期，保留非None金标、只读发布、显式选择提交及不学习断言，仅重验受影响场景，不改生产迎合旧文本，也无需为cfg(test)变化重打未变运行包。
 
 ## 交接
 

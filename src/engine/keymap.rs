@@ -12,6 +12,7 @@ pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
 pub const VK_DOWN: u32 = 0x28;
+pub const VK_DELETE: u32 = 0x2E;
 
 /// Maps the Windows virtual-key subset used by the MVP.
 ///
@@ -39,6 +40,7 @@ pub fn map_windows_virtual_key(virtual_key: u32, modifiers: Modifiers) -> Option
         0xBD if !modifiers.shift => Key::PageUp, // - but not _
         0x6D => Key::PageUp,                     // numpad -
         VK_BACK => Key::Backspace,
+        VK_DELETE => Key::Delete,
         VK_RETURN => Key::Enter,
         VK_ESCAPE => Key::Escape,
         VK_SPACE => Key::Space,

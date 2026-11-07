@@ -1,7 +1,7 @@
 //! Local-only correction transport. The host must establish that the helper's
 //! installation directory is protected; canonicalization is not an ACL check.
 
-use super::{eligible_text, Request, Response};
+use super::{eligible_request, Request, Response};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -55,7 +55,7 @@ impl AiClient {
     pub fn submit(&self, request: Request) -> bool {
         if self.stop.load(Ordering::Acquire)
             || request.text.len() > super::MAX_FRAME_BYTES
-            || !eligible_text(&request.text)
+            || !eligible_request(&request)
         {
             return false;
         }
@@ -116,6 +116,8 @@ mod mailbox_tests {
         let mut client = client();
         for id in 0..100 {
             assert!(client.submit(Request {
+                raw: String::new(),
+                reading: String::new(),
                 id,
                 text: "今天心情很好".into(),
             }));
@@ -124,12 +126,16 @@ mod mailbox_tests {
             let m = client.mailbox.lock().unwrap();
             assert_eq!(m.pending.as_ref().unwrap().1.id, 99);
             assert!(!client.submit(Request {
+                raw: String::new(),
+                reading: String::new(),
                 id: 100,
                 text: "今天心情很好".into(),
             }));
             assert!(client.try_result().is_none());
         }
         assert!(!client.submit(Request {
+            raw: String::new(),
+            reading: String::new(),
             id: 101,
             text: "private ASCII".into(),
         }));
@@ -137,6 +143,8 @@ mod mailbox_tests {
         client.shutdown();
         assert!(client.try_result().is_none());
         assert!(!client.submit(Request {
+            raw: String::new(),
+            reading: String::new(),
             id: 102,
             text: "今天心情很好".into(),
         }));
@@ -146,16 +154,20 @@ mod mailbox_tests {
     fn result_is_consumed_once_and_new_submission_clears_it() {
         let client = client();
         client.mailbox.lock().unwrap().result = Some(Response {
+            reading: String::new(),
             id: 1,
             corrected: None,
         });
         assert_eq!(client.try_result().unwrap().id, 1);
         assert!(client.try_result().is_none());
         client.mailbox.lock().unwrap().result = Some(Response {
+            reading: String::new(),
             id: 2,
             corrected: None,
         });
         assert!(client.submit(Request {
+            raw: String::new(),
+            reading: String::new(),
             id: 3,
             text: "今天心情很好".into(),
         }));
@@ -165,10 +177,24 @@ mod mailbox_tests {
 
 /// Bind before invoking `correct`; callers can lazily load the model in this
 /// process-owned closure. No model or host document state crosses the pipe.
-pub fn serve(correct: impl FnMut(&str) -> Result<Option<String>, String>) -> Result<(), String> {
+pub fn serve(
+    mut correct: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    serve_requests(move |request| {
+        Ok(Response {
+            id: request.id,
+            corrected: correct(&request.text)?,
+            reading: String::new(),
+        })
+    })
+}
+
+pub fn serve_requests(
+    correct: impl FnMut(&Request) -> Result<Response, String>,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
-        platform::serve(correct)
+        platform::serve_requests(correct)
     }
     #[cfg(not(windows))]
     {
@@ -180,7 +206,7 @@ pub fn serve(correct: impl FnMut(&str) -> Result<Option<String>, String>) -> Res
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use crate::ai::{valid_correction, MAX_FRAME_BYTES, RESULT_TIMEOUT_MS, SERVER_IDLE_SECONDS};
+    use crate::ai::{valid_response, MAX_FRAME_BYTES, RESULT_TIMEOUT_MS, SERVER_IDLE_SECONDS};
     use serde::{de::DeserializeOwned, Serialize};
     use sha2::{Digest, Sha256};
     use std::ffi::OsString;
@@ -574,12 +600,7 @@ mod platform {
     }
 
     fn checked_response(request: &Request, response: Response) -> Result<Response, String> {
-        if response.id != request.id
-            || response
-                .corrected
-                .as_ref()
-                .is_some_and(|s| !valid_correction(&request.text, s))
-        {
+        if !valid_response(request, &response) {
             return Err("invalid AI response identity or correction".into());
         }
         Ok(response)
@@ -619,8 +640,8 @@ mod platform {
         }
     }
 
-    pub(super) fn serve(
-        correct: impl FnMut(&str) -> Result<Option<String>, String>,
+    pub(super) fn serve_requests(
+        correct: impl FnMut(&Request) -> Result<Response, String>,
     ) -> Result<(), String> {
         let helper = helper_path(
             std::env::current_exe().map_err(|_| "cannot resolve AI broker image".to_string())?,
@@ -639,7 +660,7 @@ mod platform {
         pipe: Handle,
         sid: &str,
         idle_for: Duration,
-        mut correct: impl FnMut(&str) -> Result<Option<String>, String>,
+        mut correct: impl FnMut(&Request) -> Result<Response, String>,
     ) -> Result<(), String> {
         let stop = AtomicBool::new(false);
         let mut idle = Instant::now() + idle_for;
@@ -665,7 +686,7 @@ mod platform {
                 peer(pipe.0, None, sid)?;
                 let request: Request =
                     read_frame(pipe.0, &stop, idle.min(Instant::now() + IO_LIMIT))?;
-                if !eligible_text(&request.text) {
+                if !eligible_request(&request) {
                     return Err("ineligible AI request".into());
                 }
                 Ok(request)
@@ -680,26 +701,15 @@ mod platform {
                 }
             };
             idle = Instant::now() + idle_for;
-            let corrected = match correct(&request.text) {
+            let response = match correct(&request) {
                 Ok(value) => value,
                 Err(_) => return Err("AI correction initialization or inference failed".into()),
             };
-            if corrected
-                .as_ref()
-                .is_some_and(|s| !valid_correction(&request.text, s))
-            {
+            if !valid_response(&request, &response) {
                 return Err("invalid model correction".into());
             }
             let _ = (|| {
-                write_frame(
-                    pipe.0,
-                    &Response {
-                        id: request.id,
-                        corrected,
-                    },
-                    &stop,
-                    Instant::now() + IO_LIMIT,
-                )?;
+                write_frame(pipe.0, &response, &stop, Instant::now() + IO_LIMIT)?;
                 // One request per connection. Wait for client EOF after it
                 // consumes the response; disconnecting immediately can discard
                 // unread bytes. No extra wire message or unbounded flush.
@@ -871,23 +881,29 @@ mod platform {
         #[test]
         fn response_validation_rejects_id_mismatch_and_unsafe_corrections() {
             let request = Request {
+                raw: String::new(),
+                reading: String::new(),
                 id: 7,
                 text: "今天新情很好".into(),
             };
             for response in [
                 Response {
+                    reading: String::new(),
                     id: 8,
                     corrected: None,
                 },
                 Response {
+                    reading: String::new(),
                     id: 7,
                     corrected: Some("今天新情很好".into()),
                 },
                 Response {
+                    reading: String::new(),
                     id: 7,
                     corrected: Some("天气实在不好".into()),
                 },
                 Response {
+                    reading: String::new(),
                     id: 7,
                     corrected: Some("private ASCII".into()),
                 },
@@ -897,6 +913,7 @@ mod platform {
             assert!(checked_response(
                 &request,
                 Response {
+                    reading: String::new(),
                     id: 7,
                     corrected: None
                 }
@@ -981,6 +998,8 @@ mod platform {
                 write_frame(
                     pipe.0,
                     &Request {
+                        raw: String::new(),
+                        reading: String::new(),
                         id: 1,
                         text: if eligible {
                             "今天心情很好"
@@ -1030,6 +1049,7 @@ mod platform {
                         write_frame(
                             pipe.0,
                             &Response {
+                                reading: String::new(),
                                 id: request.id,
                                 corrected: Some("今天心情很好".into()),
                             },
@@ -1064,6 +1084,8 @@ mod platform {
             let submit = |id| {
                 let deadline = Instant::now() + IO_LIMIT;
                 while !client.submit(Request {
+                    raw: String::new(),
+                    reading: String::new(),
                     id,
                     text: "今天新情很好".into(),
                 }) {

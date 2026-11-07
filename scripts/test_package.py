@@ -266,6 +266,13 @@ class PackageFixture:
             shutil.copyfile(REPO_ROOT / "data/pinyin" / name,
                             self.repo / "data/pinyin" / name)
         (self.repo / "Cargo.lock").write_text("# test lock\n", encoding="utf-8")
+        # Explicit valid category fixture: runtime allowlist plus independent source pin.
+        for name in sorted(flower_package.CATEGORY_FILES | {
+            "data/pinyin/sources/thuocl/manifest.json",
+        }):
+            destination = self.repo / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO_ROOT / name, destination)
 
         self.target_dir = base / "custom target dir"
         self.release_dir = (
@@ -567,6 +574,108 @@ class IscLicenseTests(unittest.TestCase):
                         (directory / "LICENSE").write_text(invalid, encoding="utf-8")
                     with self.assertRaises(flower_package.PackagingError):
                         flower_package._dependency_license_bundle([package])
+
+
+class CategoryBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.payload, self.record = flower_package._category_bundle(REPO_ROOT)
+        for name in ("data/pinyin/base_lexicon.tsv", "data/pinyin/everyday_phrases.tsv",
+                     "data/pinyin/phrases/phrase_lexicon.tsv"):
+            self.payload[name] = (REPO_ROOT / name).read_bytes()
+
+    def test_exact_runtime_allowlist_and_unique_union(self):
+        self.assertEqual(len(flower_package.CATEGORY_TABLES), 13)
+        self.assertEqual(len(flower_package.CATEGORY_FILES), 22)
+        self.assertEqual(self.record["global_unique_pairs"], 91458)
+        self.assertEqual(self.record["additional_to_default"], 80722)
+        self.assertFalse(any("provenance" in p or "rejected" in p for p in self.record["paths"]))
+        self.assertEqual(self.record["paths"], sorted(flower_package.CATEGORY_FILES))
+
+    def test_missing_or_tampered_required_file(self):
+        for path in sorted(flower_package.CATEGORY_FILES):
+            with self.subTest(path=path):
+                original = self.payload.pop(path)
+                with self.assertRaises(flower_package.PackagingError):
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                self.payload[path] = original + b"tamper"
+                with self.assertRaises(flower_package.PackagingError):
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+                self.payload[path] = original
+
+    def test_rehashed_noncanonical_records_fail(self):
+        path = flower_package.CATEGORY_PREFIX + "IT.tsv"
+        manifest_path = flower_package.CATEGORY_PREFIX + "manifest.json"
+        original = self.payload[path]
+        manifest_bytes = self.payload[manifest_path]
+        for row in (b"NI'hao\t" + "你好".encode() + b"\t1",
+                    b"ni'hao\t" + "你好".encode() + b"\t01",
+                    b"ni\t" + "你好".encode() + b"\t1",
+                    b"ni'hao\tAB\t1", b"ni'hao\t" + "你好".encode() + b"\t0"):
+            with self.subTest(row=row):
+                data = row + b"\n" + original.split(b"\n", 1)[1]
+                self.payload[path] = data
+                manifest = json.loads(manifest_bytes)
+                manifest["files"]["IT.tsv"].update(
+                    bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+                self.payload[manifest_path] = json.dumps(manifest).encode()
+                with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
+                    flower_package._verify_category_payload(self.payload, REPO_ROOT)
+
+    def test_rehashed_empty_tables_and_zero_statistics_cannot_self_authorize(self):
+        prefix = flower_package.CATEGORY_PREFIX
+        manifest = json.loads(self.payload[prefix + "manifest.json"])
+        coverage = json.loads(self.payload[prefix + "coverage.json"])
+        for name in flower_package.CATEGORY_TABLES:
+            self.payload[prefix + name] = b""
+            manifest["files"][name].update(
+                bytes=0, lines=0, pairs=0, sha256=hashlib.sha256(b"").hexdigest())
+        for record in (manifest, coverage):
+            record.update(global_unique_pairs=0, additional_to_default=0)
+        data = json.dumps(coverage).encode()
+        self.payload[prefix + "coverage.json"] = data
+        manifest["files"]["coverage.json"].update(
+            bytes=len(data), lines=len(data.splitlines()), sha256=hashlib.sha256(data).hexdigest())
+        self.payload[prefix + "manifest.json"] = json.dumps(manifest).encode()
+        with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
+            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+
+    def test_rehashed_unsupported_syllables_fail_pin_and_syllable_guard(self):
+        prefix = flower_package.CATEGORY_PREFIX
+        path = prefix + "IT.tsv"
+        data = b"r'zzzz'zzzz\t" + "爱加密".encode() + b"\t1025\n" + self.payload[path].split(b"\n", 1)[1]
+        self.payload[path] = data
+        manifest = json.loads(self.payload[prefix + "manifest.json"])
+        manifest["files"]["IT.tsv"].update(
+            bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+        manifest_bytes = json.dumps(manifest).encode()
+        self.payload[prefix + "manifest.json"] = manifest_bytes
+        with self.assertRaisesRegex(flower_package.PackagingError, "可信快照"):
+            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+        # Even an explicitly repinned future snapshot must pass the syllable guard.
+        with mock.patch.object(flower_package, "CATEGORY_MANIFEST_SHA256",
+                               hashlib.sha256(manifest_bytes).hexdigest()):
+            with self.assertRaisesRegex(flower_package.PackagingError, "不规范"):
+                flower_package._verify_category_payload(self.payload, REPO_ROOT)
+
+    def test_base_syllable_keys_require_pinned_bytes(self):
+        self.payload["data/pinyin/base_lexicon.tsv"] += b"zzzz\t" + "字".encode() + b"\t1\n"
+        with self.assertRaisesRegex(flower_package.PackagingError, "base 音节来源摘要"):
+            flower_package._verify_category_payload(self.payload, REPO_ROOT)
+
+    def test_forged_manifest_paths_sources_and_statistics_fail(self):
+        path = flower_package.CATEGORY_PREFIX + "manifest.json"
+        original = self.payload[path]
+        for mutate in (
+            lambda m: m["files"].update({"../extra.tsv": {}}),
+            lambda m: m.update(global_unique_pairs=m["global_unique_pairs"] + 1),
+            lambda m: m.update(default_loaded=False),
+            lambda m: m["sources"]["thuocl"]["files"]["LICENSE"].update(sha256="0" * 64),
+        ):
+            manifest = json.loads(original)
+            mutate(manifest)
+            self.payload[path] = json.dumps(manifest).encode()
+            with self.assertRaises(flower_package.PackagingError):
+                flower_package._verify_category_payload(self.payload, REPO_ROOT)
 
 
 class PackageTests(unittest.TestCase):
@@ -944,7 +1053,8 @@ class PackageTests(unittest.TestCase):
             self.assertTrue(required <= relative_names)
             self.assertEqual(
                 {name for name in relative_names if not name.startswith("licenses/")},
-                required | {"ai/" + name for name in flower_package.package_ai_assets.BUNDLE_FILES},
+                required | flower_package.CATEGORY_FILES
+                | {"ai/" + name for name in flower_package.package_ai_assets.BUNDLE_FILES},
             )
             self.assertFalse(any(
                 name.lower().endswith((".pdb", ".rlib"))

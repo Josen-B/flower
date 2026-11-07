@@ -14,6 +14,7 @@ mod ranking;
 mod router;
 mod segment;
 mod session;
+mod spelling;
 mod types;
 
 pub mod keymap;
@@ -25,6 +26,15 @@ pub use lexicon::Lexicon;
 pub use ranking::{promote_order, ranking_indices};
 pub use router::EngineRouter;
 pub use session::{EngineSession, PinyinSession, DEFAULT_PAGE_SIZE};
+pub use spelling::{single_spelling_edit, SpellingIndex};
 pub use types::{
     Candidate, CompositionUpdate, LearningEvent, PromotionEvent, RankingCandidate, RankingOrder,
 };
+
+/// A bounded dictionary reconstruction for one full-pinyin typing mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpellingCandidate {
+    pub text: String,
+    pub reading: String,
+    pub edits: u8,
+}

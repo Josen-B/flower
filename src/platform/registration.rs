@@ -43,8 +43,8 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows::Win32::UI::TextServices::{
     CLSID_TF_CategoryMgr, CLSID_TF_InputProcessorProfiles, ITfCategoryMgr,
-    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, GUID_TFCAT_TIP_KEYBOARD,
-    TF_INPUTPROCESSORPROFILE, TF_PROFILETYPE_INPUTPROCESSOR,
+    ITfInputProcessorProfileMgr, ITfInputProcessorProfiles, GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    GUID_TFCAT_TIP_KEYBOARD, TF_INPUTPROCESSORPROFILE, TF_PROFILETYPE_INPUTPROCESSOR,
 };
 
 const MAX_DLL_SIZE: u64 = 512 * 1024 * 1024;
@@ -843,12 +843,31 @@ fn inspect_language_profile() -> Result<ResourceState, String> {
 }
 
 fn inspect_keyboard_category() -> Result<ResourceState, String> {
+    inspect_category(GUID_TFCAT_TIP_KEYBOARD)
+}
+
+fn inspect_ui_element_category() -> Result<ResourceState, String> {
+    inspect_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
+}
+
+fn category_state(categories: &[GUID], requested: GUID) -> ResourceState {
+    if categories.iter().any(|category| {
+        *category != GUID_TFCAT_TIP_KEYBOARD && *category != GUID_TFCAT_TIPCAP_UIELEMENTENABLED
+    }) {
+        ResourceState::Conflict
+    } else if categories.contains(&requested) {
+        ResourceState::PresentOwned
+    } else {
+        ResourceState::Missing
+    }
+}
+
+fn inspect_category(requested: GUID) -> Result<ResourceState, String> {
     let manager = category_manager()?;
     // SAFETY: The manager and fixed class identifier are live for the call.
     let categories = unsafe { manager.EnumCategoriesInItem(&FLOWER_CLSID) }
         .map_err(|error| com_error("枚举 Flower TSF 分类", error))?;
-    let mut found_keyboard = false;
-    let mut found_unknown = false;
+    let mut found = Vec::new();
     loop {
         let mut category = [GUID::default()];
         let mut fetched = 0;
@@ -861,19 +880,39 @@ fn inspect_keyboard_category() -> Result<ResourceState, String> {
         if fetched == 0 {
             break;
         }
-        if category[0] == GUID_TFCAT_TIP_KEYBOARD {
-            found_keyboard = true;
-        } else {
-            found_unknown = true;
+        found.push(category[0]);
+    }
+    Ok(category_state(&found, requested))
+}
+
+#[cfg(test)]
+mod category_pure_tests {
+    use super::*;
+
+    #[test]
+    fn registrationpure_ui_element_categories_are_exact_and_independent() {
+        let keyboard = GUID_TFCAT_TIP_KEYBOARD;
+        let ui = GUID_TFCAT_TIPCAP_UIELEMENTENABLED;
+        assert_eq!(category_state(&[], keyboard), ResourceState::Missing);
+        assert_eq!(category_state(&[], ui), ResourceState::Missing);
+        assert_eq!(
+            category_state(&[keyboard], keyboard),
+            ResourceState::PresentOwned
+        );
+        assert_eq!(category_state(&[keyboard], ui), ResourceState::Missing);
+        assert_eq!(category_state(&[ui], ui), ResourceState::PresentOwned);
+        assert_eq!(category_state(&[ui], keyboard), ResourceState::Missing);
+        for category in [keyboard, ui] {
+            assert_eq!(
+                category_state(&[keyboard, ui], category),
+                ResourceState::PresentOwned
+            );
+            assert_eq!(
+                category_state(&[keyboard, ui, GUID::from_u128(1)], category),
+                ResourceState::Conflict
+            );
         }
     }
-    Ok(if found_unknown {
-        ResourceState::Conflict
-    } else if found_keyboard {
-        ResourceState::PresentOwned
-    } else {
-        ResourceState::Missing
-    })
 }
 
 fn install_language_profile(dll: &Path) -> Result<ResourceInstallation, String> {
@@ -944,7 +983,15 @@ fn remove_language_profile() -> Result<(), String> {
 }
 
 fn install_keyboard_category() -> Result<ResourceInstallation, String> {
-    match inspect_keyboard_category()? {
+    install_category(GUID_TFCAT_TIP_KEYBOARD)
+}
+
+fn install_ui_element_category() -> Result<ResourceInstallation, String> {
+    install_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
+}
+
+fn install_category(category: GUID) -> Result<ResourceInstallation, String> {
+    match inspect_category(category)? {
         ResourceState::PresentOwned => return Ok(ResourceInstallation::AlreadyPresent),
         ResourceState::Conflict => {
             return Err("Flower TSF 键盘分类状态冲突；未覆盖。".to_owned());
@@ -954,14 +1001,22 @@ fn install_keyboard_category() -> Result<ResourceInstallation, String> {
 
     let manager = category_manager()?;
     // SAFETY: The manager and all fixed GUIDs remain live for the call. Flower
-    // implements a keyboard TIP, so this is the only category registered.
-    unsafe { manager.RegisterCategory(&FLOWER_CLSID, &GUID_TFCAT_TIP_KEYBOARD, &FLOWER_CLSID) }
+    // implements only the keyboard and UIElement capabilities.
+    unsafe { manager.RegisterCategory(&FLOWER_CLSID, &category, &FLOWER_CLSID) }
         .map_err(|error| com_error("注册 TSF 键盘分类", error))?;
     Ok(ResourceInstallation::Created)
 }
 
 fn remove_keyboard_category() -> Result<(), String> {
-    match inspect_keyboard_category()? {
+    remove_category(GUID_TFCAT_TIP_KEYBOARD)
+}
+
+fn remove_ui_element_category() -> Result<(), String> {
+    remove_category(GUID_TFCAT_TIPCAP_UIELEMENTENABLED)
+}
+
+fn remove_category(category: GUID) -> Result<(), String> {
+    match inspect_category(category)? {
         ResourceState::Missing => return Ok(()),
         ResourceState::Conflict => {
             return Err("Flower TSF 键盘分类状态冲突；未删除。".to_owned());
@@ -971,11 +1026,9 @@ fn remove_keyboard_category() -> Result<(), String> {
 
     let manager = category_manager()?;
     // SAFETY: The manager and all fixed GUIDs remain live for the call.
-    let result = unsafe {
-        manager.UnregisterCategory(&FLOWER_CLSID, &GUID_TFCAT_TIP_KEYBOARD, &FLOWER_CLSID)
-    };
+    let result = unsafe { manager.UnregisterCategory(&FLOWER_CLSID, &category, &FLOWER_CLSID) };
     if let Err(error) = result {
-        match inspect_keyboard_category() {
+        match inspect_category(category) {
             Ok(ResourceState::Missing) => return Ok(()),
             Ok(_) => return Err(com_error("注销 TSF 键盘分类", error)),
             Err(check_error) => {
@@ -1000,6 +1053,7 @@ impl RegistrationBackend for WindowsRegistrationBackend {
             com: inspect_com(expected_dll)?.state,
             language_profile: inspect_language_profile()?,
             keyboard_category: inspect_keyboard_category()?,
+            ui_element_category: inspect_ui_element_category()?,
         })
     }
 
@@ -1015,6 +1069,7 @@ impl RegistrationBackend for WindowsRegistrationBackend {
             }
             RegistrationResource::LanguageProfile => install_language_profile(dll),
             RegistrationResource::KeyboardCategory => install_keyboard_category(),
+            RegistrationResource::UiElementCategory => install_ui_element_category(),
         }
     }
 
@@ -1023,6 +1078,7 @@ impl RegistrationBackend for WindowsRegistrationBackend {
             RegistrationResource::Com => remove_com_registration(),
             RegistrationResource::LanguageProfile => remove_language_profile(),
             RegistrationResource::KeyboardCategory => remove_keyboard_category(),
+            RegistrationResource::UiElementCategory => remove_ui_element_category(),
         }
     }
 }
@@ -1120,6 +1176,33 @@ pub fn unregister() -> Result<OperationOutcome, OperationError> {
     })?;
     let mut backend = WindowsRegistrationBackend;
     execute_unregistration(&mut backend)
+}
+
+/// Read-only ownership gate for the current installed settings executable.
+/// Does not register, enable, or write current-user configuration.
+pub fn validate_current_settings_installation() -> Result<PathBuf, String> {
+    let executable = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    if !executable.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case("flower-settings.exe")
+    }) {
+        return Err("当前程序不是 Flower 设置载荷。".into());
+    }
+    let directory = super::install_path::normalize_runtime_directory(
+        executable.parent().ok_or("缺少载荷目录。")?,
+    )?;
+    super::install_path::check_install_path(&directory)?;
+    let validated = validate_dll(&directory.join("flower.dll")).map_err(|e| e.to_string())?;
+    let _apartment = ComApartment::initialize()?;
+    let mut backend = WindowsRegistrationBackend;
+    if !backend
+        .inspect_registration(Some(&validated.path))?
+        .is_complete()
+    {
+        return Err("机器注册不属于当前完整 Flower 安装。".into());
+    }
+    Ok(directory.join("flower-settings.exe"))
 }
 
 pub fn enable() -> Result<OperationOutcome, OperationError> {

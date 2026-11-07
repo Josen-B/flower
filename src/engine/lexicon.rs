@@ -9,23 +9,46 @@ const BUILTIN_LEXICON: &str = concat!(
     include_str!("../../data/pinyin/phrases/phrase_lexicon.tsv"),
     "\n",
     include_str!("../../data/pinyin/everyday_phrases.tsv"),
+    "\n",
+    include_str!("../../data/pinyin/categories/IT.tsv"),
+    include_str!("../../data/pinyin/categories/animal.tsv"),
+    include_str!("../../data/pinyin/categories/caijing.tsv"),
+    include_str!("../../data/pinyin/categories/car.tsv"),
+    include_str!("../../data/pinyin/categories/chengyu.tsv"),
+    include_str!("../../data/pinyin/categories/diming.tsv"),
+    include_str!("../../data/pinyin/categories/food.tsv"),
+    include_str!("../../data/pinyin/categories/law.tsv"),
+    include_str!("../../data/pinyin/categories/lishimingren.tsv"),
+    include_str!("../../data/pinyin/categories/medical.tsv"),
+    include_str!("../../data/pinyin/categories/poem.tsv"),
+    include_str!("../../data/pinyin/categories/cedict_supplement.tsv"),
+    include_str!("../../data/pinyin/categories/erhua.tsv"),
 );
 
 const EVERYDAY_PHRASES: &str = include_str!("../../data/pinyin/everyday_phrases.tsv");
 
-// Project-maintained everyday vocabulary, NOT corpus frequency or new readings.
-// Canonical multi-syllable entries are classified only at builtin load.
-const EVERYDAY_WORDS: &str = "\
-你好 您好 谢谢 再见 我们 你们 他们 什么 意思 怎么 为什么 可以 需要 知道 喜欢 \
-今天 明天 现在 时间 工作 学习 电脑 手机 输入法 中国 大家 自己 一个 这个 那个 \
-这些 那些 这里 那里 这样 那样 多少 时候 已经 还是 因为 所以 如果 但是 而且 \
-一起 一直 一定 可能 应该 没有 不是 不要 不能 不好 非常 真的 觉得 希望 \
-朋友 家人 孩子 老师 学生 学校 公司 生活 世界 北京 上海 早上 晚上 下午 上午 \
-中午 昨天 以后 以前 开始 结束 继续 等待 帮助 问题 事情 方法 结果 消息 电话 \
-地址 名字 号码 邮件 文件 软件 系统 网络 网站 密码 设置 打开 关闭 保存 选择 \
-使用 安装 更新 语言 中文 拼音 文字 音乐 电影 游戏 天气 快乐 高兴 开心 健康 \
-安全 吃饭 喝水 回家 出门 上班 下班 休息 睡觉 购买 价格 生日 欢迎 对不起 \
-没关系 不客气 请问";
+// Project-maintained usage prior, NOT corpus frequency or new readings.
+// Exact pairs prevent a future additional reading inheriting the classification.
+const EVERYDAY_PAIRS: &str = "\
+ni'hao=你好 xie'xie=谢谢 zai'jian=再见 wo'men=我们 ni'men=你们 ta'men=他们 shen'me=什么 yi'si=意思 wei'xin=微信 \
+zen'me=怎么 wei'shen'me=为什么 ke'yi=可以 xu'yao=需要 zhi'dao=知道 xi'huan=喜欢 jin'tian=今天 ming'tian=明天 \
+xian'zai=现在 shi'jian=时间 gong'zuo=工作 xue'xi=学习 dian'nao=电脑 shou'ji=手机 shu'ru'fa=输入法 zhong'guo=中国 \
+da'jia=大家 zi'ji=自己 yi'ge=一个 zhe'ge=这个 na'ge=那个 zhe'xie=这些 na'xie=那些 zhe'li=这里 \
+na'li=那里 zhe'yang=这样 na'yang=那样 duo'shao=多少 shi'hou=时候 yi'jing=已经 hai'shi=还是 yin'wei=因为 \
+suo'yi=所以 ru'guo=如果 dan'shi=但是 er'qie=而且 yi'qi=一起 yi'zhi=一直 yi'ding=一定 ke'neng=可能 \
+ying'gai=应该 mei'you=没有 bu'shi=不是 bu'yao=不要 bu'neng=不能 bu'hao=不好 fei'chang=非常 zhen'de=真的 \
+jue'de=觉得 xi'wang=希望 peng'you=朋友 jia'ren=家人 hai'zi=孩子 lao'shi=老师 xue'sheng=学生 xue'xiao=学校 \
+gong'si=公司 sheng'huo=生活 shi'jie=世界 bei'jing=北京 shang'hai=上海 zao'shang=早上 wan'shang=晚上 xia'wu=下午 \
+shang'wu=上午 zhong'wu=中午 zuo'tian=昨天 yi'hou=以后 yi'qian=以前 kai'shi=开始 jie'shu=结束 ji'xu=继续 \
+deng'dai=等待 bang'zhu=帮助 wen'ti=问题 shi'qing=事情 fang'fa=方法 jie'guo=结果 xiao'xi=消息 dian'hua=电话 \
+di'zhi=地址 ming'zi=名字 hao'ma=号码 you'jian=邮件 wen'jian=文件 ruan'jian=软件 xi'tong=系统 wang'luo=网络 \
+wang'zhan=网站 mi'ma=密码 she'zhi=设置 da'kai=打开 guan'bi=关闭 bao'cun=保存 xuan'ze=选择 shi'yong=使用 \
+an'zhuang=安装 geng'xin=更新 yu'yan=语言 zhong'wen=中文 pin'yin=拼音 wen'zi=文字 yin'yue=音乐 dian'ying=电影 \
+you'xi=游戏 tian'qi=天气 kuai'le=快乐 gao'xing=高兴 kai'xin=开心 jian'kang=健康 an'quan=安全 chi'fan=吃饭 \
+hui'jia=回家 chu'men=出门 shang'ban=上班 xia'ban=下班 xiu'xi=休息 shui'jiao=睡觉 gou'mai=购买 jia'ge=价格 \
+sheng'ri=生日 huan'ying=欢迎 dui'bu'qi=对不起 mei'guan'xi=没关系 bu'ke'qi=不客气 qing'wen=请问";
+
+const EVERYDAY_RANKING_FLOOR: u32 = 16384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LexiconEntry {
@@ -35,10 +58,35 @@ struct LexiconEntry {
     everyday: bool,
 }
 
+impl LexiconEntry {
+    fn choice(&self, consumed: usize) -> super::decoder::Choice {
+        let mut choice = super::decoder::Choice::word(
+            Candidate::new(&self.text, &self.reading),
+            consumed,
+            self.weight,
+        );
+        // This prior belongs only to the supplemental graph, never legacy indexes.
+        if self.everyday || (self.reading == "shu'ru" && self.text == "输入") {
+            choice.supplemental_score +=
+                super::decoder::lexical_score(
+                    self.weight.max(EVERYDAY_RANKING_FLOOR),
+                    self.text.chars().count(),
+                ) - super::decoder::lexical_score(self.weight, self.text.chars().count());
+        }
+        choice
+    }
+}
+
 fn rank_entries(left: &LexiconEntry, right: &LexiconEntry) -> std::cmp::Ordering {
-    right
-        .everyday
-        .cmp(&left.everyday)
+    let score = |entry: &LexiconEntry| {
+        if entry.everyday {
+            entry.weight.max(EVERYDAY_RANKING_FLOOR)
+        } else {
+            entry.weight
+        }
+    };
+    score(right)
+        .cmp(&score(left))
         .then_with(|| right.weight.cmp(&left.weight))
         .then_with(|| left.text.cmp(&right.text))
         .then_with(|| left.reading.cmp(&right.reading))
@@ -54,6 +102,27 @@ pub struct Lexicon {
     entries: Arc<HashMap<String, Vec<LexiconEntry>>>,
     initials: Arc<HashMap<String, Vec<LexiconEntry>>>,
     syllables: Arc<SyllableTrie>,
+}
+
+#[cfg(test)]
+mod everyday_pair_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_everyday_pairs_exist_with_their_exact_reading() {
+        let lexicon = Lexicon::builtin().unwrap();
+        let pairs: Vec<_> = EVERYDAY_PAIRS
+            .split_whitespace()
+            .map(|pair| pair.split_once('=').unwrap())
+            .collect();
+        assert_eq!(pairs.len(), 135);
+        for (reading, text) in pairs {
+            assert!(lexicon
+                .lookup(&reading.replace('\'', ""))
+                .iter()
+                .any(|candidate| candidate.text == text && candidate.comment == reading));
+        }
+    }
 }
 
 const MIXED_BUDGET: usize = 4096;
@@ -116,13 +185,22 @@ impl SyllableTrie {
 static BUILTIN: OnceLock<Result<Lexicon, EngineError>> = OnceLock::new();
 
 impl Lexicon {
-    /// Loads the shared base, core phrases and project-authored everyday phrases.
+    pub(crate) fn spelling_entries(&self) -> impl Iterator<Item = (&str, &str, u32)> {
+        self.entries
+            .values()
+            .flatten()
+            .map(|entry| (entry.reading.as_str(), entry.text.as_str(), entry.weight))
+    }
+
+    /// Loads shared base/core/everyday and all curated category tables.
     pub fn builtin() -> Result<Self, EngineError> {
         BUILTIN
             .get_or_init(|| {
                 let mut lexicon = Self::from_tsv(BUILTIN_LEXICON)?;
-                let words: std::collections::HashSet<_> =
-                    EVERYDAY_WORDS.split_whitespace().collect();
+                let words: std::collections::HashSet<_> = EVERYDAY_PAIRS
+                    .split_whitespace()
+                    .filter_map(|pair| pair.split_once('='))
+                    .collect();
                 let phrases: std::collections::HashSet<_> = EVERYDAY_PHRASES
                     .lines()
                     .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -137,7 +215,7 @@ impl Lexicon {
                         let syllables = entry.reading.split('\'').count();
                         entry.everyday = syllables >= 2
                             && syllables == entry.text.chars().count()
-                            && (words.contains(entry.text.as_str())
+                            && (words.contains(&(entry.reading.as_str(), entry.text.as_str()))
                                 || phrases
                                     .contains(&(entry.reading.as_str(), entry.text.as_str())));
                     }
@@ -286,13 +364,7 @@ impl Lexicon {
             .into_iter()
             .flatten()
             .take(limit)
-            .map(|entry| {
-                super::decoder::Choice::word(
-                    Candidate::new(&entry.text, &entry.reading),
-                    raw.len(),
-                    entry.weight,
-                )
-            })
+            .map(|entry| entry.choice(raw.len()))
             .collect()
     }
 
@@ -391,11 +463,7 @@ impl Lexicon {
             .into_iter()
             .filter(|(entry, _, end)| seen.insert((&entry.text, &entry.reading, *end)))
             .map(|(entry, abbreviated, end)| {
-                let mut choice = super::decoder::Choice::word(
-                    Candidate::new(&entry.text, &entry.reading),
-                    end,
-                    entry.weight,
-                );
+                let mut choice = entry.choice(end);
                 choice.abbreviated = abbreviated;
                 choice.penalize_abbreviations();
                 choice
@@ -509,13 +577,7 @@ impl Lexicon {
             .filter(|entry| super::segment::boundaries_match(raw, &entry.reading))
             .filter(|entry| seen.insert(entry.text.clone()))
             .take(limit)
-            .map(|entry| {
-                super::decoder::Choice::word(
-                    Candidate::new(&entry.text, &entry.reading),
-                    raw.len(),
-                    entry.weight,
-                )
-            })
+            .map(|entry| entry.choice(raw.len()))
             .collect()
     }
 
@@ -559,6 +621,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn supplemental_metadata_penalizes_vowelless_syllables_without_changing_legacy() {
+        let lexicon =
+            Lexicon::from_tsv("n\t嗯\t100\nshu'ru\t输入\t100\nni'hao\t你好\t100").unwrap();
+        let n = &lexicon.exact_choices("n")[0];
+        assert_eq!(
+            n.supplemental_score,
+            super::super::decoder::lexical_score(100, 1) - 1024
+        );
+        let input = &lexicon.exact_choices("shuru")[0];
+        assert_eq!(
+            input.supplemental_score,
+            super::super::decoder::lexical_score(16384, 2)
+        );
+        let hello = &lexicon.exact_choices("nihao")[0];
+        assert_eq!(
+            hello.supplemental_score,
+            super::super::decoder::lexical_score(100, 2)
+        );
+        assert!(lexicon
+            .entries
+            .values()
+            .flatten()
+            .all(|entry| !entry.everyday && entry.weight == 100));
+        let mut mixed = lexicon.mixed_choices("shur").remove(0);
+        assert_eq!(mixed.abbreviated, 1);
+        assert_eq!(mixed.supplemental_score, input.supplemental_score - 512);
+        // Keep the existing score/abbreviation method semantics.
+        mixed.penalize_abbreviations();
+        assert_eq!(mixed.supplemental_score, input.supplemental_score - 1024);
+    }
+
+    #[test]
     fn everyday_layer_only_classifies_existing_builtin_words_without_changing_weights() {
         let raw = Lexicon::from_tsv(BUILTIN_LEXICON).unwrap();
         let builtin = Lexicon::builtin().unwrap();
@@ -587,8 +681,9 @@ mod tests {
                 .windows(2)
                 .all(|w| !rank_entries(&w[0], &w[1]).is_gt()));
         }
-        let expected: std::collections::HashSet<_> = EVERYDAY_WORDS
+        let expected: std::collections::HashSet<_> = EVERYDAY_PAIRS
             .split_whitespace()
+            .map(|pair| pair.split_once('=').unwrap().1)
             .chain(
                 EVERYDAY_PHRASES
                     .lines()

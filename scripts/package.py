@@ -1331,6 +1331,124 @@ def _phrase_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
 
 
 EVERYDAY_COUNT = 155
+CATEGORY_PREFIX = "data/pinyin/categories/"
+# Updating the offline snapshot requires an explicit code and evidence update.
+CATEGORY_MANIFEST_SHA256 = "2d9424c64719b08e8ffae04ff13a0db0af489cb9f72443d979ed175aca43c3f6"
+CATEGORY_TABLES = tuple(name + ".tsv" for name in (
+    "IT", "animal", "caijing", "car", "chengyu", "diming", "food", "law",
+    "lishimingren", "medical", "poem", "cedict_supplement", "erhua",
+))
+CATEGORY_LICENSE_SOURCES = {
+    "data/pinyin/sources/thuocl/LICENSE": ("thuocl", "LICENSE"),
+    "data/pinyin/sources/thuocl/README.md": ("thuocl", "README.md"),
+    "data/pinyin/phrases/sources/CC-BY-SA-4.0.txt": ("phrases", "CC-BY-SA-4.0.txt"),
+    "data/pinyin/phrases/sources/LICENSE-jieba.txt": ("phrases", "LICENSE-jieba.txt"),
+    "data/pinyin/sources/UNICODE-LICENSE.txt": ("characters", "UNICODE-LICENSE.txt"),
+    "data/pinyin/sources/LICENSE-pinyin-data.txt": ("characters", "LICENSE-pinyin-data.txt"),
+}
+CATEGORY_FILES = frozenset(
+    [CATEGORY_PREFIX + name for name in (*CATEGORY_TABLES, "manifest.json", "coverage.json", "NOTICE.md")]
+    + list(CATEGORY_LICENSE_SOURCES)
+)
+
+
+def _verify_category_payload(payload: Mapping[str, bytes], repo_root: Path) -> dict:
+    """Verify generated records and independently pinned source-license bytes."""
+    try:
+        manifest_bytes = payload[CATEGORY_PREFIX + "manifest.json"]
+        if _sha256(manifest_bytes) != CATEGORY_MANIFEST_SHA256:
+            raise ValueError("分类 manifest 不匹配代码内可信快照摘要")
+        manifest = json.loads(manifest_bytes)
+        base_data = payload["data/pinyin/base_lexicon.tsv"]
+        base_info = manifest["baseline"]["data/pinyin/base_lexicon.tsv"]
+        if len(base_data) != base_info["bytes"] or _sha256(base_data) != base_info["sha256"]:
+            raise ValueError("分类 base 音节来源摘要不一致")
+        syllables = {
+            line.split("\t", 1)[0] for line in base_data.decode("utf-8").splitlines()
+            if line and not line.startswith("#")
+        } | {"r", "sei"}
+        coverage = json.loads(payload[CATEGORY_PREFIX + "coverage.json"])
+        if manifest["schema_version"] != 1 or manifest["default_loaded"] is not True:
+            raise ValueError("分类 schema/default_loaded 无效")
+        expected = set(CATEGORY_TABLES) | {"coverage.json", "NOTICE.md", "provenance.tsv", "rejected.tsv"}
+        if set(manifest["files"]) != expected:
+            raise ValueError("分类文件清单不是固定白名单")
+        source_paths = {
+            "thuocl": "data/pinyin/sources/thuocl/manifest.json",
+            "phrases": "data/pinyin/phrases/manifest.json",
+            "characters": "data/pinyin/sources/manifest.json",
+        }
+        for source, path in source_paths.items():
+            trusted = json.loads(_read_bytes(repo_root / path, "分类来源清单"))
+            if manifest["sources"][source] != trusted:
+                raise ValueError("分类来源清单与固定源不一致")
+        for path, (source, name) in CATEGORY_LICENSE_SOURCES.items():
+            info = manifest["sources"][source]["files"][name]
+            data = payload[path]
+            if _sha256(data) != info["sha256"] or (
+                    "bytes" in info and len(data) != info["bytes"]):
+                raise ValueError("分类许可字节不一致：" + path)
+        union = set()
+        for name in (*CATEGORY_TABLES, "coverage.json", "NOTICE.md"):
+            data = payload[CATEGORY_PREFIX + name]
+            info = manifest["files"][name]
+            lines = data.decode("utf-8").splitlines()
+            if (len(data) != info["bytes"] or _sha256(data) != info["sha256"]
+                    or len(lines) != info["lines"]):
+                raise ValueError("分类文件摘要/字节/行数不一致：" + name)
+            if name not in CATEGORY_TABLES:
+                continue
+            pairs = set()
+            for line in lines:
+                reading, text, weight = line.split("\t")
+                if (not re.fullmatch("[a-z]+(?:'[a-z]+)+", reading)
+                        or not re.fullmatch("[\u4e00-\u9fff]{2,16}", text)
+                        or len(reading.split("'")) != len(text)
+                        or any(part not in syllables for part in reading.split("'"))
+                        or not re.fullmatch("[1-9][0-9]*", weight)
+                        or int(weight) > 0xffffffff or (reading, text) in pairs):
+                    raise ValueError("不规范或重复分类记录：" + name)
+                pairs.add((reading, text))
+            if len(pairs) != info["pairs"]:
+                raise ValueError("分类记录数不一致：" + name)
+            union.update(pairs)
+        if len(union) != manifest["global_unique_pairs"] or len(union) != coverage["global_unique_pairs"]:
+            raise ValueError("分类全局唯一词对不一致")
+        baseline = set()
+        for path, info in manifest["baseline"].items():
+            if path not in {"data/pinyin/base_lexicon.tsv", "data/pinyin/everyday_phrases.tsv",
+                            "data/pinyin/phrases/phrase_lexicon.tsv"}:
+                raise ValueError("分类 baseline 路径无效")
+            data = payload[path]
+            if len(data) != info["bytes"] or _sha256(data) != info["sha256"]:
+                raise ValueError("分类 baseline 摘要不一致")
+            baseline.update(tuple(line.split("\t")[:2]) for line in data.decode("utf-8").splitlines()
+                            if line and not line.startswith("#"))
+        if (len(manifest["baseline"]) != 3
+                or len(union - baseline) != manifest["additional_to_default"]
+                or manifest["additional_to_default"] != coverage["additional_to_default"]):
+            raise ValueError("分类默认增量不一致")
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise PackagingError(f"分类词库校验失败：{error}") from error
+    return {
+        "paths": sorted(CATEGORY_FILES), "default_loaded": True,
+        "global_unique_pairs": len(union), "additional_to_default": len(union - baseline),
+        "files": {path: {"bytes": len(payload[path]), "sha256": _sha256(payload[path])}
+                  for path in sorted(CATEGORY_FILES)},
+        "sources": manifest["sources"], "coverage": coverage,
+        "licenses": list(CATEGORY_LICENSE_SOURCES),
+        "weight_kind": "bounded ranking values / existing jieba weights; not global corpus frequency",
+    }
+
+
+def _category_bundle(repo_root: Path) -> tuple[dict[str, bytes], dict]:
+    payload = {path: _read_bytes(repo_root / path, "分类运行数据") for path in CATEGORY_FILES}
+    baseline = {path: _read_bytes(repo_root / path, "分类默认基线") for path in (
+        "data/pinyin/base_lexicon.tsv", "data/pinyin/everyday_phrases.tsv",
+        "data/pinyin/phrases/phrase_lexicon.tsv")}
+    return payload, _verify_category_payload({**payload, **baseline}, repo_root)
+
+
 EVERYDAY_SHA256 = "86aed552183db1964ca9f0c9f4a1978bd87b11b87202f60a29dea9d997312f2d"
 
 
@@ -1386,6 +1504,7 @@ def _build_payloads(
     dictionary_payload, dictionary_record = _dictionary_bundle(repo_root)
     phrase_payload, phrase_record = _phrase_bundle(repo_root)
     everyday_payload, everyday_record = _everyday_bundle(repo_root)
+    category_payload, category_record = _category_bundle(repo_root)
     cargo_lock = _read_bytes(repo_root / "Cargo.lock", "Cargo.lock")
     root_mit = _read_bytes(repo_root / "LICENSE-MIT", "MIT 许可证")
     root_apache = _read_bytes(repo_root / "LICENSE-APACHE", "Apache 许可证")
@@ -1416,7 +1535,7 @@ def _build_payloads(
         "Cargo.lock": cargo_lock,
     }
     for source in (dependency_payload, rust_payload, dictionary_payload, phrase_payload,
-                   everyday_payload):
+                   everyday_payload, category_payload):
         for relative, data in source.items():
             if relative in payload:
                 raise PackagingError(f"分发文件路径重复：{relative}")
@@ -1450,6 +1569,7 @@ def _build_payloads(
         "dictionaries": dictionary_record,
         "phrases": phrase_record,
         "everyday_phrases": everyday_record,
+        "category_lexicons": category_record,
         "distribution": {
             "format": "zip",
             "authenticode_signed": False,

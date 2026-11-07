@@ -16,6 +16,15 @@ from scripts.test_package import PackageFixture, ai_fixture, flower_package, mak
 
 
 class InstallerSourceTests(unittest.TestCase):
+    def test_ui_element_capability_is_required_and_orphans_are_detected(self):
+        source = (installer.REPO / "installer" / "flower.iss").read_text(encoding="utf-8-sig")
+        self.assertIn("UIElementCategory = '{49D2F9CF-1F5E-11D7-A6D3-00065B84435C}'", source)
+        # Both initial conflicts and post-registration ownership cover the capability.
+        self.assertGreaterEqual(source.count("UIElementCategory + '\\' + FlowerClass"), 2)
+        owned = source.split("function OwnedRegistrationComplete", 1)[1].split("function CanStartFlower", 1)[0]
+        self.assertIn("KeyboardCategory", owned)
+        self.assertIn("UIElementCategory", owned)
+
     """Static integration guards, not a substitute for executing the wizard."""
 
     def test_shortcuts_have_clean_names_without_changing_commands(self):
@@ -80,7 +89,13 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn('Parameters: "--start-input-method"', run)
         self.assertIn('Description: "启动 Flower"', run)
         self.assertIn("postinstall nowait skipifsilent runasoriginaluser", run)
-        self.assertNotIn("unchecked", run)
+        immediate, startup = run.strip().splitlines()
+        self.assertNotIn("unchecked", immediate)
+        self.assertIn('Parameters: "--enable-startup"', startup)
+        self.assertIn('Description: "开机自启动"', startup)
+        self.assertIn("postinstall unchecked skipifsilent runasoriginaluser", startup)
+        self.assertNotIn("nowait", startup)
+        self.assertIn("Check: CanStartFlower", startup)
         self.assertIn("Check: CanStartFlower", run)
         gate = source.split("function CanStartFlower", 1)[1].split("function InitializeSetup", 1)[0]
         for check in ["RegistrationFailed", "FixedInstallRoot", "SafeInstallPath",
@@ -96,6 +111,35 @@ class InstallerSourceTests(unittest.TestCase):
         self.assertIn("TokenIsElevated != 0", cli)
         self.assertIn('command(&["--start-input-method", "extra"]).is_err()', cli)
         self.assertIn('cfg(not(target_os = "windows"))', start)
+
+    def test_startup_is_user_owned_silent_and_never_cleaned_by_uninstaller(self):
+        source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
+        icons = source.split("[Icons]", 1)[1].split("[Run]", 1)[0]
+        self.assertIn(r'\关闭开机自启动";', icons)
+        self.assertIn('Parameters: "--disable-startup"', icons)
+        self.assertNotIn("runas", icons)
+        self.assertNotIn("启用并打开设置", source)
+        uninstall = source.split("function InitializeUninstall", 1)[1]
+        self.assertIn("先运行“关闭开机自启动”再“停用 Flower”", uninstall)
+        for forbidden in ["HKEY_USERS", "HKU", "RegLoadKey", "RegDeleteValue",
+                          "allusersstartup", "schtasks", "[UninstallRun]"]:
+            self.assertNotIn(forbidden, source)
+        cli = (installer.REPO / "src/bin/flower-settings.rs").read_text(encoding="utf-8-sig")
+        dispatch = cli.split("fn execute(", 1)[1].split("Command::AiServer", 1)[0]
+        self.assertLess(dispatch.index("require_non_elevated()?"),
+                        dispatch.index("validate_current_settings_installation()?"))
+        self.assertLess(dispatch.index("validate_current_settings_installation()?"),
+                        dispatch.index("registration::enable()"))
+        self.assertNotIn("run_settings_app", dispatch)
+        self.assertNotIn("ai_inference", dispatch)
+        main = cli.split("fn main()", 1)[1].split("#[cfg(test)]", 1)[0]
+        self.assertLess(main.index("if silent"), main.index("eprintln!"))
+        self.assertLess(main.index("if silent"), main.index("MessageBoxW"))
+        store = (installer.REPO / "src/startup.rs").read_text(encoding="utf-8-sig")
+        self.assertIn("HKEY_CURRENT_USER", store)
+        self.assertNotIn("HKEY_LOCAL_MACHINE", store)
+        self.assertIn('w!("Flower")', store)
+        self.assertIn('Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run', store)
 
     def test_post_copy_and_uninstall_validate_before_executing_installed_tool(self):
         source = (installer.REPO / "installer/flower.iss").read_text(encoding="utf-8-sig")
@@ -332,6 +376,61 @@ class InstallerTests(unittest.TestCase):
         }))
         with self.assertRaises(installer.InstallerError):
             self.build()
+
+    def test_category_allowlist_is_required_and_not_recursive(self):
+        self.assertTrue(installer.pack.CATEGORY_FILES <= installer.ROOT_FILES)
+        for path in ("data/pinyin/categories/arbitrary.tsv",
+                     "data/pinyin/categories/provenance.tsv",
+                     "data/pinyin/categories/rejected.tsv",
+                     "data/pinyin/sources/thuocl/THUOCL_IT.txt"):
+            self.assertNotIn(path, installer.ROOT_FILES)
+            with self.subTest(path=path):
+                self.rewrite(lambda data: data.update({self.archive.stem + "/" + path: b"extra"}),
+                             rehash_payload=True)
+                with self.assertRaisesRegex(installer.InstallerError, "白名单"):
+                    installer.verify_package(self.archive)
+
+    def test_category_manifest_forgery_rejected_after_outer_rehash(self):
+        def mutate(data):
+            path = self.archive.stem + "/manifest.json"
+            manifest = json.loads(data[path])
+            manifest["category_lexicons"]["global_unique_pairs"] += 1
+            data[path] = json.dumps(manifest).encode()
+        self.rewrite(mutate, rehash_payload=True)
+        with self.assertRaisesRegex(installer.InstallerError, "分类词库记录"):
+            installer.verify_package(self.archive)
+
+    def test_self_signed_category_attacks_rejected_after_outer_rehash(self):
+        original_archive = self.archive.read_bytes()
+        for attack in ("empty", "unsupported_syllables"):
+            with self.subTest(attack=attack):
+                self.archive.write_bytes(original_archive)
+                def mutate(data):
+                    prefix = self.archive.stem + "/data/pinyin/categories/"
+                    manifest = json.loads(data[prefix + "manifest.json"])
+                    if attack == "empty":
+                        for name in installer.pack.CATEGORY_TABLES:
+                            data[prefix + name] = b""
+                            manifest["files"][name].update(
+                                bytes=0, lines=0, pairs=0, sha256=hashlib.sha256(b"").hexdigest())
+                        coverage = json.loads(data[prefix + "coverage.json"])
+                        coverage.update(global_unique_pairs=0, additional_to_default=0)
+                        value = json.dumps(coverage).encode()
+                        data[prefix + "coverage.json"] = value
+                        manifest["files"]["coverage.json"].update(
+                            bytes=len(value), lines=len(value.splitlines()),
+                            sha256=hashlib.sha256(value).hexdigest())
+                        manifest.update(global_unique_pairs=0, additional_to_default=0)
+                    else:
+                        value = (b"r'zzzz'zzzz\t" + "爱加密".encode() + b"\t1025\n"
+                                 + data[prefix + "IT.tsv"].split(b"\n", 1)[1])
+                        data[prefix + "IT.tsv"] = value
+                        manifest["files"]["IT.tsv"].update(
+                            bytes=len(value), sha256=hashlib.sha256(value).hexdigest())
+                    data[prefix + "manifest.json"] = json.dumps(manifest).encode()
+                self.rewrite(mutate, rehash_payload=True)
+                with self.assertRaisesRegex(installer.InstallerError, "可信快照"):
+                    installer.verify_package(self.archive)
 
     def test_zip_symlink_is_rejected(self):
         with zipfile.ZipFile(self.archive, "a") as target:

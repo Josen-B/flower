@@ -12,6 +12,7 @@ use std::{ops::Range, sync::Arc};
 struct Confirmed {
     raw: String,
     text: String,
+    reading: String,
     events: Vec<LearningEvent>,
 }
 
@@ -29,6 +30,7 @@ pub struct PinyinSession {
     pending_promotions: Vec<PromotionEvent>,
     preedit: String,
     raw: String,
+    raw_caret: usize,
     confirmed: Vec<Confirmed>,
     choices: Vec<Choice>,
     pending_learning: Vec<LearningEvent>,
@@ -78,6 +80,7 @@ impl PinyinSession {
             pending_promotions: Vec::new(),
             preedit: String::new(),
             raw: String::new(),
+            raw_caret: 0,
             confirmed: Vec::new(),
             choices: Vec::new(),
             pending_learning: Vec::new(),
@@ -131,19 +134,26 @@ impl PinyinSession {
                 }
                 self.pending_learning.clear();
                 self.pending_promotions.clear();
-                self.raw.push(character.to_ascii_lowercase());
+                self.raw
+                    .insert(self.raw_caret, character.to_ascii_lowercase());
+                self.raw_caret += 1;
                 self.refresh_candidates();
                 Ok(self.snapshot(true))
             }
             Key::Char('\'') if self.is_composing() => {
-                self.pending_promotions.clear();
-                if !self.raw.is_empty() && !self.raw.ends_with('\'') {
+                if self.raw_caret > 0
+                    && self.raw.as_bytes()[self.raw_caret - 1] != b'\''
+                    && self.raw.as_bytes().get(self.raw_caret) != Some(&b'\'')
+                {
                     if self.raw.len() + self.confirmed.iter().map(|s| s.raw.len()).sum::<usize>()
                         >= 128
                     {
                         return Err(EngineError::InputTooLong);
                     }
-                    self.raw.push('\'');
+                    self.pending_learning.clear();
+                    self.pending_promotions.clear();
+                    self.raw.insert(self.raw_caret, '\'');
+                    self.raw_caret += 1;
                     self.refresh_candidates();
                 }
                 Ok(self.snapshot(true))
@@ -165,19 +175,39 @@ impl PinyinSession {
                     return Ok(self.snapshot(false));
                 }
 
-                self.pending_learning.clear();
-                self.pending_promotions.clear();
-                if self.raw.is_empty() {
+                if self.raw_caret == 0 {
                     if let Some(segment) = self.confirmed.pop() {
-                        self.raw = segment.raw;
+                        self.raw_caret = segment.raw.len();
+                        self.raw.insert_str(0, &segment.raw);
+                    } else {
+                        return Ok(self.snapshot(true));
                     }
                 } else {
-                    self.raw.pop();
+                    self.raw_caret -= 1;
+                    self.raw.remove(self.raw_caret);
                 }
+                self.pending_learning.clear();
+                self.pending_promotions.clear();
                 if self.raw.is_empty() && self.confirmed.is_empty() {
                     self.clear_composition();
                 } else {
                     self.refresh_candidates();
+                }
+                Ok(self.snapshot(true))
+            }
+            Key::Delete => {
+                if !self.is_composing() {
+                    return Ok(self.snapshot(false));
+                }
+                if self.raw_caret < self.raw.len() {
+                    self.raw.remove(self.raw_caret);
+                    self.pending_learning.clear();
+                    self.pending_promotions.clear();
+                    if self.raw.is_empty() && self.confirmed.is_empty() {
+                        self.clear_composition();
+                    } else {
+                        self.refresh_candidates();
+                    }
                 }
                 Ok(self.snapshot(true))
             }
@@ -220,18 +250,36 @@ impl PinyinSession {
                 self.change_page(-1);
                 Ok(self.snapshot(true))
             }
-            Key::Left | Key::Up => {
+            Key::Left => {
                 if !self.is_composing() {
                     return Ok(self.snapshot(false));
                 }
-                self.move_highlight(-1);
+                if self.raw_caret < self.raw.len()
+                    || self.highlighted.map_or(true, |index| index == 0)
+                {
+                    self.raw_caret = self.raw_caret.saturating_sub(1);
+                } else {
+                    self.move_highlight(-1);
+                }
                 Ok(self.snapshot(true))
             }
-            Key::Right | Key::Down => {
+            Key::Right => {
                 if !self.is_composing() {
                     return Ok(self.snapshot(false));
                 }
-                self.move_highlight(1);
+                if self.raw_caret < self.raw.len() {
+                    self.raw_caret += 1;
+                } else {
+                    self.move_highlight(1);
+                }
+                Ok(self.snapshot(true))
+            }
+            Key::Up | Key::Down => {
+                if !self.is_composing() {
+                    return Ok(self.snapshot(false));
+                }
+                self.raw_caret = self.raw.len();
+                self.move_highlight(if key == Key::Up { -1 } else { 1 });
                 Ok(self.snapshot(true))
             }
             Key::Char(_) | Key::Other => Ok(self.snapshot(false)),
@@ -313,9 +361,11 @@ impl PinyinSession {
         });
         let raw = self.raw[..choice.consumed].to_owned();
         self.raw.drain(..choice.consumed);
+        self.raw_caret = self.raw.len();
         self.confirmed.push(Confirmed {
             raw,
             text: choice.candidate.text,
+            reading: choice.candidate.comment,
             events: choice.events,
         });
         if self.raw.is_empty() {
@@ -467,6 +517,7 @@ impl PinyinSession {
     /// Source for a suggestion, not permission to cross the host privacy boundary.
     pub fn ai_input(&self) -> Option<crate::ai::AiInput> {
         if !self.is_composing()
+            || self.raw_caret != self.raw.len()
             || self.page != 0
             || self.highlighted != Some(0)
             || self.choices.iter().any(|c| c.candidate.is_ai())
@@ -480,7 +531,16 @@ impl PinyinSession {
             return None;
         }
         let raw: String = self.confirmed.iter().map(|s| s.raw.as_str()).collect();
+        let reading = self
+            .confirmed
+            .iter()
+            .map(|s| s.reading.as_str())
+            .chain(std::iter::once(choice.candidate.comment.as_str()))
+            .filter(|reading| !reading.is_empty())
+            .collect::<Vec<_>>()
+            .join("'");
         Some(crate::ai::AiInput {
+            reading,
             raw: raw + &self.raw,
             source,
         })
@@ -496,6 +556,31 @@ impl PinyinSession {
         {
             return None;
         }
+        Some(self.insert_ai_candidate(corrected))
+    }
+
+    pub fn apply_ai_spelling_candidate(
+        &mut self,
+        expected: &crate::ai::AiInput,
+        corrected: &str,
+        reading: &str,
+    ) -> Option<CompositionUpdate> {
+        if self.ai_input().as_ref() != Some(expected)
+            || crate::ai::spelling_change_span(
+                &expected.raw,
+                &expected.source,
+                &expected.reading,
+                corrected,
+                reading,
+            )
+            .is_none()
+        {
+            return None;
+        }
+        Some(self.insert_ai_candidate(corrected))
+    }
+
+    fn insert_ai_candidate(&mut self, corrected: &str) -> CompositionUpdate {
         let prefix: String = self.confirmed.iter().map(|s| s.text.as_str()).collect();
         self.choices.retain(|c| {
             c.consumed != self.raw.len() || format!("{}{}", prefix, c.candidate.text) != corrected
@@ -509,7 +594,7 @@ impl PinyinSession {
         self.choices.insert(1, choice);
         self.candidates = self.choices.iter().map(|c| c.candidate.clone()).collect();
         self.rebuild_pages();
-        Some(self.snapshot(true))
+        self.snapshot(true)
     }
 
     fn commit_literal(&mut self) -> Result<CompositionUpdate, EngineError> {
@@ -628,6 +713,7 @@ impl PinyinSession {
     }
 
     fn change_page(&mut self, delta: isize) {
+        self.raw_caret = self.raw.len();
         let page_count = self.page_count();
         if page_count == 0 {
             self.page = 0;
@@ -668,6 +754,7 @@ impl PinyinSession {
     fn clear_composition(&mut self) {
         self.preedit.clear();
         self.raw.clear();
+        self.raw_caret = 0;
         self.confirmed.clear();
         self.choices.clear();
         self.pending_learning.clear();
@@ -682,6 +769,13 @@ impl PinyinSession {
         CompositionUpdate {
             handled,
             preedit: self.preedit.clone(),
+            preedit_caret_utf16: Some(
+                self.confirmed
+                    .iter()
+                    .map(|segment| segment.text.encode_utf16().count())
+                    .sum::<usize>()
+                    + self.raw_caret,
+            ),
             candidates: self.current_page().to_vec(),
             highlighted: self.highlighted,
             page: self.page,

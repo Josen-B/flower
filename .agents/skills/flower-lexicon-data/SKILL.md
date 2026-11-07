@@ -69,6 +69,14 @@ description: 在 Flower 仓库扩充或更新汉字/词组数据、维护许可�
 - 包新增文件必须同步 `scripts/installer.py` 固定白名单与必需项，不只更新package生成器；不放宽任意路径。来源、MIT正文路径、独立数量/hash、SHA256SUMS和实际DLL嵌入均核验。
 - 全部条目exact lookup和initial session翻页提交与代表项full-session提交是不同证据，不扩大表述。缩写与合法全拼碰撞如wan，保留全拼层并验证后续页的我爱你，不把可达冒称首屏。
 
+## 分类词库与可靠读音补充
+
+- `scripts/build_categories.py` 管理 `data/pinyin/categories/` 的离线生成和 `--check`；THUOCL原始快照及许可在 `data/pinyin/sources/thuocl/`，类别清单、数量及可信版本以manifest为准，不把多类重合行数相加。
+- THUOCL只有词和类别DF，没有拼音。精确CEDICT词级读音优先；缺词级读音时，只能组合每字在base全部不同读音集合大小恰为1的词，不能用首选读音替代无歧义判定或做多音笛卡尔积。DF为零仍可以是合法收录，不把零频当坏行；坏数字不修后缀。不同语料DF不冒称统一词频，人工映射与原始DF分别保存。
+- 词级补充不再用jieba词频存在性决定收录；低频/无频词的排名与默认加载另有明确契约。儿化仅保留来源明确的末尾r词对，不机械造儿字或er别名。每表/provenance/coverage须能区分来源支持、待补读音、默认lookup可达及真正提交。
+- 运行包仅固定生成表/manifest/coverage/NOTICE和原路径必需许可，原语料、provenance/rejected留源码审计。打包与Inno都用精确白名单和必需项；运行验证须绑定代码可信manifest摘要，不能只信载荷重算的自签摘要及零统计。取合法音节前先验证base本体摘要，来源例外须明确，防任意字母串伪称拼音。
+- 新数据会改变普通首项与AI生成候选，因此补真实品牌/儿化全拼、简拼、混拼提交及受影响模型正反例；固定性能负载测共享快照和冷/热成本。仅改旧测试的首项基线时记录数据原因，不把旧词库证明当作新词库证明。
+
 ## 最小充分验证
 
 - 数据/转换：`python -m unittest scripts.test_lexicon -v`，`python scripts/build_lexicon.py --check`。

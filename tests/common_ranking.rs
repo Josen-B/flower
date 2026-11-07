@@ -2,6 +2,50 @@ use flower::engine::{Key, KeyEvent, Lexicon, PinyinSession};
 
 const EVERYDAY: &str = include_str!("../data/pinyin/everyday_phrases.tsv");
 
+#[test]
+fn bounded_daily_prior_keeps_greetings_without_overriding_high_frequency_words() {
+    for (raw, frequent, daily) in [("yj", "研究", "邮件"), ("sj", "世纪", "睡觉")] {
+        let mut session = session_for(raw);
+        let mut words = Vec::new();
+        for _ in 0..session.page_count() {
+            words.extend(
+                session
+                    .candidates_on_current_page()
+                    .iter()
+                    .map(|candidate| candidate.text.clone()),
+            );
+            session.next_page().unwrap();
+        }
+        let position = |text| words.iter().position(|word| word == text).unwrap();
+        assert!(position(frequent) < position(daily), "{raw}: {words:?}");
+    }
+    assert_eq!(
+        session_for("nh").candidates_on_current_page()[0].text,
+        "你好"
+    );
+    for (raw, expected) in [
+        ("wenti", "问题"),
+        ("shijie", "世界"),
+        ("shijian", "时间"),
+        ("gongzuo", "工作"),
+        ("xianzai", "现在"),
+        ("zhidao", "知道"),
+        ("yijing", "已经"),
+        ("jiankang", "健康"),
+        ("zhongguo", "中国"),
+        ("nihao", "你好"),
+        ("shi", "是"),
+        ("de", "的"),
+        ("yi", "一"),
+    ] {
+        assert_eq!(
+            session_for(raw).candidates_on_current_page()[0].text,
+            expected,
+            "{raw}"
+        );
+    }
+}
+
 fn phrase_rows() -> Vec<(&'static str, &'static str)> {
     EVERYDAY
         .lines()

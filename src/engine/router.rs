@@ -59,6 +59,16 @@ impl EngineRouter {
         self.session.apply_ai_candidate(expected, corrected)
     }
 
+    pub fn apply_ai_spelling_candidate(
+        &mut self,
+        expected: &crate::ai::AiInput,
+        corrected: &str,
+        reading: &str,
+    ) -> Option<CompositionUpdate> {
+        self.session
+            .apply_ai_spelling_candidate(expected, corrected, reading)
+    }
+
     /// Selects and commits a zero-based candidate from the current page.
     pub fn select_candidate(&mut self, index: usize) -> Result<CompositionUpdate, EngineError> {
         self.session.select_candidate(index)
